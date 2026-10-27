@@ -5,7 +5,7 @@ Lopaca is a llama-server GUI frontend written in python using standard libraries
 Start an instance of llama-server with your favorite LLM. Mostly tested with Qwen3.6 and 3.8 27b.
 Make sure gtk python libraries are installed. Otherwise it's all standard libraries.
 ```
-./run.sh
+./lopaca.sh
 ```
 
 # TO-DO
