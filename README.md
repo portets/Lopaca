@@ -7,6 +7,7 @@ Make sure gtk python libraries are installed. Otherwise it's all standard librar
 ```
 ./lopaca.sh
 ```
+Edit settings.py if you need top change your server URL, default is currently latest llama-server default.
 
 # TO-DO
 - Add global settings menu and populate
