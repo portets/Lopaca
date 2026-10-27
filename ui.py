@@ -26,8 +26,8 @@ window {
     background-color: alpha(@headerbar_shade_color,0.4);
     border-radius: 10px;
     margin: 4px;
-    padding: 4px 0px 4px 6px;
-    min-width: 280px;
+    padding: 4px 0;
+    min-width: 286px;
 }
 .sidebar, .composer-frame {
     border: 1px solid @borders;
@@ -275,7 +275,7 @@ class ChatWindow(Adw.ApplicationWindow):
         root.append(sidebar)
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         top.set_margin_top(4)
-        top.set_margin_start(2)
+        top.set_margin_start(8)
         top.set_margin_end(6)
         heading = Gtk.Label(label="Chats", xalign=0)
         heading.set_hexpand(True)
@@ -294,7 +294,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.chat_list.connect(
             "row-activated", lambda _list, row: self.controller.open_chat(row.chat_id)
         )
-        self.chat_list.set_margin_start(8)
+        self.chat_list.set_margin_start(14)
         self.chat_list.set_margin_end(12)
         self.chat_list.set_header_func(self._set_chat_header)
         drop_target = Gtk.DropTarget.new(str, Gdk.DragAction.MOVE)
@@ -310,18 +310,21 @@ class ChatWindow(Adw.ApplicationWindow):
         self._pin_indicator.set_valign(Gtk.Align.START)
         self._pin_indicator.set_can_target(False)
         self._pin_indicator.set_visible(False)
-        self._pin_indicator.set_margin_start(16)
+        self._pin_indicator.set_margin_start(22)
         self._pin_indicator.set_margin_end(20)
         list_overlay.add_overlay(self._pin_indicator)
         chat_scroll = Gtk.ScrolledWindow()
+        chat_scroll.add_css_class("undershoot-top")
+        chat_scroll.add_css_class("undershoot-bottom")
         chat_scroll.set_child(list_overlay)
         chat_scroll.set_vexpand(True)
+        chat_scroll.set_margin_bottom(8)
         sidebar.append(chat_scroll)
         usage = Gtk.CenterBox()
         usage.add_css_class("muted")
-        usage.set_margin_start(4)
+        usage.set_margin_start(10)
         usage.set_margin_bottom(12)
-        usage.set_margin_end(10)  # 4px gutter + 6px to compensate for the sidebar's left inset.
+        usage.set_margin_end(10)
         self.chat_usage = Gtk.Label(label="Chat: —", xalign=1)
         self.chat_usage.set_hexpand(True)
         self.total_usage = Gtk.Label(label="Total: —", xalign=0)
@@ -570,6 +573,8 @@ class ChatWindow(Adw.ApplicationWindow):
         self.scroll_bottom()
 
     def show_chat(self, chat, folder):
+        # Release the sidebar row before refresh removes it and GTK moves focus.
+        self.set_focus(self.prompt)
         self.chat = chat
         self.set_chat_title(chat["title"])
         self.folder_label.set_text(f"Chat folder: {folder}")
