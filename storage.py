@@ -3,8 +3,10 @@
 import json
 import os
 import shutil
+import sqlite3
 import time
 import uuid
+from contextlib import closing
 from pathlib import Path
 
 from settings import CHAT_SORT_OPTIONS, Settings
@@ -29,10 +31,6 @@ class ChatStore:
         self.root = Path(root)
 
     def ensure(self):
-        # Preserve chats from installations made before the app was renamed.
-        legacy_dir = APP_DIR.with_name("llama-chat")
-        if self.root == CHATS_DIR and legacy_dir.exists() and not APP_DIR.exists():
-            legacy_dir.rename(APP_DIR)
         self.root.mkdir(parents=True, exist_ok=True)
 
     def folder(self, chat_id):
@@ -71,14 +69,10 @@ class ChatStore:
         except FileNotFoundError:
             data = {}
         except OSError, json.JSONDecodeError:
-            return {
-                "code_agent": False,
-                "created": self.load(chat_id).get("created", time.time()),
-            }
+            return {"code_agent": False, "created": time.time()}
         data["code_agent"] = data.get("code_agent", Settings.code_agent) is True
         if not isinstance(data.get("created"), (int, float)):
-            data["created"] = self.load(chat_id).get("created", time.time())
-            self.save_settings(chat_id, data)
+            data["created"] = time.time()
         return data
 
     def save_settings(self, chat_id, settings):
@@ -107,25 +101,60 @@ class ChatStore:
         _write_json(self.root.parent / "app-settings.json", settings)
 
     def load(self, chat_id):
-        try:
-            data = _read_json_object(self.folder(chat_id) / "chat.json")
-            if isinstance(data.get("messages"), list):
-                return data
-        except OSError, json.JSONDecodeError:
-            pass
-        return {"id": chat_id, "title": "New chat", "messages": [], "created": time.time()}
+        settings = self.load_settings(chat_id)
+        data = {"id": chat_id, "title": "New chat", "created": settings["created"], "messages": []}
+        for key in ("title", "created", "updated", "inference_stats"):
+            if key in settings:
+                data[key] = settings[key]
+        path = self.folder(chat_id) / "chat-history.sqlite"
+        if path.exists():
+            with closing(sqlite3.connect(path)) as connection:
+                data["messages"] = [
+                    json.loads(message)
+                    for (message,) in connection.execute(
+                        "SELECT message FROM messages ORDER BY position"
+                    )
+                ]
+        return data
 
     def save(self, data):
+        chat_id = data["id"]
         data.get("inference_stats", {}).pop("tokens_per_second", None)
-        self.documents(data["id"]).mkdir(parents=True, exist_ok=True)
-        _write_json(self.folder(data["id"]) / "chat.json", data)
+        self.documents(chat_id).mkdir(parents=True, exist_ok=True)
+        settings_path = self.folder(chat_id) / "chat-settings.json"
+        try:
+            settings = _read_json_object(settings_path)
+        except FileNotFoundError:
+            settings = {"code_agent": Settings.code_agent}
+        settings.update(
+            {key: value for key, value in data.items() if key not in {"messages", "pinned"}}
+        )
+        # Keep each message's optional fields without duplicating conversation data in settings.
+        with (
+            closing(sqlite3.connect(self.folder(chat_id) / "chat-history.sqlite")) as connection,
+            connection,
+        ):
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS messages "
+                "(position INTEGER PRIMARY KEY, message TEXT NOT NULL)"
+            )
+            connection.execute("DELETE FROM messages")
+            connection.executemany(
+                "INSERT INTO messages (position, message) VALUES (?, ?)",
+                (
+                    (index, json.dumps(message, ensure_ascii=False))
+                    for index, message in enumerate(data["messages"])
+                ),
+            )
+            self.save_settings(chat_id, settings)
+        documents_db = self.folder(chat_id) / "documents.sqlite"
+        if not documents_db.exists():
+            with closing(sqlite3.connect(documents_db)) as connection:
+                connection.execute("PRAGMA user_version = 1")
 
     def create(self):
         chat = {"id": uuid.uuid4().hex, "title": "New chat", "messages": [], "created": time.time()}
         self.save(chat)
-        self.save_settings(
-            chat["id"], {"code_agent": Settings.code_agent, "created": chat["created"]}
-        )
         return chat
 
     def list(self):
@@ -134,7 +163,7 @@ class ChatStore:
             chats = [
                 self.load(entry.name)
                 for entry in entries
-                if entry.is_dir() and (Path(entry.path) / "chat.json").exists()
+                if entry.is_dir() and (Path(entry.path) / "chat-history.sqlite").exists()
             ]
         app_settings = self.load_app_settings()
         pinned_order = {
