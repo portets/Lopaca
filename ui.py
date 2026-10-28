@@ -250,6 +250,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._apply_css()
         self._build_ui()
         controller.attach(self)
+        self.chat_list.add_tick_callback(self._scroll_initial_chat)
 
     def _apply_css(self):
         provider = Gtk.CssProvider()
@@ -674,6 +675,17 @@ class ChatWindow(Adw.ApplicationWindow):
         if active:
             self.chat_list.select_row(active)
 
+    def _scroll_initial_chat(self, _widget, _clock):
+        row = self.chat_list.get_selected_row()
+        if row is None:
+            return False
+        adjustment = self.chat_scroll.get_vadjustment()
+        if row.get_height() <= 0 or adjustment.get_page_size() <= 0:
+            return True
+        limit = max(adjustment.get_lower(), adjustment.get_upper() - adjustment.get_page_size())
+        adjustment.set_value(max(adjustment.get_lower(), min(limit, row.get_allocation().y)))
+        return False
+
     def _set_chat_header(self, row, previous):
         divider = None
         if previous is not None and previous.pinned and not row.pinned:
@@ -719,10 +731,12 @@ class ChatWindow(Adw.ApplicationWindow):
             return False
         adjustment = self.chat_scroll.get_vadjustment()
         page_size = adjustment.get_page_size()
-        if (
-            self._dragged_row.pinned
-            and sum(row.get_height() for row in self._chat_rows if row.pinned) <= page_size
-        ):
+        pinned_height = (
+            sum(row.get_height() for row in self._chat_rows if row.pinned)
+            if self._dragged_row.pinned
+            else None
+        )
+        if pinned_height is not None and pinned_height <= page_size:
             return True
         edge = min(40, page_size / 3)
         if edge <= 0:
@@ -735,6 +749,13 @@ class ChatWindow(Adw.ApplicationWindow):
             return True
         value = adjustment.get_value()
         limit = max(adjustment.get_lower(), adjustment.get_upper() - page_size)
+        if pinned_height is not None:
+            # Include the divider and its spacing, ending before the first unpinned row.
+            pinned_end = next(
+                (row.get_allocation().y for row in self._chat_rows if not row.pinned),
+                pinned_height,
+            )
+            limit = min(limit, pinned_end - page_size)
         next_value = max(adjustment.get_lower(), min(limit, value + step))
         if next_value != value:
             adjustment.set_value(next_value)

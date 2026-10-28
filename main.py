@@ -77,7 +77,7 @@ class LlamaClient:
             "stream_options": {"include_usage": True},
             "timings_per_token": True,
             "chat_template_kwargs": {"preserve_thinking": preserve_thinking},
-            "reasoning_budget_message": budget_message,
+            "reasoning_budget_message": f" -\n{budget_message}" if budget_message else "",
         }
         if self.settings.max_tokens is not None:
             body["max_tokens"] = self.settings.max_tokens
@@ -183,7 +183,14 @@ class ChatController:
         self.chat_sort = app_settings["chat_sort"]
         threading.Thread(target=self._monitor_connection, daemon=True).start()
         chats = self.store.list()
-        self.open_chat(chats[0]["id"] if chats else self.store.create()["id"])
+        active_chat = app_settings.get("active_chat")
+        if not any(chat["id"] == active_chat for chat in chats):
+            active_chat = (
+                max(chats, key=lambda chat: chat.get("updated", chat.get("created", 0)))["id"]
+                if chats
+                else self.store.create()["id"]
+            )
+        self.open_chat(active_chat)
 
     def idle_status(self):
         if self.connected:
@@ -253,6 +260,13 @@ class ChatController:
             else None
         )
         self.view.update_inference_stats(context_used, self._chat_speeds.get(chat_id))
+        app_settings = self.store.load_app_settings()
+        if app_settings.get("active_chat") != chat_id:
+            app_settings["active_chat"] = chat_id
+            try:
+                self.store.save_app_settings(app_settings)
+            except OSError as exc:
+                self.view.notify(f"Could not save active chat: {exc}")
 
     def rename_chat(self, chat_id, title):
         if not title.strip():
