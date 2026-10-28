@@ -15,7 +15,7 @@ gi.require_version("Gsk", "4.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gsk, Gtk, Pango  # noqa: E402
 
 CSS = """
-window {
+window.lopaca-main {
     background-color: @theme_bg_color;
     color: @theme_fg_color;
 }
@@ -225,6 +225,7 @@ def append_markdown(parent, text, command_extractor=None, command_handler=None):
 class ChatWindow(Adw.ApplicationWindow):
     def __init__(self, app, controller):
         super().__init__(application=app, title="Lopaca")
+        self.add_css_class("lopaca-main")
         self.controller, self.chat = controller, None
         self.busy = self.agent_mode = False
         self.follow_output = True
@@ -1017,60 +1018,80 @@ class ChatWindow(Adw.ApplicationWindow):
         self._scroll_guard = False
         return False
 
+    def _show_alert(self, heading, body, parent=None):
+        alert = Adw.AlertDialog(heading=heading, body=body)
+        alert.add_response("close", "Close")
+        alert.set_default_response("close")
+        alert.set_close_response("close")
+        alert.present(parent if parent is not None else self)
+
     def _rename_chat(self, chat_id):
         chat = self.controller.store.load(chat_id)
-        dialog = Gtk.Window(title="Rename chat", transient_for=self, modal=True)
-        dialog.set_default_size(380, -1)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        box.set_margin_top(18)
-        box.set_margin_bottom(18)
-        box.set_margin_start(18)
-        box.set_margin_end(18)
-        dialog.set_child(box)
+        dialog = Adw.Dialog(title="Rename Chat", content_width=380)
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        toolbar.add_top_bar(header)
         entry = Gtk.Entry(text=chat.get("title", ""))
-        box.append(entry)
+        entry.set_margin_top(18)
+        entry.set_margin_bottom(18)
+        entry.set_margin_start(18)
+        entry.set_margin_end(18)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        content.append(entry)
+        buttons = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        buttons.set_margin_bottom(18)
+        buttons.set_margin_start(18)
+        buttons.set_margin_end(18)
+        cancel_button = Gtk.Button(label="Cancel")
+        cancel_button.connect("clicked", lambda *_: dialog.close())
+        buttons.append(cancel_button)
+        content.append(buttons)
+        toolbar.set_content(content)
+        dialog.set_child(toolbar)
         save_button = Gtk.Button(label="Save")
         save_button.add_css_class("suggested-action")
-        save_button.connect(
-            "clicked",
-            lambda *_: (self.controller.rename_chat(chat_id, entry.get_text()), dialog.destroy()),
-        )
-        box.append(save_button)
-        dialog.present()
+
+        def save(*_):
+            self.controller.rename_chat(chat_id, entry.get_text())
+            dialog.close()
+
+        save_button.connect("clicked", save)
+        entry.connect("activate", save)
+        buttons.append(save_button)
+        dialog.present(self)
         entry.grab_focus()
 
+    @staticmethod
+    def _settings_dialog(title):
+        dialog = Adw.PreferencesDialog(title=title, content_width=660, content_height=540)
+        dialog.set_search_enabled(False)
+        page = Adw.PreferencesPage()
+        dialog.add(page)
+        group = Adw.PreferencesGroup()
+        page.add(group)
+        return dialog, page, group
+
     def _show_app_settings(self):
-        dialog = Adw.Window(title="App Settings", transient_for=self, modal=True)
-        dialog.set_default_size(380, -1)
-        toolbar = Adw.ToolbarView()
-        toolbar.add_top_bar(Adw.HeaderBar())
-        dialog.set_content(toolbar)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        box.set_margin_top(18)
-        box.set_margin_bottom(18)
-        box.set_margin_start(18)
-        box.set_margin_end(18)
-        preserve_reasoning_checkbox = Gtk.CheckButton(
-            label="Preserve Reasoning", active=self.controller.preserve_thinking
+        dialog, page, group = self._settings_dialog("App Settings")
+        preserve_reasoning_checkbox = Adw.SwitchRow(
+            title="Preserve Reasoning", active=self.controller.preserve_thinking
         )
         preserve_reasoning_checkbox.set_tooltip_text(
             "Allow model to remember previous thinking blocks."
         )
+        group.add(preserve_reasoning_checkbox)
 
-        def changed(button):
+        def changed(button, _param):
             try:
                 self.controller.set_preserve_reasoning(button.get_active())
             except OSError as exc:
                 with button.handler_block(preserve_reasoning_handler):
                     button.set_active(not button.get_active())
-                Gtk.AlertDialog(message="Could not save app settings", detail=str(exc)).show(dialog)
+                self._show_alert("Could not save app settings", str(exc), self)
 
-        preserve_reasoning_handler = preserve_reasoning_checkbox.connect("toggled", changed)
-        box.append(preserve_reasoning_checkbox)
-        heading = Gtk.Label(label="Unpinned Chat Sort", xalign=0)
-        heading.add_css_class("heading")
-        heading.set_margin_top(8)
-        box.append(heading)
+        preserve_reasoning_handler = preserve_reasoning_checkbox.connect("notify::active", changed)
+        sort_group = Adw.PreferencesGroup(title="Unpinned Chat Sort")
+        page.add(sort_group)
         sort_controls = {}
 
         def sort_changed(button, sort_mode):
@@ -1082,11 +1103,11 @@ class ChatWindow(Adw.ApplicationWindow):
                 previous_button, previous_handler = sort_controls[self.controller.chat_sort]
                 with previous_button.handler_block(previous_handler):
                     previous_button.set_active(True)
-                Gtk.AlertDialog(message="Could not save app settings", detail=str(exc)).show(dialog)
+                self._show_alert("Could not save app settings", str(exc), self)
 
         group = None
         for sort_mode, label in CHAT_SORT_OPTIONS:
-            button = Gtk.CheckButton(label=label)
+            button = Gtk.CheckButton(valign=Gtk.Align.CENTER)
             if group is None:
                 group = button
             else:
@@ -1094,65 +1115,49 @@ class ChatWindow(Adw.ApplicationWindow):
             button.set_active(sort_mode == self.controller.chat_sort)
             sort_handler = button.connect("toggled", sort_changed, sort_mode)
             sort_controls[sort_mode] = button, sort_handler
-            box.append(button)
-        toolbar.set_content(box)
-        dialog.present()
+            row = Adw.ActionRow(title=label)
+            row.add_suffix(button)
+            row.set_activatable_widget(button)
+            sort_group.add(row)
+        dialog.present(self)
 
     def _show_chat_settings(self, chat_id):
         chat_settings = self.controller.get_chat_settings(chat_id)
-        dialog = Adw.Window(title="Chat Settings", transient_for=self, modal=True)
-        dialog.set_default_size(380, -1)
-        toolbar = Adw.ToolbarView()
-        toolbar.add_top_bar(Adw.HeaderBar())
-        dialog.set_content(toolbar)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        box.set_margin_top(18)
-        box.set_margin_bottom(18)
-        box.set_margin_start(18)
-        box.set_margin_end(18)
-        code_agent_checkbox = Gtk.CheckButton(
-            label="Code agent", active=chat_settings["code_agent"]
-        )
+        dialog, _page, group = self._settings_dialog("Chat Settings")
+        code_agent_checkbox = Adw.SwitchRow(title="Code Agent", active=chat_settings["code_agent"])
         code_agent_checkbox.set_tooltip_text(
             "Let the assistant suggest terminal commands for explicit approval"
         )
         code_agent_checkbox.set_sensitive(self.controller.settings.enable_command_approval)
 
-        def changed(button):
+        def changed(button, _param):
             try:
                 self.controller.set_agent_mode(chat_id, button.get_active())
             except OSError as exc:
                 with button.handler_block(handler):
                     button.set_active(not button.get_active())
-                Gtk.AlertDialog(message="Could not save chat settings", detail=str(exc)).show(
-                    dialog
-                )
+                self._show_alert("Could not save chat settings", str(exc), self)
 
-        handler = code_agent_checkbox.connect("toggled", changed)
-        box.append(code_agent_checkbox)
-        toolbar.set_content(box)
-        dialog.present()
+        handler = code_agent_checkbox.connect("notify::active", changed)
+        group.add(code_agent_checkbox)
+        dialog.present(self)
 
     def _confirm_delete_chat(self, chat_id):
-        dialog = Gtk.Window(title="Delete chat?", transient_for=self, modal=True)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        box.set_margin_top(18)
-        box.set_margin_bottom(18)
-        box.set_margin_start(18)
-        box.set_margin_end(18)
-        dialog.set_child(box)
-        label = Gtk.Label(
-            label="Delete this chat and its chat folder? This cannot be undone.", xalign=0
+        alert = Adw.AlertDialog(
+            heading="Delete Chat?",
+            body="Delete this chat and its chat folder? This cannot be undone.",
         )
-        label.set_wrap(True)
-        box.append(label)
-        delete_button = Gtk.Button(label="Delete Chat")
-        delete_button.add_css_class("destructive-action")
-        delete_button.connect(
-            "clicked", lambda *_: (dialog.destroy(), self.controller.delete_chat(chat_id))
-        )
-        box.append(delete_button)
-        dialog.present()
+        alert.add_response("cancel", "Cancel")
+        alert.add_response("delete", "Delete Chat")
+        alert.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        alert.set_default_response("cancel")
+        alert.set_close_response("cancel")
+
+        def confirmed(dialog, result):
+            if dialog.choose_finish(result) == "delete":
+                self.controller.delete_chat(chat_id)
+
+        alert.choose(self, None, confirmed)
 
     def _choose_documents(self, chat_id):
         if self.chat and self.chat["id"] != chat_id:
@@ -1175,7 +1180,7 @@ class ChatWindow(Adw.ApplicationWindow):
             "These files are unsupported or could not be read and were not copied:\n\n"
             + "\n".join(str(path) for path in paths)
         )
-        Gtk.AlertDialog(message="Some documents could not be added", detail=detail).show(self)
+        self._show_alert("Some documents could not be added", detail)
 
     def _review_command(self, _button, command):
         kind, payload, risks = self.controller.review_command(command)
@@ -1192,7 +1197,7 @@ class ChatWindow(Adw.ApplicationWindow):
             return
         if kind == "error":
             self.notify(payload)
-            Gtk.AlertDialog(message="Cannot prepare command", detail=payload).show(self)
+            self._show_alert("Cannot prepare command", payload)
             return
         self._show_command_approval(
             "Run this command?",
@@ -1206,7 +1211,10 @@ class ChatWindow(Adw.ApplicationWindow):
     def _show_command_approval(self, title, description, command, action_label, action, risks):
         # GNOME attaches modal windows to their parent's center while resizing.
         # Use a normal transient window and block parent interaction explicitly.
-        dialog = Gtk.Window(title=title, transient_for=self, modal=False, destroy_with_parent=True)
+        dialog = Adw.Window(title=title, transient_for=self, modal=False, destroy_with_parent=True)
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(Adw.HeaderBar())
+        dialog.set_content(toolbar)
 
         def close_preview(*_):
             self.set_sensitive(True)
@@ -1222,7 +1230,7 @@ class ChatWindow(Adw.ApplicationWindow):
         box.set_margin_bottom(18)
         box.set_margin_start(18)
         box.set_margin_end(18)
-        dialog.set_child(box)
+        toolbar.set_content(box)
         for text in (
             description,
             f"Working directory: {self.controller.store.folder(self.chat['id'])}",
@@ -1233,11 +1241,7 @@ class ChatWindow(Adw.ApplicationWindow):
             label.set_selectable(True)
             box.append(label)
         risk_details = list(dict.fromkeys(f"{risk.level.title()}: {risk.reason}" for risk in risks))
-        risk_summary = "\n".join(risk_details[:10])
-        if len(risk_details) > 10:
-            risk_summary += (
-                "\nAdditional risks were detected; review the code and referenced files."
-            )
+        risk_summary = "\n".join(risk_details)
         if risks:
             legend = Gtk.Label(
                 label="POTENTIALLY DANGEROUS CODE DETECTED\n"
@@ -1331,7 +1335,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 response = alert.choose_finish(result)
             except GLib.Error:
                 return
-            if response == 1:
+            if response == "proceed":
                 close_preview()
                 action()
 
@@ -1340,21 +1344,33 @@ class ChatWindow(Adw.ApplicationWindow):
                 close_preview()
                 action()
                 return
-            alert = Gtk.AlertDialog(
-                message="Warning: potentially dangerous commands detected. Are you sure?",
-                detail=risk_summary,
-                buttons=["Cancel", "Proceed"],
-                cancel_button=0,
-                default_button=0,
+            alert = Adw.AlertDialog(
+                heading="Potentially Dangerous Commands",
+                body="Warning: potentially dangerous commands detected. Are you sure?",
             )
+            warnings = Gtk.Label(label=risk_summary, xalign=0, wrap=True, selectable=True)
+            warnings.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            alert.set_extra_child(warnings)
+            alert.set_content_width(460)
+            alert.set_follows_content_size(True)
+            alert.add_response("cancel", "Cancel")
+            alert.add_response("proceed", "Proceed")
+            alert.set_response_appearance("proceed", Adw.ResponseAppearance.DESTRUCTIVE)
+            alert.set_default_response("cancel")
+            alert.set_close_response("cancel")
             approve_button.set_sensitive(False)
-            alert.choose(dialog, None, confirmed)
+            # An embedded alert cannot grow beyond a short command preview.
+            alert.choose(None, None, confirmed)
+            alert_window = alert.get_root()
+            alert_window.set_transient_for(dialog)
+            alert_window.set_modal(True)
+            alert_window.set_destroy_with_parent(True)
 
         approve_button.connect("clicked", approve)
         buttons.append(approve_button)
         box.append(buttons)
         # Measure the controls instead of leaving a fixed amount of empty window space.
-        _, natural_height, _, _ = box.measure(Gtk.Orientation.VERTICAL, dialog_width)
+        _, natural_height, _, _ = toolbar.measure(Gtk.Orientation.VERTICAL, dialog_width)
         horizontal_height = 0
         if command_width > dialog_width - 64:
             horizontal_height = max(
