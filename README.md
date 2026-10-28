@@ -17,7 +17,7 @@ Make sure gtk python libraries are installed. Otherwise it's all standard librar
 Edit settings.py if you need top change your server URL, default is currently latest llama-server default.
 
 # TO-DO
-- Add global settings menu and populate
+- Add more global settings
 - Add more individual chat settings
 - More robust RAG; BM25 and RFF
 - Global memories file that the RAG function uses
