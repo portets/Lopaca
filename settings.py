@@ -26,4 +26,5 @@ class Settings:
     max_context_chars: int = 12000
     chunk_chars: int = 1100
     chunk_overlap: int = 140
+    code_agent: bool = True
     enable_command_approval: bool = True

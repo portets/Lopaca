@@ -75,7 +75,7 @@ class ChatStore:
                 "code_agent": False,
                 "created": self.load(chat_id).get("created", time.time()),
             }
-        data["code_agent"] = data.get("code_agent") is True
+        data["code_agent"] = data.get("code_agent", Settings.code_agent) is True
         if not isinstance(data.get("created"), (int, float)):
             data["created"] = self.load(chat_id).get("created", time.time())
             self.save_settings(chat_id, data)
@@ -123,7 +123,9 @@ class ChatStore:
     def create(self):
         chat = {"id": uuid.uuid4().hex, "title": "New chat", "messages": [], "created": time.time()}
         self.save(chat)
-        self.save_settings(chat["id"], {"code_agent": False, "created": chat["created"]})
+        self.save_settings(
+            chat["id"], {"code_agent": Settings.code_agent, "created": chat["created"]}
+        )
         return chat
 
     def list(self):

@@ -7,6 +7,7 @@ import threading
 import time
 import urllib.request
 from contextlib import suppress
+from pathlib import Path
 
 from agentic import (
     CODING_INSTRUCTION,
@@ -16,7 +17,7 @@ from agentic import (
     run_command,
     write_file,
 )
-from rag import format_context, retrieve
+from rag import format_context, read_document, retrieve
 from settings import Settings
 from storage import ChatStore
 
@@ -315,11 +316,20 @@ class ChatController:
         self._drafts.pop(chat_id, None)
 
     def add_documents(self, paths):
-        try:
-            self.store.add_documents(self.chat["id"], paths)
-            self.view.notify("Documents added to this chat's folder")
-        except OSError as exc:
-            self.view.notify(f"Could not add documents: {exc}")
+        supported, skipped = [], []
+        for path in map(Path, paths):
+            if read_document(path) is None:
+                skipped.append(path)
+            else:
+                supported.append(path)
+        if supported:
+            try:
+                self.store.add_documents(self.chat["id"], supported)
+                self.view.notify("Documents added to this chat's folder")
+            except OSError as exc:
+                self.view.notify(f"Could not add documents: {exc}")
+        if skipped:
+            self.view.show_document_warning(skipped)
 
     def open_folder(self, chat_id):
         try:

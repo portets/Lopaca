@@ -1,50 +1,50 @@
 """Local document retrieval using keyword scoring."""
 
+import codecs
 import re
 
-TEXT_SUFFIXES = {
-    ".txt",
-    ".md",
-    ".rst",
-    ".py",
-    ".c",
-    ".h",
-    ".cpp",
-    ".hpp",
-    ".js",
-    ".ts",
-    ".tsx",
-    ".jsx",
-    ".html",
-    ".css",
-    ".json",
-    ".toml",
-    ".yaml",
-    ".yml",
-    ".ini",
-    ".sh",
-    ".java",
-    ".rs",
-    ".go",
-    ".sql",
-    ".csv",
-    ".log",
-    ".xml",
-}
+
+def read_document(path):
+    """Read common text encodings, skipping likely binary and unsupported documents."""
+    try:
+        with path.open("rb") as source:
+            sample = source.read(8192)
+            if sample.startswith(b"%PDF-"):
+                return None
+            if sample.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+                encodings = ("utf-32",)
+            elif sample.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+                encodings = ("utf-16",)
+            else:
+                controls = sum(byte < 32 and byte not in b"\t\n\r\v\f\b\x1b" for byte in sample)
+                if b"\0" in sample or controls > len(sample) * 0.05:
+                    return None
+                encodings = ("utf-8-sig", "cp1252", "latin-1")
+            data = sample + source.read()
+    except OSError:
+        return None
+    for encoding in encodings:
+        try:
+            text = data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        sample_text = text[:8192]
+        controls = sum(
+            not (char.isprintable() or char.isspace() or char in "\b\x1b") for char in sample_text
+        )
+        if "\0" in text or controls > len(sample_text) * 0.05:
+            return None
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+    return None
 
 
 def _chunk_documents(folder, size, overlap):
     chunks = []
     for path in folder.rglob("*"):
-        if (
-            path.name.startswith(".")
-            or path.suffix.lower() not in TEXT_SUFFIXES
-            or not path.is_file()
-        ):
+        if not path.is_file():
             continue
-        try:
-            content = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        content = read_document(path)
+        if not content:
             continue
         source_name = str(path.relative_to(folder))
         for start in range(0, len(content), max(1, size - overlap)):

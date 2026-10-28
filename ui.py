@@ -1148,6 +1148,14 @@ class ChatWindow(Adw.ApplicationWindow):
         paths = (files.get_item(i).get_path() for i in range(files.get_n_items()))
         self.controller.add_documents([path for path in paths if path])
 
+    def show_document_warning(self, paths):
+        detail = (
+            "Only readable text documents are currently supported. "
+            "These files are unsupported or could not be read and were not copied:\n\n"
+            + "\n".join(str(path) for path in paths)
+        )
+        Gtk.AlertDialog(message="Some documents could not be added", detail=detail).show(self)
+
     def _review_command(self, _button, command):
         kind, payload = self.controller.review_command(command)
         if kind == "file":
