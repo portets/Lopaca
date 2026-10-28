@@ -63,7 +63,7 @@ class LlamaClient:
         with urllib.request.urlopen(request, timeout=3) as response:
             return json.load(response).get("status") == "ok"
 
-    def stream(self, messages, stopped, on_thinking, on_answer, on_stats):
+    def stream(self, messages, preserve_thinking, stopped, on_thinking, on_answer, on_stats):
         url = self.settings.server_url.rstrip("/") + "/chat/completions"
         body = {
             "model": self.settings.model,
@@ -72,11 +72,10 @@ class LlamaClient:
             "temperature": self.settings.temperature,
             "stream_options": {"include_usage": True},
             "timings_per_token": True,
+            "chat_template_kwargs": {"preserve_thinking": preserve_thinking},
         }
         if self.settings.max_tokens is not None:
             body["max_tokens"] = self.settings.max_tokens
-        if self.settings.preserve_thinking:
-            body["chat_template_kwargs"] = {"preserve_thinking": True}
         request = urllib.request.Request(
             url,
             data=json.dumps(body).encode(),
@@ -147,6 +146,7 @@ class ChatController:
 
     def __init__(self, settings):
         self.settings, self.store, self.client = settings, ChatStore(), LlamaClient(settings)
+        self.preserve_thinking = settings.preserve_thinking
         self.view = self.chat = None
         self.busy = self.agent_mode = self.stop_requested = False
         self._generation_chat_id = None
@@ -160,6 +160,10 @@ class ChatController:
     def attach(self, view):
         self.view = view
         self.store.ensure()
+        app_settings = self.store.load_app_settings()
+        self.preserve_thinking = (
+            app_settings.get("preserve_reasoning", self.settings.preserve_thinking) is True
+        )
         threading.Thread(target=self._monitor_connection, daemon=True).start()
         chats = self.store.list()
         self.open_chat(chats[0]["id"] if chats else self.store.create()["id"])
@@ -303,6 +307,12 @@ class ChatController:
     def get_chat_settings(self, chat_id):
         return self.store.load_settings(chat_id)
 
+    def set_preserve_reasoning(self, enabled):
+        app_settings = self.store.load_app_settings()
+        app_settings["preserve_reasoning"] = bool(enabled)
+        self.store.save_app_settings(app_settings)
+        self.preserve_thinking = bool(enabled)
+
     def set_agent_mode(self, chat_id, enabled):
         chat_settings = self.get_chat_settings(chat_id)
         chat_settings["code_agent"] = bool(enabled)
@@ -343,7 +353,7 @@ class ChatController:
         ]
         for message in self.chat["messages"]:
             item = {"role": message["role"], "content": message.get("content", "")}
-            if message.get("reasoning_content"):
+            if self.preserve_thinking and message.get("reasoning_content"):
                 item["reasoning_content"] = message["reasoning_content"]
             messages.append(item)
         self._generation_chat_id = self.chat["id"]
@@ -351,11 +361,14 @@ class ChatController:
         self.busy = True
         self.stop_requested = False
         self.view.begin_response()
-        threading.Thread(target=self._stream, args=(messages,), daemon=True).start()
+        threading.Thread(
+            target=self._stream, args=(messages, self.preserve_thinking), daemon=True
+        ).start()
 
-    def _stream(self, messages):
+    def _stream(self, messages, preserve_thinking):
         answer, reasoning, error = self.client.stream(
             messages,
+            preserve_thinking,
             lambda: self.stop_requested,
             lambda text: self.view.dispatch(self.view.update_thinking, text),
             lambda text: self.view.dispatch(self.view.update_answer, text),
