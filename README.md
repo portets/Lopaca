@@ -2,7 +2,7 @@
 Lopaca is a llama-server GUI frontend written in python using standard libraries, currently designed for Linux with GTK but others will come later. Primarily designed for local model usage with local documents. Features include RAG document support and rudimentary agentic support.
 
 # Requirements
-Should run using default packages on any recent(2026) Gnome-based distro, no extra packages needed.
+Should run using default packages on any recent(2026) Gnome-based distro, no extra packages needed.\
 Python 3.14+ is required. For any recent Ubuntu-based distros WITHOUT gnome you should only need to run:
 ```
 sudo apt install python3-gi gir1.2-adw-1
@@ -10,7 +10,7 @@ sudo apt install python3-gi gir1.2-adw-1
 Edit settings.py if you need to change your server URL, default is currently latest llama-server default.
 
 # Usage
-Start an instance of llama-server with your favorite LLM. Mostly tested with Qwen3.6 and 3.8 27b.
+Start an instance of llama-server with your favorite LLM. Mostly tested with Qwen3.6 and 3.8 27b.\
 To run:
 ```
 ./lopaca.sh
@@ -19,8 +19,8 @@ To install:
 ```
 ./install.sh
 ```
-Or right click and run as program. May need to check Properties/Executable as Program first.
-Installs to ~/.local/share/lopaca/ with a shorcut menu entry at ~/.local/share/applications/Lopaca.desktop.
+Or right click and run as program. May need to check Properties/Executable as Program first.\
+Installs to ~/.local/share/lopaca/ with a shorcut menu entry at ~/.local/share/applications/Lopaca.desktop.\
 Then just run it using your menu shortcut.
 
 # TO-DO
