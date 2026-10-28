@@ -320,11 +320,13 @@ class ChatWindow(Adw.ApplicationWindow):
         chat_scroll.set_vexpand(True)
         chat_scroll.set_margin_bottom(8)
         sidebar.append(chat_scroll)
+        footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        footer.set_margin_start(10)
+        footer.set_margin_end(10)
+        footer.set_margin_bottom(12)
         usage = Gtk.CenterBox()
         usage.add_css_class("muted")
-        usage.set_margin_start(10)
-        usage.set_margin_bottom(12)
-        usage.set_margin_end(10)
+        usage.set_hexpand(True)
         self.chat_usage = Gtk.Label(label="Chat: —", xalign=1)
         self.chat_usage.set_hexpand(True)
         self.total_usage = Gtk.Label(label="Total: —", xalign=0)
@@ -332,7 +334,14 @@ class ChatWindow(Adw.ApplicationWindow):
         usage.set_start_widget(self.chat_usage)
         usage.set_center_widget(Gtk.Label(label=" | "))
         usage.set_end_widget(self.total_usage)
-        sidebar.append(usage)
+        footer.append(usage)
+        settings_button = Gtk.Button(
+            icon_name="emblem-system-symbolic", tooltip_text="App Settings"
+        )
+        settings_button.add_css_class("flat")
+        settings_button.connect("clicked", lambda *_: self._show_app_settings())
+        footer.append(settings_button)
+        sidebar.append(footer)
         root.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
         main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         main.set_hexpand(True)
@@ -958,6 +967,37 @@ class ChatWindow(Adw.ApplicationWindow):
         box.append(save_button)
         dialog.present()
         entry.grab_focus()
+
+    def _show_app_settings(self):
+        dialog = Adw.Window(title="App Settings", transient_for=self, modal=True)
+        dialog.set_default_size(380, -1)
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(Adw.HeaderBar())
+        dialog.set_content(toolbar)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_margin_top(18)
+        box.set_margin_bottom(18)
+        box.set_margin_start(18)
+        box.set_margin_end(18)
+        preserve_reasoning_checkbox = Gtk.CheckButton(
+            label="Preserve Reasoning", active=self.controller.preserve_thinking
+        )
+        preserve_reasoning_checkbox.set_tooltip_text(
+            "Allow model to remember previous thinking blocks."
+        )
+
+        def changed(button):
+            try:
+                self.controller.set_preserve_reasoning(button.get_active())
+            except OSError as exc:
+                with button.handler_block(handler):
+                    button.set_active(not button.get_active())
+                Gtk.AlertDialog(message="Could not save app settings", detail=str(exc)).show(dialog)
+
+        handler = preserve_reasoning_checkbox.connect("toggled", changed)
+        box.append(preserve_reasoning_checkbox)
+        toolbar.set_content(box)
+        dialog.present()
 
     def _show_chat_settings(self, chat_id):
         chat_settings = self.controller.get_chat_settings(chat_id)
