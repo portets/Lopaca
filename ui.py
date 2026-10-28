@@ -16,8 +16,10 @@ from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gsk, Gtk, Pango  # noqa
 
 CSS = """
 window.lopaca-main {
-    background-color: @theme_bg_color;
     color: @theme_fg_color;
+}
+window.lopaca-main, .transcript-scroll, .transcript {
+    background-color: @theme_bg_color;
 }
 .app-titlebar {
     background-color: @headerbar_bg_color;
@@ -25,17 +27,14 @@ window.lopaca-main {
     box-shadow: 0 1px 1px @headerbar_shade_color;
 }
 .sidebar {
-    background-color: alpha(@headerbar_shade_color,0.4);
-    border-radius: 10px;
     margin: 4px;
     padding: 4px 0;
     min-width: 286px;
 }
 .sidebar, .composer-frame {
+    background-color: alpha(@headerbar_shade_color,0.4);
     border: 1px solid @borders;
-}
-.transcript-scroll, .transcript {
-    background-color: @theme_bg_color;
+    border-radius: 10px;
 }
 .workspace-list row {
     border-radius: 8px;
@@ -108,23 +107,17 @@ window.lopaca-main {
     padding: 3px 10px;
     margin-bottom: 8px;
     border-radius: 5px;
-    font-weight: normal;
 }
 .thinking button {
     min-height: 28px;
     padding: 2px 4px;
-    font-weight: normal;
 }
-.thinking label {
+.thinking, .thinking button, .thinking label {
     font-weight: normal;
 }
 .muted {
     color: alpha(@window_fg_color,0.62);
     font-size: 0.9em;
-}
-.composer-frame {
-    background-color: alpha(@headerbar_shade_color,0.4);
-    border-radius: 10px;
 }
 .prompt-view, .prompt-view text {
     background-color: transparent;
@@ -1411,7 +1404,6 @@ class Lopaca(Adw.Application):
         GLib.set_application_name("Lopaca")
 
     def do_activate(self):
-        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.DEFAULT)
         window = self.props.active_window
         if not window:
             window = ChatWindow(self, self.controller)
