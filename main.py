@@ -15,6 +15,7 @@ from agentic import (
     parse_file_heredoc,
     prepare_command,
     run_command,
+    scan_command,
     write_file,
 )
 from rag import format_context, read_document, retrieve
@@ -500,11 +501,12 @@ class ChatController:
         return extract_commands(text) if self.settings.enable_command_approval else []
 
     def review_command(self, command):
+        risks = scan_command(command, self.store.folder(self.chat["id"]), self.settings)
         file_write = parse_file_heredoc(command)
         if file_write:
-            return "file", file_write
+            return "file", file_write, risks
         args, error = prepare_command(command)
-        return ("error", error) if error else ("command", args)
+        return ("error", error, risks) if error else ("command", args, risks)
 
     def create_file(self, path, contents):
         try:
@@ -517,11 +519,12 @@ class ChatController:
 
     def run_command(self, args):
         self.view.set_status("Running command…")
-        threading.Thread(target=self._run_command, args=(args,), daemon=True).start()
+        cwd = self.store.folder(self.chat["id"])
+        threading.Thread(target=self._run_command, args=(args, cwd), daemon=True).start()
 
-    def _run_command(self, args):
+    def _run_command(self, args, cwd):
         try:
-            output, exit_code, note = run_command(args, self.store.folder(self.chat["id"]))
+            output, exit_code, note = run_command(args, cwd)
             self.view.dispatch(self.view.show_command_result, output[-5000:], exit_code, note)
         except Exception as exc:
             self.view.dispatch(self.view.show_command_error, str(exc))

@@ -477,7 +477,7 @@ class ChatWindow(Adw.ApplicationWindow):
         if self._notification_timer is not None:
             GLib.source_remove(self._notification_timer)
         self._display_status(text)
-        self._notification_timer = GLib.timeout_add(4000, self._restore_status)
+        self._notification_timer = GLib.timeout_add(3000, self._restore_status)
 
     def _restore_status(self):
         self._notification_timer = None
@@ -1178,7 +1178,7 @@ class ChatWindow(Adw.ApplicationWindow):
         Gtk.AlertDialog(message="Some documents could not be added", detail=detail).show(self)
 
     def _review_command(self, _button, command):
-        kind, payload = self.controller.review_command(command)
+        kind, payload, risks = self.controller.review_command(command)
         if kind == "file":
             path, contents = payload
             self._show_command_approval(
@@ -1187,6 +1187,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 command,
                 "Create file",
                 lambda: self.controller.create_file(path, contents),
+                risks,
             )
             return
         if kind == "error":
@@ -1199,9 +1200,10 @@ class ChatWindow(Adw.ApplicationWindow):
             command,
             "Run command",
             lambda: self.controller.run_command(payload),
+            risks,
         )
 
-    def _show_command_approval(self, title, description, command, action_label, action):
+    def _show_command_approval(self, title, description, command, action_label, action, risks):
         # GNOME attaches modal windows to their parent's center while resizing.
         # Use a normal transient window and block parent interaction explicitly.
         dialog = Gtk.Window(title=title, transient_for=self, modal=False, destroy_with_parent=True)
@@ -1230,6 +1232,20 @@ class ChatWindow(Adw.ApplicationWindow):
             label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
             label.set_selectable(True)
             box.append(label)
+        risk_details = list(dict.fromkeys(f"{risk.level.title()}: {risk.reason}" for risk in risks))
+        risk_summary = "\n".join(risk_details[:10])
+        if len(risk_details) > 10:
+            risk_summary += (
+                "\nAdditional risks were detected; review the code and referenced files."
+            )
+        if risks:
+            legend = Gtk.Label(
+                label="POTENTIALLY DANGEROUS CODE DETECTED\n"
+                "Basic scan only; unhighlighted code can still be dangerous.",
+                xalign=0,
+            )
+            legend.set_wrap(True)
+            box.append(legend)
         lines = command.count("\n") + 1
         if lines > 16:
             notice = Gtk.Label(
@@ -1243,7 +1259,24 @@ class ChatWindow(Adw.ApplicationWindow):
         preview.set_left_margin(4)
         preview.set_right_margin(4)
         preview.set_wrap_mode(Gtk.WrapMode.NONE)
-        preview.get_buffer().set_text(command)
+        buffer = preview.get_buffer()
+        buffer.set_text(command)
+        tags = {}
+        for level, color in (
+            ("warning", "rgba(255,226,0,0.6)"),
+            ("danger", "rgba(229,57,53,0.6)"),
+        ):
+            shade = Gdk.RGBA()
+            shade.parse(color)
+            tags[level] = buffer.create_tag(f"risk-{level}", background_rgba=shade)
+        for risk in risks:
+            buffer.apply_tag(
+                tags[risk.level],
+                buffer.get_iter_at_offset(risk.start),
+                buffer.get_iter_at_offset(risk.end),
+            )
+        if risks:
+            preview.set_tooltip_text(risk_summary)
         context = preview.get_pango_context()
         font = context.get_font_description().copy()
         font.set_family("monospace")
@@ -1286,8 +1319,38 @@ class ChatWindow(Adw.ApplicationWindow):
         cancel_button.connect("clicked", close_preview)
         buttons.append(cancel_button)
         approve_button = Gtk.Button(label=action_label)
-        approve_button.add_css_class("suggested-action")
-        approve_button.connect("clicked", lambda *_: (close_preview(), action()))
+        approve_button.add_css_class(
+            "destructive-action"
+            if any(risk.level == "danger" for risk in risks)
+            else "suggested-action"
+        )
+
+        def confirmed(alert, result):
+            approve_button.set_sensitive(True)
+            try:
+                response = alert.choose_finish(result)
+            except GLib.Error:
+                return
+            if response == 1:
+                close_preview()
+                action()
+
+        def approve(_button):
+            if not risks:
+                close_preview()
+                action()
+                return
+            alert = Gtk.AlertDialog(
+                message="Warning: potentially dangerous commands detected. Are you sure?",
+                detail=risk_summary,
+                buttons=["Cancel", "Proceed"],
+                cancel_button=0,
+                default_button=0,
+            )
+            approve_button.set_sensitive(False)
+            alert.choose(dialog, None, confirmed)
+
+        approve_button.connect("clicked", approve)
         buttons.append(approve_button)
         box.append(buttons)
         # Measure the controls instead of leaving a fixed amount of empty window space.

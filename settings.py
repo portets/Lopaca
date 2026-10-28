@@ -28,3 +28,5 @@ class Settings:
     chunk_overlap: int = 140
     code_agent: bool = True
     enable_command_approval: bool = True
+    command_scan_chars: int = 262144
+    command_scan_files: int = 8
