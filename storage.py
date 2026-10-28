@@ -7,6 +7,8 @@ import time
 import uuid
 from pathlib import Path
 
+from settings import CHAT_SORT_OPTIONS, Settings
+
 APP_DIR = Path.home() / ".local" / "share" / "lopaca"
 CHATS_DIR = APP_DIR / "chats"
 
@@ -67,11 +69,16 @@ class ChatStore:
         try:
             data = _read_json_object(self.folder(chat_id) / "chat-settings.json")
         except FileNotFoundError:
-            data = {"code_agent": False}
-            self.save_settings(chat_id, data)
-        except OSError, json.JSONDecodeError:
             data = {}
+        except OSError, json.JSONDecodeError:
+            return {
+                "code_agent": False,
+                "created": self.load(chat_id).get("created", time.time()),
+            }
         data["code_agent"] = data.get("code_agent") is True
+        if not isinstance(data.get("created"), (int, float)):
+            data["created"] = self.load(chat_id).get("created", time.time())
+            self.save_settings(chat_id, data)
         return data
 
     def save_settings(self, chat_id, settings):
@@ -84,12 +91,15 @@ class ChatStore:
             data = _read_json_object(self.root.parent / "app-settings.json")
         except OSError, json.JSONDecodeError:
             data = {}
-        pinned_chats = data.get("pinned_chats", [])
-        data["pinned_chats"] = (
-            list(dict.fromkeys(chat_id for chat_id in pinned_chats if isinstance(chat_id, str)))
-            if isinstance(pinned_chats, list)
-            else []
-        )
+        for key in ("pinned_chats", "unpinned_chat_order"):
+            chat_order = data.get(key, [])
+            data[key] = (
+                list(dict.fromkeys(chat_id for chat_id in chat_order if isinstance(chat_id, str)))
+                if isinstance(chat_order, list)
+                else []
+            )
+        if data.get("chat_sort") not in dict(CHAT_SORT_OPTIONS):
+            data["chat_sort"] = Settings.chat_sort
         return data
 
     def save_app_settings(self, settings):
@@ -113,7 +123,7 @@ class ChatStore:
     def create(self):
         chat = {"id": uuid.uuid4().hex, "title": "New chat", "messages": [], "created": time.time()}
         self.save(chat)
-        self.save_settings(chat["id"], {"code_agent": False})
+        self.save_settings(chat["id"], {"code_agent": False, "created": chat["created"]})
         return chat
 
     def list(self):
@@ -124,18 +134,28 @@ class ChatStore:
                 for entry in entries
                 if entry.is_dir() and (Path(entry.path) / "chat.json").exists()
             ]
+        app_settings = self.load_app_settings()
         pinned_order = {
-            chat_id: index for index, chat_id in enumerate(self.load_app_settings()["pinned_chats"])
+            chat_id: index for index, chat_id in enumerate(app_settings["pinned_chats"])
+        }
+        manual_order = {
+            chat_id: index for index, chat_id in enumerate(app_settings["unpinned_chat_order"])
         }
         for chat in chats:
             chat["pinned"] = chat["id"] in pinned_order
-        chats.sort(
-            key=lambda chat: (
-                (0, pinned_order[chat["id"]])
-                if chat["pinned"]
-                else (1, -chat.get("updated", chat.get("created", 0)))
-            )
-        )
+            chat["created"] = self.load_settings(chat["id"])["created"]
+
+        def sort_key(chat):
+            if chat["pinned"]:
+                return 0, pinned_order[chat["id"]]
+            if app_settings["chat_sort"] == "recently_used":
+                return 1, -chat.get("updated", chat["created"])
+            if app_settings["chat_sort"] == "creation_date":
+                return 1, -chat["created"]
+            # New chats precede the saved order; without one, use creation date.
+            return 1, manual_order.get(chat["id"], -1), -chat["created"]
+
+        chats.sort(key=sort_key)
         return chats
 
     def add_documents(self, chat_id, paths):
@@ -152,6 +172,8 @@ class ChatStore:
     def delete(self, chat_id):
         shutil.rmtree(self.folder(chat_id))
         settings = self.load_app_settings()
-        if chat_id in settings["pinned_chats"]:
-            settings["pinned_chats"].remove(chat_id)
+        order_keys = ("pinned_chats", "unpinned_chat_order")
+        if any(chat_id in settings[key] for key in order_keys):
+            for key in order_keys:
+                settings[key] = [item for item in settings[key] if item != chat_id]
             self.save_app_settings(settings)

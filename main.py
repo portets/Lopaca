@@ -147,6 +147,7 @@ class ChatController:
     def __init__(self, settings):
         self.settings, self.store, self.client = settings, ChatStore(), LlamaClient(settings)
         self.preserve_thinking = settings.preserve_thinking
+        self.chat_sort = settings.chat_sort
         self.view = self.chat = None
         self.busy = self.agent_mode = self.stop_requested = False
         self._generation_chat_id = None
@@ -164,6 +165,7 @@ class ChatController:
         self.preserve_thinking = (
             app_settings.get("preserve_reasoning", self.settings.preserve_thinking) is True
         )
+        self.chat_sort = app_settings["chat_sort"]
         threading.Thread(target=self._monitor_connection, daemon=True).start()
         chats = self.store.list()
         self.open_chat(chats[0]["id"] if chats else self.store.create()["id"])
@@ -262,17 +264,28 @@ class ChatController:
             return
         self.refresh()
 
-    def move_pinned(self, chat_id, target_id, after):
+    def move_chat(self, chat_id, target_id, after):
         app_settings = self.store.load_app_settings()
         pinned_chats = app_settings["pinned_chats"]
-        if chat_id == target_id or chat_id not in pinned_chats or target_id not in pinned_chats:
+        pinned = chat_id in pinned_chats
+        if chat_id == target_id or pinned != (target_id in pinned_chats):
             return False
-        pinned_chats.remove(chat_id)
-        pinned_chats.insert(pinned_chats.index(target_id) + int(after), chat_id)
+        if pinned:
+            order_key, chat_order = "pinned_chats", pinned_chats
+        elif app_settings["chat_sort"] == "user_selectable":
+            order_key = "unpinned_chat_order"
+            chat_order = [chat["id"] for chat in self.store.list() if not chat["pinned"]]
+        else:
+            return False
+        if chat_id not in chat_order or target_id not in chat_order:
+            return False
+        chat_order.remove(chat_id)
+        chat_order.insert(chat_order.index(target_id) + int(after), chat_id)
+        app_settings[order_key] = chat_order
         try:
             self.store.save_app_settings(app_settings)
         except OSError as exc:
-            self.view.notify(f"Could not save pinned order: {exc}")
+            self.view.notify(f"Could not save chat order: {exc}")
             return False
         self.view.dispatch(self.refresh)  # Rebuild rows after GTK finishes the drop.
         return True
@@ -312,6 +325,13 @@ class ChatController:
         app_settings["preserve_reasoning"] = bool(enabled)
         self.store.save_app_settings(app_settings)
         self.preserve_thinking = bool(enabled)
+
+    def set_chat_sort(self, sort_mode):
+        app_settings = self.store.load_app_settings()
+        app_settings["chat_sort"] = sort_mode
+        self.store.save_app_settings(app_settings)
+        self.chat_sort = sort_mode
+        self.refresh()
 
     def set_agent_mode(self, chat_id, enabled):
         chat_settings = self.get_chat_settings(chat_id)

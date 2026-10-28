@@ -5,6 +5,8 @@ import re
 
 import gi
 
+from settings import CHAT_SORT_OPTIONS
+
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Graphene", "1.0")
@@ -68,7 +70,7 @@ window {
 .chat-options-menu modelbutton {
     font-weight: normal;
 }
-.pin-drop-indicator {
+.chat-drop-indicator {
     min-height: 3px;
     border-radius: 2px;
     background-color: alpha(@window_fg_color,0.28);
@@ -239,7 +241,10 @@ class ChatWindow(Adw.ApplicationWindow):
         self._response_row = None
         self._response_chat_id = None
         self._scroll_idle_id = None
-        self._pinned_rows = []
+        self._chat_rows = []
+        self._dragged_row = None
+        self._drag_pointer_y = None
+        self._drag_scroll_id = None
         self.set_default_size(1180, 790)
         self.set_size_request(760, 520)
         self._apply_css()
@@ -298,28 +303,28 @@ class ChatWindow(Adw.ApplicationWindow):
         self.chat_list.set_margin_end(12)
         self.chat_list.set_header_func(self._set_chat_header)
         drop_target = Gtk.DropTarget.new(str, Gdk.DragAction.MOVE)
-        drop_target.connect("enter", self._pin_drag_motion)
-        drop_target.connect("motion", self._pin_drag_motion)
-        drop_target.connect("leave", lambda *_: self._clear_pin_indicator())
-        drop_target.connect("drop", self._pin_drop)
+        drop_target.connect("enter", self._chat_drag_motion)
+        drop_target.connect("motion", self._chat_drag_motion)
+        drop_target.connect("leave", lambda *_: self._clear_drop_indicator())
+        drop_target.connect("drop", self._chat_drop)
         self.chat_list.add_controller(drop_target)
         list_overlay = Gtk.Overlay()
         list_overlay.set_child(self.chat_list)
-        self._pin_indicator = Gtk.Box()
-        self._pin_indicator.add_css_class("pin-drop-indicator")
-        self._pin_indicator.set_valign(Gtk.Align.START)
-        self._pin_indicator.set_can_target(False)
-        self._pin_indicator.set_visible(False)
-        self._pin_indicator.set_margin_start(22)
-        self._pin_indicator.set_margin_end(20)
-        list_overlay.add_overlay(self._pin_indicator)
-        chat_scroll = Gtk.ScrolledWindow()
-        chat_scroll.add_css_class("undershoot-top")
-        chat_scroll.add_css_class("undershoot-bottom")
-        chat_scroll.set_child(list_overlay)
-        chat_scroll.set_vexpand(True)
-        chat_scroll.set_margin_bottom(8)
-        sidebar.append(chat_scroll)
+        self._drop_indicator = Gtk.Box()
+        self._drop_indicator.add_css_class("chat-drop-indicator")
+        self._drop_indicator.set_valign(Gtk.Align.START)
+        self._drop_indicator.set_can_target(False)
+        self._drop_indicator.set_visible(False)
+        self._drop_indicator.set_margin_start(22)
+        self._drop_indicator.set_margin_end(20)
+        list_overlay.add_overlay(self._drop_indicator)
+        self.chat_scroll = Gtk.ScrolledWindow()
+        self.chat_scroll.add_css_class("undershoot-top")
+        self.chat_scroll.add_css_class("undershoot-bottom")
+        self.chat_scroll.set_child(list_overlay)
+        self.chat_scroll.set_vexpand(True)
+        self.chat_scroll.set_margin_bottom(8)
+        sidebar.append(self.chat_scroll)
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         footer.set_margin_start(10)
         footer.set_margin_end(10)
@@ -597,8 +602,9 @@ class ChatWindow(Adw.ApplicationWindow):
         self._refresh_inference_stats()
 
     def show_sidebar(self, chats, active_id):
-        self._clear_pin_indicator()
-        self._pinned_rows = []
+        self._clear_drop_indicator()
+        self._chat_rows = []
+        self._dragged_row = None
         while (child := self.chat_list.get_first_child()) is not None:
             self.chat_list.remove(child)
         active = None
@@ -649,25 +655,22 @@ class ChatWindow(Adw.ApplicationWindow):
             line.append(options_button)
             row.set_child(line)
             self.chat_list.append(row)
-            if pinned:
-                self._pinned_rows.append(row)
+            self._chat_rows.append(row)
+            if pinned or self.controller.chat_sort == "user_selectable":
                 drag_source = Gtk.DragSource.new()
                 drag_source.set_actions(Gdk.DragAction.MOVE)
-                drag_source.connect(
-                    "prepare",
-                    lambda _source, _x, _y, chat_id=chat["id"]: Gdk.ContentProvider.new_for_value(
-                        chat_id
-                    ),
-                )
+                drag_source.connect("prepare", self._prepare_chat_drag, row)
                 drag_source.connect(
                     "drag-begin",
                     lambda source, _drag, row=row: source.set_icon(
                         Gtk.WidgetPaintable.new(row), 0, 0
                     ),
                 )
-                drag_source.connect("drag-end", lambda *_: self._clear_pin_indicator())
+                drag_source.connect("drag-end", self._end_chat_drag)
                 label.add_controller(drag_source)
-                label.set_tooltip_text("Drag to reorder pinned chats")
+                label.set_tooltip_text(
+                    "Drag to reorder pinned chats" if pinned else "Drag to reorder chats"
+                )
         if active:
             self.chat_list.select_row(active)
 
@@ -679,31 +682,78 @@ class ChatWindow(Adw.ApplicationWindow):
             divider.set_margin_bottom(6)
         row.set_header(divider)
 
-    def _pin_drop_position(self, y):
-        for row in self._pinned_rows:
+    def _prepare_chat_drag(self, _source, _x, _y, row):
+        self._dragged_row = row
+        return Gdk.ContentProvider.new_for_value(row.chat_id)
+
+    def _end_chat_drag(self, *_):
+        self._dragged_row = None
+        self._clear_drop_indicator()
+
+    def _chat_drop_position(self, y):
+        if self._dragged_row is None:
+            return None, False
+        rows = [row for row in self._chat_rows if row.pinned == self._dragged_row.pinned]
+        for row in rows:
             if y < row.get_allocation().y + row.get_height() / 2:
                 return row, False
         # Empty space below the rows is also a drop area for the final position.
-        return (self._pinned_rows[-1], True) if self._pinned_rows else (None, False)
+        return (rows[-1], True) if rows else (None, False)
 
-    def _pin_drag_motion(self, _target, _x, y):
-        row, after = self._pin_drop_position(y)
+    def _chat_drag_motion(self, _target, _x, y):
+        row, after = self._chat_drop_position(y)
         if row is None:
             return Gdk.DragAction(0)
+        # Keep viewport coordinates stable while the list moves under the pointer.
+        self._drag_pointer_y = y - self.chat_scroll.get_vadjustment().get_value()
+        if self._drag_scroll_id is None:
+            self._drag_scroll_id = GLib.timeout_add(30, self._scroll_chat_drag)
         top = row.get_allocation().y + (row.get_height() - 3 if after else 0)
-        self._pin_indicator.set_margin_top(max(0, top))
-        self._pin_indicator.set_visible(True)
+        self._drop_indicator.set_margin_top(max(0, top))
+        self._drop_indicator.set_visible(True)
         return Gdk.DragAction.MOVE
 
-    def _clear_pin_indicator(self):
-        self._pin_indicator.set_visible(False)
+    def _scroll_chat_drag(self):
+        if self._dragged_row is None or self._drag_pointer_y is None:
+            self._drag_scroll_id = None
+            return False
+        adjustment = self.chat_scroll.get_vadjustment()
+        page_size = adjustment.get_page_size()
+        if (
+            self._dragged_row.pinned
+            and sum(row.get_height() for row in self._chat_rows if row.pinned) <= page_size
+        ):
+            return True
+        edge = min(40, page_size / 3)
+        if edge <= 0:
+            return True
+        if self._drag_pointer_y < edge:
+            step = -16 * min(1, (edge - self._drag_pointer_y) / edge)
+        elif self._drag_pointer_y > page_size - edge:
+            step = 16 * min(1, (self._drag_pointer_y - page_size + edge) / edge)
+        else:
+            return True
+        value = adjustment.get_value()
+        limit = max(adjustment.get_lower(), adjustment.get_upper() - page_size)
+        next_value = max(adjustment.get_lower(), min(limit, value + step))
+        if next_value != value:
+            adjustment.set_value(next_value)
+            self._chat_drag_motion(None, 0, next_value + self._drag_pointer_y)
+        return True
 
-    def _pin_drop(self, _target, chat_id, _x, y):
-        row, after = self._pin_drop_position(y)
-        self._clear_pin_indicator()
-        return (
-            self.controller.move_pinned(chat_id, row.chat_id, after) if row is not None else False
-        )
+    def _clear_drop_indicator(self):
+        self._drop_indicator.set_visible(False)
+        if self._drag_scroll_id is not None:
+            GLib.source_remove(self._drag_scroll_id)
+            self._drag_scroll_id = None
+        self._drag_pointer_y = None
+
+    def _chat_drop(self, _target, chat_id, _x, y):
+        row, after = self._chat_drop_position(y)
+        self._clear_drop_indicator()
+        if self._dragged_row is None or chat_id != self._dragged_row.chat_id:
+            return False
+        return self.controller.move_chat(chat_id, row.chat_id, after) if row is not None else False
 
     def render_history(self, messages):
         while (child := self.transcript.get_first_child()) is not None:
@@ -990,12 +1040,40 @@ class ChatWindow(Adw.ApplicationWindow):
             try:
                 self.controller.set_preserve_reasoning(button.get_active())
             except OSError as exc:
-                with button.handler_block(handler):
+                with button.handler_block(preserve_reasoning_handler):
                     button.set_active(not button.get_active())
                 Gtk.AlertDialog(message="Could not save app settings", detail=str(exc)).show(dialog)
 
-        handler = preserve_reasoning_checkbox.connect("toggled", changed)
+        preserve_reasoning_handler = preserve_reasoning_checkbox.connect("toggled", changed)
         box.append(preserve_reasoning_checkbox)
+        heading = Gtk.Label(label="Unpinned Chat Sort", xalign=0)
+        heading.add_css_class("heading")
+        heading.set_margin_top(8)
+        box.append(heading)
+        sort_controls = {}
+
+        def sort_changed(button, sort_mode):
+            if not button.get_active():
+                return
+            try:
+                self.controller.set_chat_sort(sort_mode)
+            except OSError as exc:
+                previous_button, previous_handler = sort_controls[self.controller.chat_sort]
+                with previous_button.handler_block(previous_handler):
+                    previous_button.set_active(True)
+                Gtk.AlertDialog(message="Could not save app settings", detail=str(exc)).show(dialog)
+
+        group = None
+        for sort_mode, label in CHAT_SORT_OPTIONS:
+            button = Gtk.CheckButton(label=label)
+            if group is None:
+                group = button
+            else:
+                button.set_group(group)
+            button.set_active(sort_mode == self.controller.chat_sort)
+            sort_handler = button.connect("toggled", sort_changed, sort_mode)
+            sort_controls[sort_mode] = button, sort_handler
+            box.append(button)
         toolbar.set_content(box)
         dialog.present()
 

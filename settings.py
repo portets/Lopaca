@@ -2,6 +2,12 @@
 
 from dataclasses import dataclass
 
+CHAT_SORT_OPTIONS = (
+    ("recently_used", "Recently Used"),
+    ("creation_date", "Creation Date"),
+    ("user_selectable", "User Selectable"),
+)
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -14,6 +20,7 @@ class Settings:
     request_timeout: int = 600
     connection_check_interval: int = 5
     preserve_thinking: bool = True
+    chat_sort: str = "recently_used"
     max_context_chars: int = 12000
     chunk_chars: int = 1100
     chunk_overlap: int = 140
