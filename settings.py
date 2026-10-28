@@ -20,6 +20,8 @@ class Settings:
     request_timeout: int = 600
     connection_check_interval: int = 5
     preserve_thinking: bool = True
+    # Injected by llama-server when its reasoning budget runs out.
+    reasoning_budget_message: str = "Reasoning budget exceeded, continuing..."
     chat_sort: str = "recently_used"
     max_context_chars: int = 12000
     chunk_chars: int = 1100

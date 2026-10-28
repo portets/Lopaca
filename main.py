@@ -63,8 +63,11 @@ class LlamaClient:
         with urllib.request.urlopen(request, timeout=3) as response:
             return json.load(response).get("status") == "ok"
 
-    def stream(self, messages, preserve_thinking, stopped, on_thinking, on_answer, on_stats):
+    def stream(
+        self, messages, preserve_thinking, stopped, on_thinking, on_answer, on_stats, on_notice
+    ):
         url = self.settings.server_url.rstrip("/") + "/chat/completions"
+        budget_message = self.settings.reasoning_budget_message
         body = {
             "model": self.settings.model,
             "messages": messages,
@@ -73,6 +76,7 @@ class LlamaClient:
             "stream_options": {"include_usage": True},
             "timings_per_token": True,
             "chat_template_kwargs": {"preserve_thinking": preserve_thinking},
+            "reasoning_budget_message": budget_message,
         }
         if self.settings.max_tokens is not None:
             body["max_tokens"] = self.settings.max_tokens
@@ -86,6 +90,7 @@ class LlamaClient:
             },
         )
         reasoning_parts, answer_parts, finish_reason = [], [], None
+        budget_tails, budget_notified = ["", ""], False
         try:
             with urllib.request.urlopen(request, timeout=self.settings.request_timeout) as response:
                 self.active_response = response
@@ -129,6 +134,15 @@ class LlamaClient:
                     if content:
                         answer_parts.append(content)
                         on_answer("".join(answer_parts))
+                    if budget_message and not budget_notified:
+                        # Keep separate, bounded tails for reasoning and in-band content.
+                        for index, text in enumerate((reasoning, content)):
+                            probe = budget_tails[index] + text
+                            if budget_message in probe:
+                                budget_notified = True
+                                on_notice("Reasoning budget exceeded, continuing...")
+                                break
+                            budget_tails[index] = probe[-len(budget_message) :]
             error = (
                 "Generation reached the server's token or context limit."
                 if finish_reason == "length"
@@ -395,6 +409,7 @@ class ChatController:
             lambda context_used, tokens_per_second: self.view.dispatch(
                 self._update_inference_stats, context_used, tokens_per_second
             ),
+            lambda text: self.view.dispatch(self.view.notify, text),
         )
         self.view.dispatch(self.finish_response, answer, reasoning, error)
 
