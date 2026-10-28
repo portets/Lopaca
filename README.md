@@ -20,7 +20,7 @@ To install:
 ./install.sh
 ```
 Or right click and run as program. May need to check Properties/Executable as Program first.\
-Installs to ~/.local/share/lopaca/ with a shorcut menu entry at ~/.local/share/applications/Lopaca.desktop.\
+Installs to ~/.local/share/lopaca/ with a shortcut menu entry at ~/.local/share/applications/Lopaca.desktop.\
 Then just run it using your menu shortcut.
 
 # TO-DO
