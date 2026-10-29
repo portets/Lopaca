@@ -1,4 +1,6 @@
 __pycache__/
 .ruff_cache/
+rag-expansion-tests-20261029/
 NOTES
 ruff-review.txt
+REPORT.md
