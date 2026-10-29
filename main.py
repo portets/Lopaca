@@ -18,7 +18,7 @@ from agentic import (
     scan_command,
     write_file,
 )
-from rag import format_context, read_document, retrieve
+from rag import DocumentIndexer, format_context, read_document, retrieve
 from settings import Settings
 from storage import ChatStore
 
@@ -201,6 +201,7 @@ class ChatController:
 
     def __init__(self, settings):
         self.settings, self.store, self.client = settings, ChatStore(), LlamaClient(settings)
+        self.document_indexer = DocumentIndexer(settings)
         self.preserve_thinking = settings.preserve_thinking
         self.rag_query_expansion = settings.rag_query_expansion
         self.chat_sort = settings.chat_sort
@@ -253,6 +254,9 @@ class ChatController:
     def _monitor_connection(self):
         capacity = None
         while True:
+            with suppress(OSError):
+                for folder in self.store.root.iterdir():
+                    self.document_indexer.schedule(folder / "documents")
             try:
                 connected = self.client.connected()
             except Exception:
@@ -290,6 +294,7 @@ class ChatController:
         if self.chat:
             self._drafts[self.chat["id"]] = self.view.prompt_text(strip=False)
         self.chat = self.store.load(chat_id)
+        self.document_indexer.schedule(self.store.documents(chat_id))
         self.agent_mode = (
             self.get_chat_settings(chat_id)["code_agent"] and self.settings.enable_command_approval
         )
@@ -383,6 +388,7 @@ class ChatController:
         if supported:
             try:
                 self.store.add_documents(self.chat["id"], supported)
+                self.document_indexer.schedule(self.store.documents(self.chat["id"]))
                 self.view.notify("Documents added to this chat's folder")
             except OSError as exc:
                 self.view.notify(f"Could not add documents: {exc}")
@@ -479,6 +485,8 @@ class ChatController:
     def _stream(self, messages, preserve_thinking, query, folder, agent_mode, query_expansion):
         retrieved = []
         try:
+            self.document_indexer.schedule(folder)
+            self.document_indexer.wait(folder, lambda: self.stop_requested)
             retrieved = retrieve(
                 query,
                 folder,
@@ -488,6 +496,7 @@ class ChatController:
                 previous_queries=[
                     item["content"] for item in messages[:-1] if item["role"] == "user"
                 ],
+                refresh=False,
             )
         except Exception as exc:
             if not self.stop_requested:

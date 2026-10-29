@@ -138,14 +138,16 @@ class ChatStore:
                 "CREATE TABLE IF NOT EXISTS messages "
                 "(position INTEGER PRIMARY KEY, message TEXT NOT NULL)"
             )
-            connection.execute("DELETE FROM messages")
             connection.executemany(
-                "INSERT INTO messages (position, message) VALUES (?, ?)",
+                "INSERT INTO messages (position, message) VALUES (?, ?) "
+                "ON CONFLICT(position) DO UPDATE SET message = excluded.message "
+                "WHERE messages.message != excluded.message",
                 (
                     (index, json.dumps(message, ensure_ascii=False))
                     for index, message in enumerate(data["messages"])
                 ),
             )
+            connection.execute("DELETE FROM messages WHERE position >= ?", (len(data["messages"]),))
             self.save_settings(chat_id, settings)
         documents_db = self.folder(chat_id) / "documents.sqlite"
         if not documents_db.exists():

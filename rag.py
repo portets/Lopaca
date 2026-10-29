@@ -2,12 +2,66 @@
 
 import ast
 import codecs
+import logging
 import math
+import queue
 import re
 import sqlite3
+import threading
 from collections import defaultdict
 from contextlib import closing, suppress
 from pathlib import Path
+
+
+class DocumentIndexer:
+    """Serialize background indexing, with at most one queued check per folder."""
+
+    def __init__(self, settings):
+        self.settings = settings
+        self._queue = queue.Queue()
+        self._pending = {}
+        self._active = None
+        self._lock = threading.Lock()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def schedule(self, folder):
+        with self._lock:
+            if folder in self._pending:
+                return
+            ready = threading.Event()
+            self._pending[folder] = ready
+            self._queue.put((folder, ready))
+
+    def wait(self, folder, stopped):
+        """Wait for this chat's already-scheduled pass, without starting another scan."""
+        with self._lock:
+            ready = self._pending.get(folder)
+            if ready is None and self._active and self._active[0] == folder:
+                ready = self._active[1]
+        while ready is not None and not ready.wait(0.1):
+            if stopped():
+                break
+
+    def _run(self):
+        while True:
+            folder, ready = self._queue.get()
+            # Allow a follow-up check if files change during this indexing pass.
+            with self._lock:
+                self._pending.pop(folder)
+                self._active = folder, ready
+            try:
+                if folder.is_dir():
+                    with closing(
+                        sqlite3.connect(folder.parent / "documents.sqlite", timeout=5)
+                    ) as connection:
+                        _index(connection, folder, self.settings, lambda: False)
+            except Exception as exc:
+                logging.warning("Could not index documents in %s: %s", folder, exc)
+            finally:
+                with self._lock:
+                    self._active = None
+                    ready.set()
+                self._queue.task_done()
 
 
 def read_document(path):
@@ -505,8 +559,10 @@ def _retrieval_query(query, previous_queries):
     return query
 
 
-def retrieve(query, folder, settings, expand=None, stopped=lambda: False, previous_queries=()):
-    """Update changed files and retrieve passages using a thread-local SQLite connection."""
+def retrieve(
+    query, folder, settings, expand=None, stopped=lambda: False, previous_queries=(), refresh=True
+):
+    """Retrieve passages; background-indexed callers can skip the folder scan."""
     query = _retrieval_query(query, previous_queries)
     if (
         not folder.is_dir()
@@ -517,7 +573,12 @@ def retrieve(query, folder, settings, expand=None, stopped=lambda: False, previo
         return []
     with closing(sqlite3.connect(folder.parent / "documents.sqlite", timeout=5)) as connection:
         connection.set_progress_handler(lambda: int(stopped()), 1000)
-        _index(connection, folder, settings, stopped)
+        if refresh:
+            _index(connection, folder, settings, stopped)
+        elif not connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chunks'"
+        ).fetchone():
+            return []  # The background worker has not prepared this chat's first index yet.
         if stopped():
             return []
         expansion = ""
@@ -527,6 +588,9 @@ def retrieve(query, folder, settings, expand=None, stopped=lambda: False, previo
                 expansion = expand(query)[:1024]
         if stopped():
             return []
+        # Keep term counts, candidate rows, and excerpts in the same read snapshot.
+        # Begin after expansion so its model request cannot hold up indexing commits.
+        connection.execute("BEGIN")
         return _rank(connection, query, expansion, settings)
 
 
