@@ -386,8 +386,8 @@ def _chunks(text, filename, size, overlap):
             if end < len(lines) and paragraph_end is not None:
                 end = paragraph_end
             end = max(start + 1, end)
-            body = "".join(line for _, line in lines[start:end]).strip()
-            if body:
+            body = "".join(line for _, line in lines[start:end])
+            if body.strip():
                 yield section, lines[start][0], lines[end - 1][0], body
             if end == len(lines):
                 break
@@ -410,7 +410,7 @@ def _index(connection, folder, settings, stopped):
             tokenize='porter unicode61'
         );
     """)
-    signature = f"3:{settings.chunk_chars}:{settings.chunk_overlap}"
+    signature = f"4:{settings.chunk_chars}:{settings.chunk_overlap}"
     state = connection.execute("SELECT value FROM index_state WHERE key = 'chunking'").fetchone()
     changed = state != (signature,)
     if state != (signature,):
@@ -536,22 +536,14 @@ def _document_context(connection, row, limit):
             parts.pop()  # Farthest neighbor; keep the matching chunk.
         parts.sort(key=lambda part: (part[4], part[0]))
     if 1 < len(parts) < 17 and sum(len(part[3]) + 2 for part in parts) <= limit:
-        body, previous_end = "", 0
+        lines = {}
         for part in parts:
-            text = part[3]
-            overlap = 0
-            if part[4] <= previous_end:
-                overlap = next(
-                    (
-                        length
-                        for length in range(min(len(body), len(text)), 15, -1)
-                        if body.endswith(text[:length])
-                    ),
-                    0,
-                )
-            separator = "" if overlap or part[4] == previous_end else "\n\n"
-            body += (separator if body else "") + text[overlap:]
-            previous_end = part[5]
+            # Wrapped/minified lines cannot be reconstructed by line number.
+            if len(part[3].splitlines()) != part[5] - part[4] + 1:
+                return None
+            lines.update(enumerate(part[3].splitlines(), part[4]))
+        first, last = min(lines), max(lines)
+        body = "\n".join(lines.get(number, "") for number in range(first, last + 1))
         return (
             row[0],
             source,
@@ -795,7 +787,21 @@ def format_context(retrieved, max_chars):
     """Format source excerpts within the document-context character budget."""
     excerpts, remaining = [], max(0, max_chars)
     for source_name, text in retrieved:
-        header = f"[Source: {source_name}]\n"
+        span = re.fullmatch(r"(.+), lines (\d+)-(\d+)(.*)", source_name)
+        if (
+            span
+            and not span[1].lower().endswith(_CODE_SUFFIXES)
+            and len(text.splitlines()) == int(span[3]) - int(span[2]) + 1
+        ):
+            # Give each prose paragraph an exact citation, including surrounding context.
+            paragraphs = []
+            for match in re.finditer(r"\S[^\n]*(?:\n(?!\s*\n)[^\n]+)*", text):
+                first = int(span[2]) + text.count("\n", 0, match.start())
+                last = first + match[0].count("\n")
+                paragraphs.append(f"[Source: {span[1]}, lines {first}-{last}{span[4]}]\n{match[0]}")
+            text = "\n\n".join(paragraphs)
+            source_name = None
+        header = f"[Source: {source_name}]\n" if source_name else ""
         separator = "\n\n---\n\n" if excerpts else ""
         available = remaining - len(separator) - len(header)
         if available <= 0:
