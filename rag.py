@@ -728,35 +728,32 @@ def _rank(connection, query, expansion, settings):
 
 def _retrieval_query(query, previous_queries):
     """Resolve document follow-ups without pulling old topics into unrelated questions."""
-    reference = re.search(
-        r"\b(?:that|this|the) (?:file|document|value)\b|\b(?:check again|current value|and now)\b",
-        query,
+    reference = re.compile(
+        r"\b(?:that|this) (?:file|document|value|number|function|class|setting)\b"
+        r"|\bthe (?:other|same) (?:one|file|document|value|number)\b"
+        r"|\b(?:what|how) about (?:its|their|that|those)\b"
+        r"|\b(?:read|check|scan) the (?:file|document) again\b"
+        r"|^(?:please )?(?:check again|and now|(?:what is )?the current value)[?.!\s]*$",
         re.IGNORECASE,
     )
-    generic = {
-        "changed",
-        "change",
-        "updated",
-        "update",
-        "value",
-        "values",
-        "file",
-        "files",
-        "document",
-        "documents",
-        "check",
-        "again",
-        "current",
-        "latest",
-        "now",
-        "give",
-        "read",
-    }
-    if reference and not (set(_terms(query)) - generic):
-        for previous in reversed(previous_queries):
-            if set(_terms(previous)) - generic:
-                return previous + "\n" + query
-    return query
+
+    def follows_previous(text):
+        # Explicit filenames stand on their own; quoted phrases are not references.
+        if re.search(r"\b[\w-]+\.[a-zA-Z][\w]*\b", text):
+            return False
+        return reference.search(re.sub(r'`[^`]*`|"[^"]*"', "", text).strip()) is not None
+
+    if not follows_previous(query):
+        return query
+    queries = [query]
+    # Follow a short chain of references, stopping at the nearest standalone question.
+    for previous in reversed(previous_queries[-3:]):
+        if not _terms(previous):
+            continue
+        queries.insert(0, previous)
+        if not follows_previous(previous):
+            break
+    return "\n".join(queries)
 
 
 def retrieve(
