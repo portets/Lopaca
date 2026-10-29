@@ -1263,7 +1263,7 @@ class ChatWindow(Adw.ApplicationWindow):
         lines = command.count("\n") + 1
         if lines > 16:
             notice = Gtk.Label(
-                label=f"↕ {lines} lines — scroll inside the preview to review the full command.",
+                label=f"↕ {lines} lines, scroll inside the preview to review the full command.",
                 xalign=0,
             )
             notice.set_wrap(True)

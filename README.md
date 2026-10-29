@@ -26,21 +26,20 @@ Then just run it using your menu shortcut.
 # Local documents
 Add readable text documents through a chat's menu, or place them in that chat's `documents/` folder. Before each prompt, a background worker checks for new, changed, and deleted files and updates `documents.sqlite` incrementally.
 
-Retrieval uses SQLite FTS5/BM25, phrase and identifier matching, and filename/section searches combined with Reciprocal Rank Fusion (RRF). Chunking follows paragraphs, Markdown sections, and code definitions, with overlap between chunks. Relevant excerpts are injected into the current request as document reference data, not saved in chat history.
+Retrieval uses SQLite FTS5/BM25, phrase and identifier matching, and filename/section searches combined with Reciprocal Rank Fusion (RRF). Relevant excerpts are injected into the current request as document reference data, not saved in chat history.
 
-**Expand Document Searches** in App Settings optionally asks the same llama-server model for related search terms. It is off by default because it adds response latency.
+**Expand Document Searches** in App Settings optionally asks the same llama-server model for related search terms. It's off by default because it adds response latency.
 
 # TO-DO
 - Add more global settings
 - Add more individual chat settings
 - Global memories file that the RAG function uses
 - Selectable assistant style.md for communication styles
-- Basic agentic mode
+- More advanced agentic mode with more tools, web searching, etc
 
 # Further TO-DOs
 - Context compression using RAG once a limit is hit
 - Make llama-server launchable within Lopaca with parameters
 - Add support for other llm servers
-- More advanced agentic mode with more tools, web searching, etc
 - Add Image and Code tabs, image can connect to stable-diffusion.cpp
 
