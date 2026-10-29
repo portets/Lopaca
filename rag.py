@@ -260,8 +260,23 @@ _STOP_WORDS = frozenset(
 )
 _TERM = re.compile(r"(?:--?)?\w+(?:[./:+#-]+\w+)*[+#]*", re.UNICODE)
 _CODE_HEADING = re.compile(
-    r"^(\s*)(?:(?:async\s+)?(?:def|function|fn|func)|class|struct|interface|enum)\s+([\w.]+)"
+    r"^(\s*)(?:(?:export|default|pub(?:\([^)]*\))?|public|private|protected|static|async)\s+)*"
+    r"(?:def|function|fn|func|class|struct|interface|enum)\s+([\w.]+)"
 )
+_CODE_SUFFIXES = tuple(
+    ".py .pyi .js .jsx .mjs .cjs .ts .tsx .c .h .cc .cpp .hpp "  # noqa: SIM905 -- Compact syntax-family list.
+    ".rs .go .java .cs .sh .bash .zsh".split()
+)
+
+
+def _comment_only(body, source):
+    """Recognize standalone comments without treating C directives as comments."""
+    if source.lower().endswith((".py", ".pyi", ".sh", ".bash", ".zsh")):
+        prefix = "#"
+    else:
+        prefix = "//"
+        body = re.sub(r"/\*.*?\*/", "", body, flags=re.DOTALL)
+    return all(not line.strip() or line.lstrip().startswith(prefix) for line in body.splitlines())
 
 
 def _terms(query):
@@ -282,7 +297,7 @@ def _sections(text, filename):
     """Find Markdown sections and code definitions with standard-library tools."""
     lines = text.splitlines(keepends=True)
     starts = {0: ""}
-    if filename.lower().endswith(".py"):
+    if filename.lower().endswith((".py", ".pyi")):
         try:
             tree = ast.parse(text)
         except SyntaxError, ValueError, RecursionError:
@@ -295,6 +310,8 @@ def _sections(text, filename):
                 starts[start] = " > ".join(parents)
                 if node.end_lineno < len(lines):
                     starts.setdefault(node.end_lineno, " > ".join(parents[:-1]))
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return  # Keep nested callbacks with the function that uses them.
             for child in ast.iter_child_nodes(node):
                 visit(child, parents)
 
@@ -327,14 +344,19 @@ def _sections(text, filename):
                 headings.pop()
             headings.append((level, title))
             starts[index] = " > ".join(title for _, title in headings)
-        elif not markdown and not filename.lower().endswith(".py"):
+        elif not markdown and not filename.lower().endswith((".py", ".pyi")):
             definition = _CODE_HEADING.match(line)
             if definition:
                 indent = len(definition[1].expandtabs(4))
                 while code_scope and code_scope[-1][0] >= indent:
                     code_scope.pop()
-                code_scope.append((indent, definition[2]))
-                starts[index] = " > ".join(name for _, name in code_scope)
+                if filename.lower().endswith(_CODE_SUFFIXES) and any(
+                    not container for _, _, container in code_scope
+                ):
+                    continue
+                container = bool(re.search(r"\b(?:class|struct|interface|enum)\b", definition[0]))
+                code_scope.append((indent, definition[2], container))
+                starts[index] = " > ".join(name for _, name, _ in code_scope)
     boundaries = sorted(starts)
     for index, start in enumerate(boundaries):
         end = boundaries[index + 1] if index + 1 < len(boundaries) else len(lines)
@@ -388,7 +410,7 @@ def _index(connection, folder, settings, stopped):
             tokenize='porter unicode61'
         );
     """)
-    signature = f"1:{settings.chunk_chars}:{settings.chunk_overlap}"
+    signature = f"3:{settings.chunk_chars}:{settings.chunk_overlap}"
     state = connection.execute("SELECT value FROM index_state WHERE key = 'chunking'").fetchone()
     changed = state != (signature,)
     if state != (signature,):
@@ -502,6 +524,17 @@ def _document_context(connection, row, limit):
             if row[2]
             else []
         )
+    if not source.lower().endswith(_CODE_SUFFIXES) and not (
+        1 < len(parts) < 17 and sum(len(part[3]) + 2 for part in parts) <= limit
+    ):
+        parts = connection.execute(
+            "SELECT rowid,source,section,body,start_line,end_line FROM chunks "
+            "WHERE source=? AND section=? ORDER BY abs(start_line-?),abs(rowid-?) LIMIT 3",
+            (source, row[2], row[4], row[0]),
+        ).fetchall()
+        while len(parts) > 1 and sum(len(part[3]) + 2 for part in parts) > limit:
+            parts.pop()  # Farthest neighbor; keep the matching chunk.
+        parts.sort(key=lambda part: (part[4], part[0]))
     if 1 < len(parts) < 17 and sum(len(part[3]) + 2 for part in parts) <= limit:
         body, previous_end = "", 0
         for part in parts:
@@ -645,6 +678,8 @@ def _rank(connection, query, expansion, settings):
             + 0.25 * bool(identifiers)
         )
         score *= 0.5 + 0.5 * diversity
+        if source.lower().endswith(_CODE_SUFFIXES) and _comment_only(body, source):
+            score *= 0.25
         scores[rowid] = score
         # Expanded vocabulary must also count as new evidence during result selection.
         covered_terms[rowid] = found | (expanded_found if expansion_hit else set())
@@ -664,9 +699,15 @@ def _rank(connection, query, expansion, settings):
         if selected and not (covered_terms[rowid] - used) and score < 0.65:
             continue
         source = candidates[rowid][1]
-        context_key = (source, candidates[rowid][2])
+        is_code = source.lower().endswith(_CODE_SUFFIXES)
+        context_key = (source, candidates[rowid][2], None if is_code else rowid)
         if context_key not in contexts:
-            contexts[context_key] = _document_context(connection, candidates[rowid], context_limit)
+            limit = (
+                min(context_limit * 2, settings.max_context_chars // 2)
+                if is_code
+                else context_limit
+            )
+            contexts[context_key] = _document_context(connection, candidates[rowid], limit)
         row = contexts[context_key] or candidates[rowid]
         _, source, section, body, first, last = row
         if any(
