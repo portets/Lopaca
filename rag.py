@@ -2,10 +2,12 @@
 
 import ast
 import codecs
+import math
 import re
 import sqlite3
 from collections import defaultdict
 from contextlib import closing, suppress
+from pathlib import Path
 
 
 def read_document(path):
@@ -49,7 +51,8 @@ _STOP_WORDS = frozenset(
     "hello help hi how i if in into is it its me my of on or our please should show so some "
     "tell than thank thanks that the their them there these they this those to use using was "
     "we were what when where which who why will with would you your about any also "
-    "work works".split()
+    "work works according give find current latest document documents file files "
+    "long many much period value values before after called named".split()
 )
 _TERM = re.compile(r"(?:--?)?\w+(?:[./:+#-]+\w+)*[+#]*", re.UNICODE)
 _CODE_HEADING = re.compile(
@@ -238,79 +241,221 @@ def _index(connection, folder, settings, stopped):
             connection.execute("DELETE FROM files WHERE path = ?", (name,))
 
 
-def _search(connection, expression, limit):
+def _search(connection, expression, limit, sources=()):
     if not expression:
         return []
+    scope = " AND source IN (" + ",".join("?" for _ in sources) + ")" if sources else ""
     return connection.execute(
         "SELECT rowid, source, section, body, start_line, end_line FROM chunks "
-        "WHERE chunks MATCH ? ORDER BY bm25(chunks, 4.0, 2.0, 1.0, 0.5) LIMIT ?",
-        (expression, limit),
+        "WHERE chunks MATCH ?" + scope + " ORDER BY bm25(chunks, 4.0, 2.0, 1.0, 0.5) LIMIT ?",
+        (expression, *sources, limit),
     ).fetchall()
 
 
+def _source_scope(_connection, paths, terms, _frequencies, _total, query):
+    """Restrict sources only when the query names an actual filename."""
+    explicit = {
+        path for path in paths if path.casefold() in terms or Path(path).name.casefold() in terms
+    }
+    if explicit:
+        return (
+            tuple(sorted(explicit)) if len(explicit) <= 64 else (),
+            set(terms)
+            & {name for path in explicit for name in (path.casefold(), Path(path).name.casefold())},
+        )
+    suffixes = {Path(path).suffix.casefold() for path in paths} - {""}
+    if any(
+        Path(term).suffix in suffixes
+        and re.search(
+            r"\b(?:in|from|according to)\s+[`\"]?" + re.escape(term), query, re.IGNORECASE
+        )
+        for term in terms
+    ):
+        return None, set()  # A specifically requested local filename does not exist.
+    return (), set()
+
+
+def _document_context(connection, row, limit):
+    """Keep small source documents together instead of losing facts across tiny sections."""
+    source = row[1]
+    parts = connection.execute(
+        "SELECT rowid,source,section,body,start_line,end_line FROM chunks "
+        "WHERE source=? ORDER BY start_line,rowid LIMIT 17",
+        (source,),
+    ).fetchall()
+    if not (1 < len(parts) < 17 and sum(len(part[3]) + 2 for part in parts) <= limit):
+        parts = (
+            connection.execute(
+                "SELECT rowid,source,section,body,start_line,end_line FROM chunks "
+                "WHERE source=? AND section=? ORDER BY start_line,rowid LIMIT 17",
+                (source, row[2]),
+            ).fetchall()
+            if row[2]
+            else []
+        )
+    if 1 < len(parts) < 17 and sum(len(part[3]) + 2 for part in parts) <= limit:
+        body, previous_end = "", 0
+        for part in parts:
+            text = part[3]
+            overlap = 0
+            if part[4] <= previous_end:
+                overlap = next(
+                    (
+                        length
+                        for length in range(min(len(body), len(text)), 15, -1)
+                        if body.endswith(text[:length])
+                    ),
+                    0,
+                )
+            separator = "" if overlap or part[4] == previous_end else "\n\n"
+            body += (separator if body else "") + text[overlap:]
+            previous_end = part[5]
+        return (
+            row[0],
+            source,
+            "",
+            body,
+            min(part[4] for part in parts),
+            max(part[5] for part in parts),
+        )
+    return None
+
+
 def _rank(connection, query, expansion, settings):
-    terms, extra = _terms(query), _terms(expansion)
+    terms = _terms(query)
+    extra = [term for term in _terms(expansion) if term not in terms]
+    expanded_terms = set(extra)
     if not terms:
         return []
-    quoted = [_quote(term) for term in terms]
-    phrases = list(dict.fromkeys(re.findall(r'`([^`\n]+)`|"([^"\n]+)"', query)))
-    phrases = [next(part for part in pair if part).strip()[:160] for pair in phrases]
-    phrases += [" ".join(terms[index : index + 2]) for index in range(len(terms) - 1)]
-    phrases = [phrase for phrase in phrases if _terms(phrase)][:12]
-    expressions = [
-        (1.0, " OR ".join(quoted)),
-        (1.0, " AND ".join(quoted) if len(terms) > 1 else ""),
-        (1.0, " OR ".join(_quote(phrase) for phrase in phrases)),
-        (0.8, "{source section} : (" + " OR ".join(quoted) + ")"),
-        (0.5, " OR ".join(_quote(term) for term in extra)),
+    total = connection.execute("SELECT count(*) FROM chunks").fetchone()[0]
+    if not total:
+        return []
+    frequencies = {
+        term: connection.execute(
+            "SELECT count(*) FROM chunks WHERE chunks MATCH ?",
+            (_quote(term),),
+        ).fetchone()[0]
+        for term in (*terms, *extra)
+    }
+    weights = {
+        term: math.log1p((total + 0.5) / (frequencies[term] + 0.5)) if frequencies[term] else 1.0
+        for term in frequencies
+    }
+    paths = [row[0] for row in connection.execute("SELECT path FROM files")]
+    sources, anchors = _source_scope(connection, paths, terms, frequencies, total, query)
+    if sources is None:
+        return []
+    phrases = [
+        next(part for part in pair if part).strip()[:160]
+        for pair in re.findall(r'`([^`\n]+)`|"([^"\n]+)"', query)
     ]
-    candidates, scores = {}, defaultdict(float)
+    phrases = list(dict.fromkeys(phrase for phrase in phrases if _terms(phrase)))[:8]
+    # Fuse the original query, explicit phrases, and optional new vocabulary.
+    expressions = [
+        (1.0, " OR ".join(_quote(term) for term in terms)),
+        (0.4, " OR ".join(_quote(phrase) for phrase in phrases)),
+        (0.35, " OR ".join(_quote(term) for term in extra)),
+    ]
+    candidates, ranks = {}, defaultdict(float)
     for weight, expression in expressions:
         for rank, row in enumerate(
-            _search(connection, expression, max(1, settings.rag_candidates)), 1
+            _search(connection, expression, max(1, settings.rag_candidates), sources), 1
         ):
             candidates[row[0]] = row
-            scores[row[0]] += weight / (60 + rank)
+            ranks[row[0]] += weight / (60 + rank)
     if not candidates:
         return []
-    # Measure original-query coverage with the same tokenizer/stemmer as the index.
-    coverage, expanded_coverage = defaultdict(int), defaultdict(int)
+    matches, file_matches, body_matches = defaultdict(set), defaultdict(set), defaultdict(set)
     rowids = ",".join("?" for _ in candidates)
-    for words, counts in ((terms, coverage), (extra, expanded_coverage)):
-        for term in words:
+    for term in weights:
+        for (rowid,) in connection.execute(
+            f"SELECT rowid FROM chunks WHERE chunks MATCH ? AND rowid IN ({rowids})",
+            (_quote(term), *candidates),
+        ):
+            matches[rowid].add(term)
+            file_matches[candidates[rowid][1]].add(term)
+        if term in terms and frequencies[term]:
             for (rowid,) in connection.execute(
                 f"SELECT rowid FROM chunks WHERE chunks MATCH ? AND rowid IN ({rowids})",
-                (_quote(term), *candidates),
+                ("body:" + _quote(term), *candidates),
             ):
-                counts[rowid] += 1
-    exact = []
+                body_matches[rowid].add(term)
+    original = set(terms)
+    content_terms = original - anchors or original
+    denominator = sum(weights[term] for term in content_terms)
     technical = {
         term.casefold()
         for term in _TERM.findall(query)
         if re.search(r"[_./:+#\d-]|[a-z][A-Z]", term)
     }
+    expansion_weight = sum(weights[term] for term in extra)
+    best_rank = max(ranks.values())
+    scores, covered_terms = {}, {}
     for rowid, source, section, body, _first, _last in candidates.values():
+        found = matches[rowid] & content_terms
+        coverage = sum(weights[term] for term in found) / denominator
+        source_coverage = (
+            sum(weights[term] for term in file_matches[source] & content_terms) / denominator
+        )
         haystack = f"{source}\n{section}\n{body}".casefold()
         identifiers = sum(
             bool(re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", haystack))
             for term in technical
         )
-        phrase_hits = sum(phrase.casefold() in haystack for phrase in phrases)
-        if identifiers or phrase_hits:
-            exact.append((identifiers, phrase_hits, coverage[rowid], rowid))
-    for rank, match in enumerate(sorted(exact, reverse=True), 1):
-        scores[match[-1]] += 1 / (60 + rank)
-    exact_ids = {row[-1] for row in exact}
-    minimum = min(2, len(terms))
-    selected, spans = [], defaultdict(list)
-    for rowid in sorted(scores, key=lambda item: (-scores[item], item)):
-        # RRF ranks candidates; it cannot decide whether a weak match is relevant.
-        if coverage[rowid] < minimum and rowid not in exact_ids and expanded_coverage[rowid] < 2:
+        expanded_found = matches[rowid] & expanded_terms
+        expansion_coverage = sum(weights[term] for term in expanded_found) / max(
+            1, expansion_weight
+        )
+        rare = {term for term in expanded_found if frequencies[term] <= max(1, total // 20)}
+        # Require corroboration, or a rare term naming the section itself.
+        expansion_hit = (
+            expansion_coverage >= 0.2
+            and bool(rare)
+            and (len(expanded_found) >= 2 or bool(rare & set(_terms(section))))
+        )
+        # Two body terms, including a rare one, can support a wordy paraphrase.
+        body_found = body_matches[rowid] & content_terms
+        original_hit = len(body_found) >= 2 and any(
+            frequencies[term] <= max(1, total // 20) for term in body_found
+        )
+        if source_coverage < 0.5 and not original_hit and not identifiers and not expansion_hit:
             continue
-        if len(terms) == 1 and technical and rowid not in exact_ids:
-            continue  # Tokenizer punctuation splitting alone isn't an identifier match.
-        _, source, section, body, first, last = candidates[rowid]
-        # Don't spend the prompt budget on almost identical overlapping chunks.
+        if len(terms) == 1 and technical and not identifiers and not expansion_hit:
+            continue
+        if coverage < 0.15 and not original_hit and not identifiers and not expansion_hit:
+            continue
+        tokens = _TERM.findall(body.casefold())
+        diversity = len(set(tokens)) / max(1, len(tokens))
+        score = (
+            max(coverage, expansion_coverage)
+            + 0.15 * ranks[rowid] / best_rank
+            + 0.25 * bool(identifiers)
+        )
+        score *= 0.5 + 0.5 * diversity
+        scores[rowid] = score
+        # Expanded vocabulary must also count as new evidence during result selection.
+        covered_terms[rowid] = found | (expanded_found if expansion_hit else set())
+    selected, used, spans = [], set(), defaultdict(list)
+    contexts = {}
+    context_limit = min(settings.chunk_chars * 2, settings.max_context_chars // 2)
+    while scores and len(selected) < settings.rag_results:
+        rowid = max(
+            scores,
+            key=lambda item: (
+                scores[item]
+                + 0.5 * sum(weights[term] for term in covered_terms[item] - used) / denominator,
+                -item,
+            ),
+        )
+        score = scores.pop(rowid)
+        if selected and not (covered_terms[rowid] - used) and score < 0.65:
+            continue
+        source = candidates[rowid][1]
+        context_key = (source, candidates[rowid][2])
+        if context_key not in contexts:
+            contexts[context_key] = _document_context(connection, candidates[rowid], context_limit)
+        row = contexts[context_key] or candidates[rowid]
+        _, source, section, body, first, last = row
         if any(
             max(0, min(last, end) - max(first, start) + 1) > 0.6 * max(1, last - first + 1)
             for start, end in spans[source]
@@ -320,9 +465,10 @@ def _rank(connection, query, expansion, settings):
         if section:
             reference += f", section: {section}"
         selected.append((reference, body))
+        used.update(
+            file_matches[source] & content_terms if contexts[context_key] else covered_terms[rowid]
+        )
         spans[source].append((first, last))
-        if len(selected) >= settings.rag_results:
-            break
     return selected
 
 

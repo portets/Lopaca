@@ -1,0 +1,40 @@
+{
+  "checks": {
+    "initial_fact": true,
+    "unchanged_files_not_reread": true,
+    "same_size_edit_fresh": true,
+    "only_changed_document_read": true,
+    "deleted_source_not_returned": true,
+    "deleted_source_not_indexed": true,
+    "binary_not_indexed": true,
+    "cancellation": true,
+    "timeout_fallback": true,
+    "empty_expansion_fallback": true,
+    "context_budget": true,
+    "unknown_requested_file_abstains": true,
+    "fts_query_quoted_safely": true,
+    "independent_worker_connections": true
+  },
+  "rank_timings": {
+    "before_off": {
+      "median_ms": 0.9763860000475688,
+      "p95_ms": 3.8800419997642166,
+      "samples": 360
+    },
+    "before_on": {
+      "median_ms": 1.829012999905899,
+      "p95_ms": 10.539535000134492,
+      "samples": 360
+    },
+    "after_off": {
+      "median_ms": 1.3039669997851888,
+      "p95_ms": 5.435694999960106,
+      "samples": 360
+    },
+    "after_on": {
+      "median_ms": 5.847356000003856,
+      "p95_ms": 13.584269000148197,
+      "samples": 360
+    }
+  }
+}

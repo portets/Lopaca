@@ -1,0 +1,63 @@
+{
+  "before": {
+    "off": {
+      "complete": 65,
+      "positive": 96,
+      "top1": 65,
+      "false_context": 2,
+      "negative": 24,
+      "regressions": [],
+      "rescues": [],
+      "elapsed_ms": 166.94033199974
+    },
+    "on": {
+      "complete": 89,
+      "positive": 96,
+      "top1": 81,
+      "false_context": 15,
+      "negative": 24,
+      "regressions": [],
+      "rescues": [],
+      "elapsed_ms": 438.41178499997113
+    }
+  },
+  "after": {
+    "off": {
+      "complete": 74,
+      "positive": 96,
+      "top1": 74,
+      "false_context": 3,
+      "negative": 24,
+      "regressions": [],
+      "rescues": [
+        "q062",
+        "q074",
+        "q079",
+        "q050",
+        "q056",
+        "q021",
+        "q068",
+        "q084",
+        "q089"
+      ],
+      "elapsed_ms": 267.32735700034027
+    },
+    "on": {
+      "complete": 95,
+      "positive": 96,
+      "top1": 88,
+      "false_context": 6,
+      "negative": 24,
+      "regressions": [],
+      "rescues": [
+        "q043",
+        "q015",
+        "q023",
+        "q031",
+        "q041",
+        "q045"
+      ],
+      "elapsed_ms": 683.7208060001103
+    }
+  }
+}

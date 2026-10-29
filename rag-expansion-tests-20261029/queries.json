@@ -1,0 +1,1362 @@
+[
+  {
+    "id": "q001",
+    "category": "recreated_vocabulary_gap",
+    "query": "How do we stop somebody guessing lots of passwords?",
+    "facts": [
+      [
+        "credential-defence.md",
+        "seven attempts"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q002",
+    "category": "direct_terminology",
+    "query": "What is the credential throttling lockout threshold?",
+    "facts": [
+      [
+        "credential-defence.md",
+        "seven attempts"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q003",
+    "category": "recreated_vocabulary_gap",
+    "query": "What prevents a fast sender from overwhelming a slow receiver?",
+    "facts": [
+      [
+        "transport-pressure.md",
+        "640 items"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q004",
+    "category": "direct_terminology",
+    "query": "What is the backpressure high-water mark?",
+    "facts": [
+      [
+        "transport-pressure.md",
+        "640 items"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q005",
+    "category": "recreated_vocabulary_gap",
+    "query": "How do we reclaim space occupied by things nothing points to anymore?",
+    "facts": [
+      [
+        "storage-reclamation.md",
+        "23 files"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q006",
+    "category": "direct_terminology",
+    "query": "How many files can garbage collection release per sweep?",
+    "facts": [
+      [
+        "storage-reclamation.md",
+        "23 files"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q007",
+    "category": "recreated_vocabulary_gap",
+    "query": "What should we do after somebody leaks our secret?",
+    "facts": [
+      [
+        "identity-renewal.md",
+        "19 hours"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q008",
+    "category": "direct_terminology",
+    "query": "What is the credential rotation replacement deadline?",
+    "facts": [
+      [
+        "identity-renewal.md",
+        "19 hours"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q009",
+    "category": "recreated_vocabulary_gap",
+    "query": "How many machines must agree if some servers disappear?",
+    "facts": [
+      [
+        "replica-quorum.md",
+        "five acknowledgments"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q010",
+    "category": "direct_terminology",
+    "query": "How many acknowledgments does the consensus quorum require?",
+    "facts": [
+      [
+        "replica-quorum.md",
+        "five acknowledgments"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q011",
+    "category": "recreated_vocabulary_gap",
+    "query": "Can repeated clicks trigger just one action when somebody finally stops?",
+    "facts": [
+      [
+        "work-coalescing.md",
+        "340 milliseconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q012",
+    "category": "direct_terminology",
+    "query": "What quiet interval does debouncing use?",
+    "facts": [
+      [
+        "work-coalescing.md",
+        "340 milliseconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q013",
+    "category": "recreated_vocabulary_gap",
+    "query": "How can resending a payment avoid charging somebody twice?",
+    "facts": [
+      [
+        "request-idempotency.md",
+        "37 minutes"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q014",
+    "category": "direct_terminology",
+    "query": "What is the idempotency deduplication horizon?",
+    "facts": [
+      [
+        "request-idempotency.md",
+        "37 minutes"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q015",
+    "category": "recreated_vocabulary_gap",
+    "query": "How can smaller customers get a turn when large customers never stop asking?",
+    "facts": [
+      [
+        "schedule-fairness.md",
+        "0.173"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q016",
+    "category": "direct_terminology",
+    "query": "What aging coefficient does weighted fair queuing use for starvation prevention?",
+    "facts": [
+      [
+        "schedule-fairness.md",
+        "0.173"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q017",
+    "category": "new_vocabulary_gap",
+    "query": "How can we stop hammering a broken service and let it recover?",
+    "facts": [
+      [
+        "failure-gate.md",
+        "46 seconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q018",
+    "category": "direct_terminology",
+    "query": "What is the circuit breaker open-state cooldown?",
+    "facts": [
+      [
+        "failure-gate.md",
+        "46 seconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q019",
+    "category": "new_vocabulary_gap",
+    "query": "Can we avoid calculating something until somebody actually needs its result?",
+    "facts": [
+      [
+        "late-work.md",
+        "83 entries"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q020",
+    "category": "direct_terminology",
+    "query": "What is the lazy evaluation pending-thunk ceiling?",
+    "facts": [
+      [
+        "late-work.md",
+        "83 entries"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q021",
+    "category": "new_vocabulary_gap",
+    "query": "How can a duplicate share memory until somebody changes it?",
+    "facts": [
+      [
+        "snapshot.md",
+        "96 KiB"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q022",
+    "category": "direct_terminology",
+    "query": "What allocation granularity does copy-on-write use?",
+    "facts": [
+      [
+        "snapshot.md",
+        "96 KiB"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q023",
+    "category": "new_vocabulary_gap",
+    "query": "How are deleted records finally removed from the sorted storage files?",
+    "facts": [
+      [
+        "batch-merge.md",
+        "13 runs"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q024",
+    "category": "direct_terminology",
+    "query": "What merge fan-in does compaction use?",
+    "facts": [
+      [
+        "batch-merge.md",
+        "13 runs"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q025",
+    "category": "new_vocabulary_gap",
+    "query": "How do we establish what happened first on machines whose watches disagree?",
+    "facts": [
+      [
+        "clock.md",
+        "271"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q026",
+    "category": "direct_terminology",
+    "query": "What is the Lamport logical clock initial counter?",
+    "facts": [
+      [
+        "clock.md",
+        "271"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q027",
+    "category": "new_vocabulary_gap",
+    "query": "How can we store sign-in checks without keeping readable passwords?",
+    "facts": [
+      [
+        "password-storage.md",
+        "72 MiB"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q028",
+    "category": "direct_terminology",
+    "query": "What memory cost does Argon2id password hashing use?",
+    "facts": [
+      [
+        "password-storage.md",
+        "72 MiB"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q029",
+    "category": "new_vocabulary_gap",
+    "query": "How long can a saved answer stay around before we must fetch a fresh one?",
+    "facts": [
+      [
+        "expiry.md",
+        "117 seconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q030",
+    "category": "direct_terminology",
+    "query": "What is the cache time-to-live TTL?",
+    "facts": [
+      [
+        "expiry.md",
+        "117 seconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q031",
+    "category": "new_vocabulary_gap",
+    "query": "Can we wait longer between attempts whenever the request keeps failing?",
+    "facts": [
+      [
+        "busy-wait.md",
+        "53 seconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q032",
+    "category": "direct_terminology",
+    "query": "What retry ceiling does exponential backoff use?",
+    "facts": [
+      [
+        "busy-wait.md",
+        "53 seconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q033",
+    "category": "new_vocabulary_gap",
+    "query": "How can we recover database changes after a sudden power loss?",
+    "facts": [
+      [
+        "undo.md",
+        "61 milliseconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q034",
+    "category": "direct_terminology",
+    "query": "What journal sync interval does write-ahead logging use?",
+    "facts": [
+      [
+        "undo.md",
+        "61 milliseconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q035",
+    "category": "new_vocabulary_gap",
+    "query": "How can only one worker own a job until its claim expires?",
+    "facts": [
+      [
+        "owner.md",
+        "41 seconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q036",
+    "category": "direct_terminology",
+    "query": "What renewal interval does the distributed lease use?",
+    "facts": [
+      [
+        "owner.md",
+        "41 seconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q037",
+    "category": "new_vocabulary_gap",
+    "query": "How do we avoid keeping two copies of identical file contents?",
+    "facts": [
+      [
+        "dedupe.md",
+        "BLAKE2b-256"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q038",
+    "category": "direct_terminology",
+    "query": "What blob digest does content-addressed storage use?",
+    "facts": [
+      [
+        "dedupe.md",
+        "BLAKE2b-256"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q039",
+    "category": "new_vocabulary_gap",
+    "query": "Can we quickly tell that an item definitely isn't present without loading the whole database?",
+    "facts": [
+      [
+        "partial-read.md",
+        "0.0047"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q040",
+    "category": "direct_terminology",
+    "query": "What false-positive target does the Bloom filter use?",
+    "facts": [
+      [
+        "partial-read.md",
+        "0.0047"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q041",
+    "category": "new_vocabulary_gap",
+    "query": "How do we walk through a long changing result list a little at a time?",
+    "facts": [
+      [
+        "chunks.md",
+        "73 records"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q042",
+    "category": "direct_terminology",
+    "query": "What page size does cursor pagination use?",
+    "facts": [
+      [
+        "chunks.md",
+        "73 records"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q043",
+    "category": "new_vocabulary_gap",
+    "query": "How do we keep an unknown program from accessing the rest of the machine?",
+    "facts": [
+      [
+        "isolation.md",
+        "29 children"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q044",
+    "category": "direct_terminology",
+    "query": "What process quota does sandboxing enforce?",
+    "facts": [
+      [
+        "isolation.md",
+        "29 children"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q045",
+    "category": "new_vocabulary_gap",
+    "query": "How can two people type in the same shared document without losing each other's changes?",
+    "facts": [
+      [
+        "merge-changes.md",
+        "251 edits"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q046",
+    "category": "direct_terminology",
+    "query": "What operation window does operational transformation retain?",
+    "facts": [
+      [
+        "merge-changes.md",
+        "251 edits"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q047",
+    "category": "new_vocabulary_gap",
+    "query": "How can adding a server avoid moving nearly every saved item to another machine?",
+    "facts": [
+      [
+        "path-choice.md",
+        "113 virtual nodes"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q048",
+    "category": "direct_terminology",
+    "query": "How many virtual nodes does consistent hashing allocate per member?",
+    "facts": [
+      [
+        "path-choice.md",
+        "113 virtual nodes"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q049",
+    "category": "source_scoped",
+    "query": "In harbor-guide.md, what is the connection recovery delay?",
+    "facts": [
+      [
+        "services/harbor-guide.md",
+        "29 seconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q050",
+    "category": "source_scoped_paraphrase",
+    "query": "According to harbor-guide.md, how long do we keep the activity trail?",
+    "facts": [
+      [
+        "services/harbor-guide.md",
+        "47 days"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q051",
+    "category": "multiple_facts",
+    "query": "Give the Harbor connection recovery policy and audit retention.",
+    "facts": [
+      [
+        "services/harbor-guide.md",
+        "Lantern-1"
+      ],
+      [
+        "services/harbor-guide.md",
+        "47 days"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q052",
+    "category": "missing_fact",
+    "query": "What is the monthly subscription price for Harbor? We need the price in dollars.",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q053",
+    "category": "missing_file",
+    "query": "In harbor-billing.md, what is the invoice grace period?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q054",
+    "category": "followup",
+    "query": "What is the current value in that document?",
+    "facts": [
+      [
+        "services/harbor-guide.md",
+        "29 seconds"
+      ]
+    ],
+    "previous": [
+      "In harbor-guide.md, what is the connection recovery delay?"
+    ]
+  },
+  {
+    "id": "q055",
+    "category": "source_scoped",
+    "query": "In meadow-guide.md, what is the connection recovery delay?",
+    "facts": [
+      [
+        "services/meadow-guide.md",
+        "32 seconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q056",
+    "category": "source_scoped_paraphrase",
+    "query": "According to meadow-guide.md, how long do we keep the activity trail?",
+    "facts": [
+      [
+        "services/meadow-guide.md",
+        "54 days"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q057",
+    "category": "multiple_facts",
+    "query": "Give the Meadow connection recovery policy and audit retention.",
+    "facts": [
+      [
+        "services/meadow-guide.md",
+        "Lantern-2"
+      ],
+      [
+        "services/meadow-guide.md",
+        "54 days"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q058",
+    "category": "missing_fact",
+    "query": "What is the monthly subscription price for Meadow? We need the price in dollars.",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q059",
+    "category": "missing_file",
+    "query": "In meadow-billing.md, what is the invoice grace period?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q060",
+    "category": "followup",
+    "query": "What is the current value in that document?",
+    "facts": [
+      [
+        "services/meadow-guide.md",
+        "32 seconds"
+      ]
+    ],
+    "previous": [
+      "In meadow-guide.md, what is the connection recovery delay?"
+    ]
+  },
+  {
+    "id": "q061",
+    "category": "source_scoped",
+    "query": "In cobalt-guide.md, what is the connection recovery delay?",
+    "facts": [
+      [
+        "services/cobalt-guide.md",
+        "35 seconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q062",
+    "category": "source_scoped_paraphrase",
+    "query": "According to cobalt-guide.md, how long do we keep the activity trail?",
+    "facts": [
+      [
+        "services/cobalt-guide.md",
+        "61 days"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q063",
+    "category": "multiple_facts",
+    "query": "Give the Cobalt connection recovery policy and audit retention.",
+    "facts": [
+      [
+        "services/cobalt-guide.md",
+        "Lantern-3"
+      ],
+      [
+        "services/cobalt-guide.md",
+        "61 days"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q064",
+    "category": "missing_fact",
+    "query": "What is the monthly subscription price for Cobalt? We need the price in dollars.",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q065",
+    "category": "missing_file",
+    "query": "In cobalt-billing.md, what is the invoice grace period?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q066",
+    "category": "followup",
+    "query": "What is the current value in that document?",
+    "facts": [
+      [
+        "services/cobalt-guide.md",
+        "35 seconds"
+      ]
+    ],
+    "previous": [
+      "In cobalt-guide.md, what is the connection recovery delay?"
+    ]
+  },
+  {
+    "id": "q067",
+    "category": "source_scoped",
+    "query": "In juniper-guide.md, what is the connection recovery delay?",
+    "facts": [
+      [
+        "services/juniper-guide.md",
+        "38 seconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q068",
+    "category": "source_scoped_paraphrase",
+    "query": "According to juniper-guide.md, how long do we keep the activity trail?",
+    "facts": [
+      [
+        "services/juniper-guide.md",
+        "68 days"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q069",
+    "category": "multiple_facts",
+    "query": "Give the Juniper connection recovery policy and audit retention.",
+    "facts": [
+      [
+        "services/juniper-guide.md",
+        "Lantern-4"
+      ],
+      [
+        "services/juniper-guide.md",
+        "68 days"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q070",
+    "category": "missing_fact",
+    "query": "What is the monthly subscription price for Juniper? We need the price in dollars.",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q071",
+    "category": "missing_file",
+    "query": "In juniper-billing.md, what is the invoice grace period?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q072",
+    "category": "followup",
+    "query": "What is the current value in that document?",
+    "facts": [
+      [
+        "services/juniper-guide.md",
+        "38 seconds"
+      ]
+    ],
+    "previous": [
+      "In juniper-guide.md, what is the connection recovery delay?"
+    ]
+  },
+  {
+    "id": "q073",
+    "category": "source_scoped",
+    "query": "In orchid-guide.md, what is the connection recovery delay?",
+    "facts": [
+      [
+        "services/orchid-guide.md",
+        "41 seconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q074",
+    "category": "source_scoped_paraphrase",
+    "query": "According to orchid-guide.md, how long do we keep the activity trail?",
+    "facts": [
+      [
+        "services/orchid-guide.md",
+        "75 days"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q075",
+    "category": "multiple_facts",
+    "query": "Give the Orchid connection recovery policy and audit retention.",
+    "facts": [
+      [
+        "services/orchid-guide.md",
+        "Lantern-5"
+      ],
+      [
+        "services/orchid-guide.md",
+        "75 days"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q076",
+    "category": "missing_fact",
+    "query": "What is the monthly subscription price for Orchid? We need the price in dollars.",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q077",
+    "category": "missing_file",
+    "query": "In orchid-billing.md, what is the invoice grace period?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q078",
+    "category": "source_scoped",
+    "query": "In summit-guide.md, what is the connection recovery delay?",
+    "facts": [
+      [
+        "services/summit-guide.md",
+        "44 seconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q079",
+    "category": "source_scoped_paraphrase",
+    "query": "According to summit-guide.md, how long do we keep the activity trail?",
+    "facts": [
+      [
+        "services/summit-guide.md",
+        "82 days"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q080",
+    "category": "multiple_facts",
+    "query": "Give the Summit connection recovery policy and audit retention.",
+    "facts": [
+      [
+        "services/summit-guide.md",
+        "Lantern-6"
+      ],
+      [
+        "services/summit-guide.md",
+        "82 days"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q081",
+    "category": "missing_fact",
+    "query": "What is the monthly subscription price for Summit? We need the price in dollars.",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q082",
+    "category": "missing_file",
+    "query": "In summit-billing.md, what is the invoice grace period?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q083",
+    "category": "source_scoped",
+    "query": "In linden-guide.md, what is the connection recovery delay?",
+    "facts": [
+      [
+        "services/linden-guide.md",
+        "47 seconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q084",
+    "category": "source_scoped_paraphrase",
+    "query": "According to linden-guide.md, how long do we keep the activity trail?",
+    "facts": [
+      [
+        "services/linden-guide.md",
+        "89 days"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q085",
+    "category": "multiple_facts",
+    "query": "Give the Linden connection recovery policy and audit retention.",
+    "facts": [
+      [
+        "services/linden-guide.md",
+        "Lantern-7"
+      ],
+      [
+        "services/linden-guide.md",
+        "89 days"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q086",
+    "category": "missing_fact",
+    "query": "What is the monthly subscription price for Linden? We need the price in dollars.",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q087",
+    "category": "missing_file",
+    "query": "In linden-billing.md, what is the invoice grace period?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q088",
+    "category": "source_scoped",
+    "query": "In kestrel-guide.md, what is the connection recovery delay?",
+    "facts": [
+      [
+        "services/kestrel-guide.md",
+        "50 seconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q089",
+    "category": "source_scoped_paraphrase",
+    "query": "According to kestrel-guide.md, how long do we keep the activity trail?",
+    "facts": [
+      [
+        "services/kestrel-guide.md",
+        "96 days"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q090",
+    "category": "multiple_facts",
+    "query": "Give the Kestrel connection recovery policy and audit retention.",
+    "facts": [
+      [
+        "services/kestrel-guide.md",
+        "Lantern-8"
+      ],
+      [
+        "services/kestrel-guide.md",
+        "96 days"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q091",
+    "category": "missing_fact",
+    "query": "What is the monthly subscription price for Kestrel? We need the price in dollars.",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q092",
+    "category": "missing_file",
+    "query": "In kestrel-billing.md, what is the invoice grace period?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q093",
+    "category": "exact_identifier",
+    "query": "What marker does `readSessionToken` return?",
+    "facts": [
+      [
+        "code/module_00.py",
+        "violet-71"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q094",
+    "category": "exact_identifier",
+    "query": "What marker does `reset_connection_cache` return?",
+    "facts": [
+      [
+        "code/module_01.py",
+        "violet-72"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q095",
+    "category": "exact_identifier",
+    "query": "What marker does `loadAuditPolicy` return?",
+    "facts": [
+      [
+        "code/module_02.py",
+        "violet-73"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q096",
+    "category": "exact_identifier",
+    "query": "What marker does `flush_pending_jobs` return?",
+    "facts": [
+      [
+        "code/module_03.py",
+        "violet-74"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q097",
+    "category": "exact_identifier",
+    "query": "What marker does `rebuild_search_index` return?",
+    "facts": [
+      [
+        "code/module_04.py",
+        "violet-75"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q098",
+    "category": "exact_identifier",
+    "query": "What marker does `scheduleRetry` return?",
+    "facts": [
+      [
+        "code/module_05.py",
+        "violet-76"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q099",
+    "category": "exact_identifier",
+    "query": "What marker does `setConnectionLimit` return?",
+    "facts": [
+      [
+        "code/module_06.py",
+        "violet-77"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q100",
+    "category": "exact_identifier",
+    "query": "What marker does `commit_batch` return?",
+    "facts": [
+      [
+        "code/module_07.py",
+        "violet-78"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q101",
+    "category": "exact_identifier",
+    "query": "What marker does `fetchDocumentVersion` return?",
+    "facts": [
+      [
+        "code/module_08.py",
+        "violet-79"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q102",
+    "category": "exact_identifier",
+    "query": "What marker does `parse_config_value` return?",
+    "facts": [
+      [
+        "code/module_09.py",
+        "violet-80"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q103",
+    "category": "exact_identifier",
+    "query": "What marker does `closeIdleSessions` return?",
+    "facts": [
+      [
+        "code/module_10.py",
+        "violet-81"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q104",
+    "category": "exact_identifier",
+    "query": "What marker does `write_snapshot` return?",
+    "facts": [
+      [
+        "code/module_11.py",
+        "violet-82"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q105",
+    "category": "ambiguity_and_phrases",
+    "query": "What temperature is specified for the python enclosure?",
+    "facts": [
+      [
+        "animals/python.md",
+        "31 Celsius"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q106",
+    "category": "ambiguity_and_phrases",
+    "query": "How many processes does the Python runtime worker pool use?",
+    "facts": [
+      [
+        "languages/python.md",
+        "17 processes"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q107",
+    "category": "ambiguity_and_phrases",
+    "query": "How many keys are on the piano keyboard?",
+    "facts": [
+      [
+        "music/keys.md",
+        "88 keys"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q108",
+    "category": "ambiguity_and_phrases",
+    "query": "How often are signing keys renewed?",
+    "facts": [
+      [
+        "security/keys.md",
+        "67 days"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q109",
+    "category": "ambiguity_and_phrases",
+    "query": "What pause does the \"Silver Window\" policy require?",
+    "facts": [
+      [
+        "quote-policy.md",
+        "137-second"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q110",
+    "category": "ambiguity_and_phrases",
+    "query": "What pause does the \"Amber Window\" policy require?",
+    "facts": [
+      [
+        "quotes-other.md",
+        "19-second"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q111",
+    "category": "ambiguity_and_phrases",
+    "query": "What is the Java island field station identifier?",
+    "facts": [
+      [
+        "geography/java.md",
+        "ISLAND-61"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q112",
+    "category": "ambiguity_and_phrases",
+    "query": "What compiler profile does the Java language use?",
+    "facts": [
+      [
+        "languages/java.md",
+        "JVM-24"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "q113",
+    "category": "missing_topic",
+    "query": "What is the warranty period of the Lunar Kettle appliance?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q114",
+    "category": "missing_topic",
+    "query": "What is the recommended insulin dosage for patient ZYX-149?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q115",
+    "category": "missing_topic",
+    "query": "What launch date was approved for the underwater tram network?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q116",
+    "category": "missing_topic",
+    "query": "What is the admission fee for the Nebula Observatory?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q117",
+    "category": "missing_topic",
+    "query": "What is the checksum for release v99.73.15?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q118",
+    "category": "missing_topic",
+    "query": "Which Unicode normalization form does our text database enforce?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q119",
+    "category": "missing_topic",
+    "query": "Which TLS cipher suite is mandated by the regional payment gateway?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "q120",
+    "category": "missing_topic",
+    "query": "What is the maximum sodium content of the campus cafeteria soup?",
+    "facts": [],
+    "previous": []
+  }
+]

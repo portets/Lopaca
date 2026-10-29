@@ -1,0 +1,202 @@
+[
+  {
+    "id": "h001",
+    "query": "Which process admission primitive lets only three workers in together?",
+    "facts": [
+      [
+        "concurrency/admission.md",
+        "three permits"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "h002",
+    "query": "Does our admission control use a counting semaphore, and what is the permit ceiling?",
+    "facts": [
+      [
+        "concurrency/admission.md",
+        "three permits"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "h003",
+    "query": "For the resume-state mechanism, give the interval between snapshots of computation.",
+    "facts": [
+      [
+        "recovery/state.md",
+        "181 iterations"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "h004",
+    "query": "Find the prescribed codec for analysis where we access just a column of values.",
+    "facts": [
+      [
+        "analytics/layout.md",
+        "ZSTD-9"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "h005",
+    "query": "Where is the queued-event pattern that couples committed business data with a notification, and what is its drain size?",
+    "facts": [
+      [
+        "messaging/persistence.md",
+        "27 records"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "h006",
+    "query": "What lifetime is used for cached failed DNS resolutions?",
+    "facts": [
+      [
+        "dns/absence.md",
+        "94 seconds"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "h007",
+    "query": "Which method merges offline edits without central coordination, and what initial merge clock does it use?",
+    "facts": [
+      [
+        "collaboration/merge.md",
+        "812 ticks"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "h008",
+    "query": "With due-date-based scheduling, how far ahead are jobs planned?",
+    "facts": [
+      [
+        "calendar/dispatch.md",
+        "39 minutes"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "h009",
+    "query": "For adhesion-driven fluid transport in tubes, state the documented tube size.",
+    "facts": [
+      [
+        "biology/transport.md",
+        "0.38 millimeters"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "h010",
+    "query": "According to messaging/persistence.md, how many pending event rows fit in a dispatch pass?",
+    "facts": [
+      [
+        "messaging/persistence.md",
+        "27 records"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "h011",
+    "query": "In manuals/mistral.md, give shipment batch timing and financial-record lifetime.",
+    "facts": [
+      [
+        "manuals/mistral.md",
+        "212 milliseconds"
+      ],
+      [
+        "manuals/mistral.md",
+        "522 days"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "h012",
+    "query": "What is returned by reserve_invoice_credit in implementation/handler_1.py?",
+    "facts": [
+      [
+        "implementation/handler_1.py",
+        "copper-934"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "h013",
+    "query": "What is returned by renewConnectionLease?",
+    "facts": [
+      [
+        "implementation/handler_0.py",
+        "copper-933"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "h014",
+    "query": "What is returned by release_snapshot_pages_obsolete?",
+    "facts": [
+      [
+        "implementation/handler_2.py",
+        "not-current"
+      ]
+    ],
+    "previous": []
+  },
+  {
+    "id": "h015",
+    "query": "What is the daily electrical consumption of the semaphore implementation?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "h016",
+    "query": "What is the maintainers' email address for Arcadia?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "h017",
+    "query": "What unit test coverage percentage is required for the transactional outbox?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "h018",
+    "query": "From documents/nonexistent-network.md, give the packet limit.",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "h019",
+    "query": "Which commercial license do we purchase for the negative caching subsystem?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "h020",
+    "query": "What is the earthquake rating of the Turquoise viewing dome?",
+    "facts": [],
+    "previous": []
+  },
+  {
+    "id": "h021",
+    "query": "In analytics/layout.md, what is the annual carbon tax rate?",
+    "facts": [],
+    "previous": []
+  }
+]

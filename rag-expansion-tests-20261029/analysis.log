@@ -1,0 +1,481 @@
+{
+  "novel_terms_ablation": {
+    "missing_file": {
+      "answerable": 0,
+      "complete": 0,
+      "top1": 0,
+      "missing_answer": 8,
+      "false_context": 0
+    },
+    "all": {
+      "answerable": 96,
+      "complete": 89,
+      "top1": 81,
+      "missing_answer": 24,
+      "false_context": 7
+    },
+    "new_vocabulary_gap": {
+      "answerable": 16,
+      "complete": 10,
+      "top1": 5,
+      "missing_answer": 0,
+      "false_context": 0
+    },
+    "source_scoped": {
+      "answerable": 8,
+      "complete": 8,
+      "top1": 8,
+      "missing_answer": 0,
+      "false_context": 0
+    },
+    "ambiguity_and_phrases": {
+      "answerable": 8,
+      "complete": 8,
+      "top1": 8,
+      "missing_answer": 0,
+      "false_context": 0
+    },
+    "source_scoped_paraphrase": {
+      "answerable": 8,
+      "complete": 8,
+      "top1": 8,
+      "missing_answer": 0,
+      "false_context": 0
+    },
+    "missing_fact": {
+      "answerable": 0,
+      "complete": 0,
+      "top1": 0,
+      "missing_answer": 8,
+      "false_context": 0
+    },
+    "recreated_vocabulary_gap": {
+      "answerable": 8,
+      "complete": 7,
+      "top1": 4,
+      "missing_answer": 0,
+      "false_context": 0
+    },
+    "direct_terminology": {
+      "answerable": 24,
+      "complete": 24,
+      "top1": 24,
+      "missing_answer": 0,
+      "false_context": 0
+    },
+    "exact_identifier": {
+      "answerable": 12,
+      "complete": 12,
+      "top1": 12,
+      "missing_answer": 0,
+      "false_context": 0
+    },
+    "multiple_facts": {
+      "answerable": 8,
+      "complete": 8,
+      "top1": 8,
+      "missing_answer": 0,
+      "false_context": 0
+    },
+    "missing_topic": {
+      "answerable": 0,
+      "complete": 0,
+      "top1": 0,
+      "missing_answer": 8,
+      "false_context": 7
+    },
+    "followup": {
+      "answerable": 4,
+      "complete": 4,
+      "top1": 4,
+      "missing_answer": 0,
+      "false_context": 0
+    }
+  },
+  "failure_diagnostics": [
+    {
+      "id": "q043",
+      "query": "How do we keep an unknown program from accessing the rest of the machine?",
+      "expansion": "Sandboxing, Isolation, Virtualization, Containerization, Access Control, Privilege Separation",
+      "inferred_scope": [],
+      "anchor_terms": [],
+      "expected_sources": [
+        "isolation.md"
+      ],
+      "expected_sources_excluded_by_scope": [],
+      "expected_sources_in_candidate_pool": [
+        "isolation.md"
+      ]
+    },
+    {
+      "id": "q015",
+      "query": "How can smaller customers get a turn when large customers never stop asking?",
+      "expansion": "Queueing theory, Priority scheduling, Fairness algorithms, Resource allocation, Load balancing, Service level agreement",
+      "inferred_scope": [],
+      "anchor_terms": [],
+      "expected_sources": [
+        "schedule-fairness.md"
+      ],
+      "expected_sources_excluded_by_scope": [],
+      "expected_sources_in_candidate_pool": [
+        "schedule-fairness.md"
+      ]
+    },
+    {
+      "id": "q023",
+      "query": "How are deleted records finally removed from the sorted storage files?",
+      "expansion": "purge, compaction, garbage collection, vacuum, merge, defragmentation",
+      "inferred_scope": [
+        "lopaca/storage.py",
+        "storage-reclamation.md"
+      ],
+      "anchor_terms": [
+        "storage"
+      ],
+      "expected_sources": [
+        "batch-merge.md"
+      ],
+      "expected_sources_excluded_by_scope": [
+        "batch-merge.md"
+      ],
+      "expected_sources_in_candidate_pool": []
+    },
+    {
+      "id": "q031",
+      "query": "Can we wait longer between attempts whenever the request keeps failing?",
+      "expansion": "Exponential backoff, Retry policy, Jitter, Circuit breaker, Transient fault, Timeout",
+      "inferred_scope": [
+        "request-idempotency.md"
+      ],
+      "anchor_terms": [
+        "request"
+      ],
+      "expected_sources": [
+        "busy-wait.md"
+      ],
+      "expected_sources_excluded_by_scope": [
+        "busy-wait.md"
+      ],
+      "expected_sources_in_candidate_pool": []
+    },
+    {
+      "id": "q041",
+      "query": "How do we walk through a long changing result list a little at a time?",
+      "expansion": "Pagination, Cursor-based pagination, Offset-based pagination, Lazy loading, Infinite scroll, Chunking",
+      "inferred_scope": [
+        "expiry.md"
+      ],
+      "anchor_terms": [
+        "time"
+      ],
+      "expected_sources": [
+        "chunks.md"
+      ],
+      "expected_sources_excluded_by_scope": [
+        "chunks.md"
+      ],
+      "expected_sources_in_candidate_pool": []
+    },
+    {
+      "id": "q047",
+      "query": "How can adding a server avoid moving nearly every saved item to another machine?",
+      "expansion": "Server migration, Data replication, Network storage, Centralized data management, Distributed file system, Cloud backup",
+      "inferred_scope": [],
+      "anchor_terms": [],
+      "expected_sources": [
+        "path-choice.md"
+      ],
+      "expected_sources_excluded_by_scope": [],
+      "expected_sources_in_candidate_pool": []
+    },
+    {
+      "id": "q045",
+      "query": "How can two people type in the same shared document without losing each other's changes?",
+      "expansion": "Operational Transformation, Conflict-free Replicated Data Types, CRDT, Real-time Collaboration, Synchronization, Version Control",
+      "inferred_scope": [
+        "quotes-other.md"
+      ],
+      "anchor_terms": [
+        "other"
+      ],
+      "expected_sources": [
+        "merge-changes.md"
+      ],
+      "expected_sources_excluded_by_scope": [
+        "merge-changes.md"
+      ],
+      "expected_sources_in_candidate_pool": []
+    }
+  ],
+  "fallback_checks": [
+    {
+      "id": "q107",
+      "timeout_equals_off": true,
+      "empty_equals_off": true
+    },
+    {
+      "id": "q004",
+      "timeout_equals_off": true,
+      "empty_equals_off": true
+    },
+    {
+      "id": "q103",
+      "timeout_equals_off": true,
+      "empty_equals_off": true
+    },
+    {
+      "id": "q066",
+      "timeout_equals_off": true,
+      "empty_equals_off": true
+    },
+    {
+      "id": "q064",
+      "timeout_equals_off": true,
+      "empty_equals_off": true
+    },
+    {
+      "id": "q077",
+      "timeout_equals_off": true,
+      "empty_equals_off": true
+    },
+    {
+      "id": "q114",
+      "timeout_equals_off": true,
+      "empty_equals_off": true
+    },
+    {
+      "id": "q080",
+      "timeout_equals_off": true,
+      "empty_equals_off": true
+    },
+    {
+      "id": "q025",
+      "timeout_equals_off": true,
+      "empty_equals_off": true
+    },
+    {
+      "id": "q007",
+      "timeout_equals_off": true,
+      "empty_equals_off": true
+    },
+    {
+      "id": "q073",
+      "timeout_equals_off": true,
+      "empty_equals_off": true
+    },
+    {
+      "id": "q062",
+      "timeout_equals_off": true,
+      "empty_equals_off": true
+    }
+  ],
+  "repeat_comparisons": [
+    {
+      "id": "q105",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q106",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q002",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q004",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q093",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q094",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q054",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q060",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q052",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q058",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q053",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q059",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q113",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q114",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q051",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q057",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q017",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q019",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q001",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q003",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q049",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q055",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q050",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    },
+    {
+      "id": "q056",
+      "identical_text": true,
+      "same_passages": true,
+      "same_complete": true,
+      "same_false_context": true,
+      "error": null
+    }
+  ],
+  "app_files_unchanged": {
+    "main.py": true,
+    "ui.py": true,
+    "storage.py": true,
+    "settings.py": true,
+    "rag.py": true,
+    "agentic.py": true
+  },
+  "expansion_latency_seconds": {
+    "min": 2.082065665999835,
+    "median": 3.2332355864999727,
+    "p95": 4.092885368999987,
+    "max": 4.736279177000142,
+    "total": 397.12628464199975
+  }
+}
