@@ -326,8 +326,42 @@ def _rank(connection, query, expansion, settings):
     return selected
 
 
-def retrieve(query, folder, settings, expand=None, stopped=lambda: False):
+def _retrieval_query(query, previous_queries):
+    """Resolve document follow-ups without pulling old topics into unrelated questions."""
+    reference = re.search(
+        r"\b(?:that|this|the) (?:file|document|value)\b|\b(?:check again|current value|and now)\b",
+        query,
+        re.IGNORECASE,
+    )
+    generic = {
+        "changed",
+        "change",
+        "updated",
+        "update",
+        "value",
+        "values",
+        "file",
+        "files",
+        "document",
+        "documents",
+        "check",
+        "again",
+        "current",
+        "latest",
+        "now",
+        "give",
+        "read",
+    }
+    if reference and not (set(_terms(query)) - generic):
+        for previous in reversed(previous_queries):
+            if set(_terms(previous)) - generic:
+                return previous + "\n" + query
+    return query
+
+
+def retrieve(query, folder, settings, expand=None, stopped=lambda: False, previous_queries=()):
     """Update changed files and retrieve passages using a thread-local SQLite connection."""
+    query = _retrieval_query(query, previous_queries)
     if (
         not folder.is_dir()
         or not _terms(query)
