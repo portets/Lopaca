@@ -1083,6 +1083,23 @@ class ChatWindow(Adw.ApplicationWindow):
                 self._show_alert("Could not save app settings", str(exc), self)
 
         preserve_reasoning_handler = preserve_reasoning_checkbox.connect("notify::active", changed)
+        expansion_row = Adw.SwitchRow(
+            title="Expand Document Searches", active=self.controller.rag_query_expansion
+        )
+        expansion_row.set_tooltip_text(
+            "Ask the current model for related search terms before retrieval. Adds latency."
+        )
+
+        def expansion_changed(row, _param):
+            try:
+                self.controller.set_rag_query_expansion(row.get_active())
+            except OSError as exc:
+                with row.handler_block(expansion_handler):
+                    row.set_active(not row.get_active())
+                self._show_alert("Could not save app settings", str(exc), self)
+
+        expansion_handler = expansion_row.connect("notify::active", expansion_changed)
+        group.add(expansion_row)
         sort_group = Adw.PreferencesGroup(title="Unpinned Chat Sort")
         page.add(sort_group)
         sort_controls = {}

@@ -26,6 +26,10 @@ class Settings:
     max_context_chars: int = 12000
     chunk_chars: int = 1100
     chunk_overlap: int = 140
+    rag_results: int = 5
+    rag_candidates: int = 40
+    rag_query_expansion: bool = False
+    rag_expansion_timeout: int = 10
     code_agent: bool = True
     enable_command_approval: bool = True
     command_scan_chars: int = 262144

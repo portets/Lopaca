@@ -23,10 +23,16 @@ Or right click and run as program. May need to check Properties/Executable as Pr
 Installs to ~/.local/share/lopaca/ with a shortcut menu entry at ~/.local/share/applications/Lopaca.desktop.\
 Then just run it using your menu shortcut.
 
+# Local documents
+Add readable text documents through a chat's menu, or place them in that chat's `documents/` folder. Before each prompt, a background worker checks for new, changed, and deleted files and updates `documents.sqlite` incrementally.
+
+Retrieval uses SQLite FTS5/BM25, phrase and identifier matching, and filename/section searches combined with Reciprocal Rank Fusion (RRF). Chunking follows paragraphs, Markdown sections, and code definitions, with overlap between chunks. Relevant excerpts are injected into the current request as document reference data, not saved in chat history.
+
+**Expand Document Searches** in App Settings optionally asks the same llama-server model for related search terms. It is off by default because it adds response latency.
+
 # TO-DO
 - Add more global settings
 - Add more individual chat settings
-- More robust RAG; BM25 and RFF
 - Global memories file that the RAG function uses
 - Selectable assistant style.md for communication styles
 - Basic agentic mode
