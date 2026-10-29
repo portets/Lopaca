@@ -231,6 +231,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._status_timer = None
         self._status_dots = 0
         self._activity_status = "Not Connected"
+        self._processing_documents = False
         self._notification_timer = None
         self._response_row = None
         self._response_chat_id = None
@@ -465,7 +466,16 @@ class ChatWindow(Adw.ApplicationWindow):
     def set_status(self, text):
         self._activity_status = text
         if self._notification_timer is None:
-            self._display_status(text)
+            self._display_status(
+                "Assistant processing documents" if self._processing_documents else text
+            )
+
+    def set_document_processing(self, active):
+        self._processing_documents = active
+        if active and self._notification_timer is not None:
+            GLib.source_remove(self._notification_timer)
+            self._notification_timer = None
+        self.set_status(self._activity_status)
 
     def notify(self, text):
         if self._notification_timer is not None:
@@ -475,7 +485,7 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def _restore_status(self):
         self._notification_timer = None
-        self._display_status(self._activity_status)
+        self.set_status(self._activity_status)
         return False
 
     def _display_status(self, text):
@@ -487,7 +497,7 @@ class ChatWindow(Adw.ApplicationWindow):
             GLib.source_remove(self._status_timer)
             self._status_timer = None
         self.status.set_text(text)
-        if text in ("Waiting", "Thinking", "Responding"):
+        if text in ("Waiting", "Thinking", "Responding", "Assistant processing documents"):
             self._status_timer = GLib.timeout_add(650, self._animate_status)
 
     def _animate_status(self):
@@ -1087,7 +1097,7 @@ class ChatWindow(Adw.ApplicationWindow):
             title="Expand Document Searches", active=self.controller.rag_query_expansion
         )
         expansion_row.set_tooltip_text(
-            "Ask the current model for related search terms before retrieval. Adds latency."
+            "Ask the current model for related search terms before retrieval. Adds prompt latency."
         )
 
         def expansion_changed(row, _param):
@@ -1100,6 +1110,24 @@ class ChatWindow(Adw.ApplicationWindow):
 
         expansion_handler = expansion_row.connect("notify::active", expansion_changed)
         group.add(expansion_row)
+        indexing_row = Adw.SwitchRow(
+            title="Model-Assisted Document Indexing (SLOW)",
+            active=self.controller.rag_model_indexing,
+        )
+        indexing_row.set_tooltip_text(
+            "Modestly improves document info retrieval. CAN BE SLOW, best used with t/s > 80."
+        )
+
+        def indexing_changed(row, _param):
+            try:
+                self.controller.set_rag_model_indexing(row.get_active())
+            except OSError as exc:
+                with row.handler_block(indexing_handler):
+                    row.set_active(not row.get_active())
+                self._show_alert("Could not save app settings", str(exc), self)
+
+        indexing_handler = indexing_row.connect("notify::active", indexing_changed)
+        group.add(indexing_row)
         sort_group = Adw.PreferencesGroup(title="Unpinned Chat Sort")
         page.add(sort_group)
         sort_controls = {}

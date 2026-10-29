@@ -2,12 +2,14 @@
 
 import ast
 import codecs
+import hashlib
 import logging
 import math
 import queue
 import re
 import sqlite3
 import threading
+import time
 from collections import defaultdict
 from contextlib import closing, suppress
 from pathlib import Path
@@ -16,8 +18,17 @@ from pathlib import Path
 class DocumentIndexer:
     """Serialize background indexing, with at most one queued check per folder."""
 
-    def __init__(self, settings):
+    def __init__(self, settings, generate_questions, model_lock, on_processing):
         self.settings = settings
+        self.enabled = settings.rag_model_indexing
+        self._generate_questions = generate_questions
+        self._model_lock = model_lock
+        self._on_processing = on_processing
+        self._retry_after = 0
+        self._hint_version = (
+            "questions-v1:"
+            + hashlib.sha256(f"{settings.server_url}:{settings.model}".encode()).hexdigest()
+        )
         self._queue = queue.Queue()
         self._pending = {}
         self._active = None
@@ -54,14 +65,153 @@ class DocumentIndexer:
                     with closing(
                         sqlite3.connect(folder.parent / "documents.sqlite", timeout=5)
                     ) as connection:
-                        _index(connection, folder, self.settings, lambda: False)
+                        changed = _index(connection, folder, self.settings, lambda: False)
+                        version = self._hint_version if self.enabled else "off"
+                        state = connection.execute(
+                            "SELECT value FROM index_state WHERE key = 'model_indexing'"
+                        ).fetchone()
+                        if changed or (
+                            state != (version,)
+                            and (not self.enabled or time.monotonic() >= self._retry_after)
+                        ):
+                            self._update_hints(connection, folder)
             except Exception as exc:
+                self._retry_after = time.monotonic() + self.settings.rag_indexing_retry_interval
                 logging.warning("Could not index documents in %s: %s", folder, exc)
             finally:
                 with self._lock:
                     self._active = None
                     ready.set()
                 self._queue.task_done()
+
+    def _update_hints(self, connection, folder):
+        """Apply cached search text; generate missing questions outside write transactions."""
+        enabled = self.enabled
+        version = self._hint_version if enabled else "off"
+        cached = dict(connection.execute("SELECT key, questions FROM document_hints"))
+        stamps = {
+            name: (mtime, ctime, size)
+            for name, mtime, ctime, size in connection.execute("SELECT * FROM files")
+        }
+        rows = connection.execute(
+            "SELECT rowid, source, section, body, keywords FROM chunks"
+        ).fetchall()
+        jobs, keys = [], set()
+        with connection:
+            for rowid, source, section, body, keywords in rows:
+                key = hashlib.sha256(
+                    f"{self._hint_version}\0{source}\0{section}\0{body}".encode()
+                ).hexdigest()
+                keys.add(key)
+                search_text = _keywords(source, section, body)
+                if enabled and key in cached:
+                    search_text += " " + cached[key]
+                elif enabled and any(
+                    line.strip() and not line.lstrip().startswith("#") for line in body.splitlines()
+                ):
+                    jobs.append((rowid, source, section, body, key, search_text))
+                if search_text != keywords:
+                    connection.execute(
+                        "UPDATE chunks SET keywords = ? WHERE rowid = ?", (search_text, rowid)
+                    )
+            for key in cached.keys() - keys:
+                connection.execute("DELETE FROM document_hints WHERE key = ?", (key,))
+            connection.execute(
+                "INSERT OR REPLACE INTO index_state VALUES ('model_indexing', ?)",
+                (version + ":pending" if jobs else version,),
+            )
+        if not jobs or time.monotonic() < self._retry_after:
+            return
+        # Chat requests wait for indexing before acquiring this same lock.
+        with self._model_lock:
+            if not self.enabled:
+                return
+            self._on_processing(True)
+            written = 0
+            try:
+                for job, questions in self._question_batches(jobs, folder, stamps):
+                    if not self.enabled:
+                        return
+                    rowid, source, section, body, key, search_text = job
+                    if not _unchanged(folder / source, stamps[source]):
+                        continue
+                    with connection:
+                        # Row IDs can be reused if another process reindexes this chat.
+                        result = connection.execute(
+                            "UPDATE chunks SET keywords = ? "
+                            "WHERE rowid = ? AND source = ? AND section = ? AND body = ?",
+                            (search_text + " " + questions, rowid, source, section, body),
+                        )
+                        if result.rowcount:
+                            connection.execute(
+                                "INSERT OR REPLACE INTO document_hints VALUES (?, ?)",
+                                (key, questions),
+                            )
+                            written += 1
+                if written == len(jobs):
+                    with connection:
+                        connection.execute(
+                            "INSERT OR REPLACE INTO index_state VALUES ('model_indexing', ?)",
+                            (version,),
+                        )
+            finally:
+                self._on_processing(False)
+                # Model work can take minutes; refresh edits/deletions made during it
+                # before releasing a waiting chat request to read source passages.
+                _index(connection, folder, self.settings, lambda: False)
+
+    def _question_batches(self, jobs, folder, stamps):
+        """Bound request sizes without splitting or merging the indexed passages."""
+        batch, size = [], 0
+        for job in jobs:
+            _, source, section, body, _, _ = job
+            if not _unchanged(folder / source, stamps[source]):
+                continue
+            length = len(source) + len(section) + len(body)
+            if batch and (
+                len(batch) >= max(1, self.settings.rag_indexing_batch_size)
+                or size + length > max(1, self.settings.rag_indexing_batch_chars)
+            ):
+                yield from self._generate_batch(batch)
+                batch, size = [], 0
+            batch.append(job)
+            size += length
+        if batch:
+            yield from self._generate_batch(batch)
+
+    def _generate_batch(self, batch):
+        if not self.enabled:
+            return
+        passages = [
+            {"id": rowid, "source": source, "section": section, "body": body}
+            for rowid, source, section, body, _key, _search_text in batch
+        ]
+        try:
+            questions = self._generate_questions(passages)
+        except ValueError:
+            # Smaller requests help models that struggle to keep several IDs straight.
+            if len(batch) == 1:
+                raise
+            middle = len(batch) // 2
+            yield from self._generate_batch(batch[:middle])
+            yield from self._generate_batch(batch[middle:])
+        else:
+            for job in batch:
+                yield job, questions[job[0]]
+
+
+def _unchanged(path, stamp):
+    try:
+        stat = path.stat()
+        return not path.is_symlink() and (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size) == stamp
+    except OSError:
+        return False
+
+
+def _keywords(source, section, body):
+    """Include split camelCase/snake_case terms alongside the original source text."""
+    words = re.sub(r"([a-z\d])([A-Z])", r"\1 \2", f"{source} {section} {body}")
+    return " ".join(re.findall(r"[^\W_]+", words))
 
 
 def read_document(path):
@@ -232,6 +382,7 @@ def _index(connection, folder, settings, stopped):
             path TEXT PRIMARY KEY, mtime_ns INTEGER, ctime_ns INTEGER, size INTEGER
         );
         CREATE TABLE IF NOT EXISTS index_state (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS document_hints (key TEXT PRIMARY KEY, questions TEXT);
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
             source, section, body, keywords, start_line UNINDEXED, end_line UNINDEXED,
             tokenize='porter unicode61'
@@ -239,10 +390,12 @@ def _index(connection, folder, settings, stopped):
     """)
     signature = f"1:{settings.chunk_chars}:{settings.chunk_overlap}"
     state = connection.execute("SELECT value FROM index_state WHERE key = 'chunking'").fetchone()
+    changed = state != (signature,)
     if state != (signature,):
         with connection:
             connection.execute("DELETE FROM chunks")
             connection.execute("DELETE FROM files")
+            connection.execute("DELETE FROM index_state WHERE key = 'model_indexing'")
             connection.execute(
                 "INSERT OR REPLACE INTO index_state VALUES ('chunking', ?)", (signature,)
             )
@@ -272,6 +425,8 @@ def _index(connection, folder, settings, stopped):
         except OSError:
             continue
         with connection:
+            changed = True
+            connection.execute("DELETE FROM index_state WHERE key = 'model_indexing'")
             connection.execute("DELETE FROM chunks WHERE source = ?", (name,))
             if text:
                 for section, first, last, body in _chunks(
@@ -279,20 +434,20 @@ def _index(connection, folder, settings, stopped):
                 ):
                     if stopped():
                         raise InterruptedError("Document indexing stopped")
-                    # Add split camelCase/snake_case terms alongside the original source text.
-                    words = re.sub(r"([a-z\d])([A-Z])", r"\1 \2", f"{name} {section} {body}")
-                    keywords = " ".join(re.findall(r"[^\W_]+", words))
                     connection.execute(
                         "INSERT INTO chunks "
                         "(source, section, body, keywords, start_line, end_line) "
                         "VALUES (?, ?, ?, ?, ?, ?)",
-                        (name, section, body, keywords, first, last),
+                        (name, section, body, _keywords(name, section, body), first, last),
                     )
             connection.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?)", (name, *stamp))
     with connection:
         for name in cached.keys() - seen:
+            changed = True
+            connection.execute("DELETE FROM index_state WHERE key = 'model_indexing'")
             connection.execute("DELETE FROM chunks WHERE source = ?", (name,))
             connection.execute("DELETE FROM files WHERE path = ?", (name,))
+    return changed
 
 
 def _search(connection, expression, limit, sources=()):
@@ -384,6 +539,10 @@ def _rank(connection, query, expansion, settings):
     total = connection.execute("SELECT count(*) FROM chunks").fetchone()[0]
     if not total:
         return []
+    hint_state = connection.execute(
+        "SELECT value FROM index_state WHERE key = 'model_indexing'"
+    ).fetchone()
+    evidence_field = "{body keywords}:" if hint_state and hint_state != ("off",) else "body:"
     frequencies = {
         term: connection.execute(
             "SELECT count(*) FROM chunks WHERE chunks MATCH ?",
@@ -431,7 +590,7 @@ def _rank(connection, query, expansion, settings):
         if term in terms and frequencies[term]:
             for (rowid,) in connection.execute(
                 f"SELECT rowid FROM chunks WHERE chunks MATCH ? AND rowid IN ({rowids})",
-                ("body:" + _quote(term), *candidates),
+                (evidence_field + _quote(term), *candidates),
             ):
                 body_matches[rowid].add(term)
     original = set(terms)
@@ -467,7 +626,7 @@ def _rank(connection, query, expansion, settings):
             and bool(rare)
             and (len(expanded_found) >= 2 or bool(rare & set(_terms(section))))
         )
-        # Two body terms, including a rare one, can support a wordy paraphrase.
+        # Two body/search-hint terms, including a rare one, can support a paraphrase.
         body_found = body_matches[rowid] & content_terms
         original_hit = len(body_found) >= 2 and any(
             frequencies[term] <= max(1, total // 20) for term in body_found

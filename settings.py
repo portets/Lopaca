@@ -30,6 +30,13 @@ class Settings:
     rag_candidates: int = 40
     rag_query_expansion: bool = False
     rag_expansion_timeout: int = 10
+    rag_model_indexing: bool = False
+    rag_indexing_timeout: int = 600
+    rag_indexing_retry_interval: int = 60
+    rag_indexing_batch_size: int = 8
+    rag_indexing_batch_chars: int = 6000
+    rag_indexing_reasoning_tokens: int = 1024
+    rag_indexing_output_tokens: int = 192
     code_agent: bool = True
     enable_command_approval: bool = True
     command_scan_chars: int = 262144
