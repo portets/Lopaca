@@ -413,7 +413,7 @@ def _index(connection, folder, settings, stopped):
     signature = f"4:{settings.chunk_chars}:{settings.chunk_overlap}"
     state = connection.execute("SELECT value FROM index_state WHERE key = 'chunking'").fetchone()
     changed = state != (signature,)
-    if state != (signature,):
+    if changed:
         with connection:
             connection.execute("DELETE FROM chunks")
             connection.execute("DELETE FROM files")
@@ -483,7 +483,7 @@ def _search(connection, expression, limit, sources=()):
     ).fetchall()
 
 
-def _source_scope(_connection, paths, terms, _frequencies, _total, query):
+def _source_scope(paths, terms, query):
     """Restrict sources only when the query names an actual filename."""
     explicit = {
         path for path in paths if path.casefold() in terms or Path(path).name.casefold() in terms
@@ -549,8 +549,8 @@ def _document_context(connection, row, limit):
             source,
             "",
             body,
-            min(part[4] for part in parts),
-            max(part[5] for part in parts),
+            first,
+            last,
         )
     return None
 
@@ -580,7 +580,7 @@ def _rank(connection, query, expansion, settings):
         for term in frequencies
     }
     paths = [row[0] for row in connection.execute("SELECT path FROM files")]
-    sources, anchors = _source_scope(connection, paths, terms, frequencies, total, query)
+    sources, anchors = _source_scope(paths, terms, query)
     if sources is None:
         return []
     phrases = [
@@ -791,6 +791,7 @@ def format_context(retrieved, max_chars):
     """Format source excerpts within the document-context character budget."""
     excerpts, remaining = [], max(0, max_chars)
     for source_name, text in retrieved:
+        header = f"[Source: {source_name}]\n"
         span = re.fullmatch(r"(.+), lines (\d+)-(\d+)(.*)", source_name)
         if (
             span
@@ -804,8 +805,7 @@ def format_context(retrieved, max_chars):
                 last = first + match[0].count("\n")
                 paragraphs.append(f"[Source: {span[1]}, lines {first}-{last}{span[4]}]\n{match[0]}")
             text = "\n\n".join(paragraphs)
-            source_name = None
-        header = f"[Source: {source_name}]\n" if source_name else ""
+            header = ""
         separator = "\n\n---\n\n" if excerpts else ""
         available = remaining - len(separator) - len(header)
         if available <= 0:

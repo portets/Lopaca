@@ -597,18 +597,17 @@ class ChatController:
 
     def _respond(self, messages, preserve_thinking, query, folder, agent_mode, query_expansion):
         retrieved = []
+        history = messages[:-1]
         try:
             retrieved = retrieve(
                 query,
                 folder,
                 self.settings,
-                expand=(lambda search_query: self.client.expand_query(search_query, messages[:-1]))
+                expand=(lambda search_query: self.client.expand_query(search_query, history))
                 if query_expansion
                 else None,
                 stopped=lambda: self.stop_requested,
-                previous_queries=[
-                    item["content"] for item in messages[:-1] if item["role"] == "user"
-                ],
+                previous_queries=[item["content"] for item in history if item["role"] == "user"],
                 refresh=False,
             )
         except Exception as exc:

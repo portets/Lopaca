@@ -1021,12 +1021,12 @@ class ChatWindow(Adw.ApplicationWindow):
         self._scroll_guard = False
         return False
 
-    def _show_alert(self, heading, body, parent=None):
+    def _show_alert(self, heading, body):
         alert = Adw.AlertDialog(heading=heading, body=body)
         alert.add_response("close", "Close")
         alert.set_default_response("close")
         alert.set_close_response("close")
-        alert.present(parent if parent is not None else self)
+        alert.present(self)
 
     def _rename_chat(self, chat_id):
         chat = self.controller.store.load(chat_id)
@@ -1090,7 +1090,7 @@ class ChatWindow(Adw.ApplicationWindow):
             except OSError as exc:
                 with button.handler_block(preserve_reasoning_handler):
                     button.set_active(not button.get_active())
-                self._show_alert("Could not save app settings", str(exc), self)
+                self._show_alert("Could not save app settings", str(exc))
 
         preserve_reasoning_handler = preserve_reasoning_checkbox.connect("notify::active", changed)
         expansion_row = Adw.SwitchRow(
@@ -1106,7 +1106,7 @@ class ChatWindow(Adw.ApplicationWindow):
             except OSError as exc:
                 with row.handler_block(expansion_handler):
                     row.set_active(not row.get_active())
-                self._show_alert("Could not save app settings", str(exc), self)
+                self._show_alert("Could not save app settings", str(exc))
 
         expansion_handler = expansion_row.connect("notify::active", expansion_changed)
         group.add(expansion_row)
@@ -1124,7 +1124,7 @@ class ChatWindow(Adw.ApplicationWindow):
             except OSError as exc:
                 with row.handler_block(indexing_handler):
                     row.set_active(not row.get_active())
-                self._show_alert("Could not save app settings", str(exc), self)
+                self._show_alert("Could not save app settings", str(exc))
 
         indexing_handler = indexing_row.connect("notify::active", indexing_changed)
         group.add(indexing_row)
@@ -1141,15 +1141,15 @@ class ChatWindow(Adw.ApplicationWindow):
                 previous_button, previous_handler = sort_controls[self.controller.chat_sort]
                 with previous_button.handler_block(previous_handler):
                     previous_button.set_active(True)
-                self._show_alert("Could not save app settings", str(exc), self)
+                self._show_alert("Could not save app settings", str(exc))
 
-        group = None
+        radio_group = None
         for sort_mode, label in CHAT_SORT_OPTIONS:
             button = Gtk.CheckButton(valign=Gtk.Align.CENTER)
-            if group is None:
-                group = button
+            if radio_group is None:
+                radio_group = button
             else:
-                button.set_group(group)
+                button.set_group(radio_group)
             button.set_active(sort_mode == self.controller.chat_sort)
             sort_handler = button.connect("toggled", sort_changed, sort_mode)
             sort_controls[sort_mode] = button, sort_handler
@@ -1174,7 +1174,7 @@ class ChatWindow(Adw.ApplicationWindow):
             except OSError as exc:
                 with button.handler_block(handler):
                     button.set_active(not button.get_active())
-                self._show_alert("Could not save chat settings", str(exc), self)
+                self._show_alert("Could not save chat settings", str(exc))
 
         handler = code_agent_checkbox.connect("notify::active", changed)
         group.add(code_agent_checkbox)

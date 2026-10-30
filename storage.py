@@ -176,7 +176,6 @@ class ChatStore:
         }
         for chat in chats:
             chat["pinned"] = chat["id"] in pinned_order
-            chat["created"] = self.load_settings(chat["id"])["created"]
 
         def sort_key(chat):
             if chat["pinned"]:
