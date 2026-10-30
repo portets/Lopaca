@@ -626,6 +626,10 @@ def _rank(connection, query, expansion, settings):
         for term in _TERM.findall(query)
         if re.search(r"[_./:+#\d-]|[a-z][A-Z]", term)
     }
+    # A resolved, existing filename is evidence even when a follow-up has no search terms.
+    technical.update(
+        set(extra) & {name.casefold() for path in paths for name in (path, Path(path).name)}
+    )
     expansion_weight = sum(weights[term] for term in extra)
     best_rank = max(ranks.values())
     scores, covered_terms = {}, {}
