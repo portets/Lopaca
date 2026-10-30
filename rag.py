@@ -793,18 +793,26 @@ def format_context(retrieved, max_chars):
     for source_name, text in retrieved:
         header = f"[Source: {source_name}]\n"
         span = re.fullmatch(r"(.+), lines (\d+)-(\d+)(.*)", source_name)
-        if (
-            span
-            and not span[1].lower().endswith(_CODE_SUFFIXES)
-            and len(text.splitlines()) == int(span[3]) - int(span[2]) + 1
-        ):
-            # Give each prose paragraph an exact citation, including surrounding context.
-            paragraphs = []
-            for match in re.finditer(r"\S[^\n]*(?:\n(?!\s*\n)[^\n]+)*", text):
-                first = int(span[2]) + text.count("\n", 0, match.start())
-                last = first + match[0].count("\n")
-                paragraphs.append(f"[Source: {span[1]}, lines {first}-{last}{span[4]}]\n{match[0]}")
-            text = "\n\n".join(paragraphs)
+        if span and len(text.splitlines()) == int(span[3]) - int(span[2]) + 1:
+            # Separate citations from the size of the surrounding retrieval window.
+            blocks = []
+            if span[1].lower().endswith(_CODE_SUFFIXES):
+                for section, lines in _sections(text, span[1]):
+                    nonblank = [number for number, line in lines if line.strip()]
+                    if not nonblank:
+                        continue
+                    first, last = nonblank[0], nonblank[-1]
+                    body = "".join(line for number, line in lines if first <= number <= last)
+                    body = body.rstrip("\n")
+                    first, last = first + int(span[2]) - 1, last + int(span[2]) - 1
+                    context = f", section: {section}" if section else span[4]
+                    blocks.append(f"[Source: {span[1]}, lines {first}-{last}{context}]\n{body}")
+            else:
+                for match in re.finditer(r"\S[^\n]*(?:\n(?!\s*\n)[^\n]+)*", text):
+                    first = int(span[2]) + text.count("\n", 0, match.start())
+                    last = first + match[0].count("\n")
+                    blocks.append(f"[Source: {span[1]}, lines {first}-{last}{span[4]}]\n{match[0]}")
+            text = "\n\n".join(blocks)
             header = ""
         separator = "\n\n---\n\n" if excerpts else ""
         available = remaining - len(separator) - len(header)
