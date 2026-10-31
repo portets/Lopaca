@@ -175,6 +175,28 @@ class BubbleLayout(Gtk.LayoutManager):
         child.allocate(bubble_width, height, -1, transform)
 
 
+def set_markdown_text(label, text):
+    """Use identical safe inline formatting for streamed and saved messages."""
+    value = html.escape(text)
+    value = re.sub(r"^#{1,6} (.*)$", r"<b>\1</b>", value, flags=re.MULTILINE)
+    value = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", value)
+    value = re.sub(r"`([^`]+)`", r"<tt>\1</tt>", value)
+    label.set_markup(value)
+
+
+def append_code_block(parent, text):
+    frame = Gtk.Frame()
+    frame.add_css_class("code-block-frame")
+    label = Gtk.Label(label=text, xalign=0, yalign=0)
+    label.set_wrap(True)
+    label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+    label.set_selectable(True)
+    label.add_css_class("code-block")
+    frame.set_child(label)
+    parent.append(frame)
+    return frame, label
+
+
 def append_markdown(parent, text, command_extractor=None, command_handler=None):
     """Append safe inline Markdown and fenced code blocks."""
 
@@ -183,10 +205,7 @@ def append_markdown(parent, text, command_extractor=None, command_handler=None):
         label.set_wrap(True)
         label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         label.set_selectable(True)
-        value = re.sub(r"^### (.*)$", r"<b>\1</b>", html.escape(value), flags=re.MULTILINE)
-        value = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", value)
-        value = re.sub(r"`([^`]+)`", r"<tt>\1</tt>", value)
-        label.set_markup(value)
+        set_markdown_text(label, value)
         parent.append(label)
 
     last = 0
@@ -201,15 +220,7 @@ def append_markdown(parent, text, command_extractor=None, command_handler=None):
                 button.connect("clicked", command_handler, command)
                 parent.append(button)
         else:
-            frame = Gtk.Frame()
-            frame.add_css_class("code-block-frame")
-            code_label = Gtk.Label(label=match.group(1).rstrip("\n"), xalign=0, yalign=0)
-            code_label.set_wrap(True)
-            code_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-            code_label.set_selectable(True)
-            code_label.add_css_class("code-block")
-            frame.set_child(code_label)
-            parent.append(frame)
+            append_code_block(parent, match.group(1).rstrip("\n"))
         last = match.end()
     if text[last:] or not last:
         add_label(text[last:])
@@ -894,6 +905,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.current_content.append(self.current_answer)
         self.current_wrapper.append(self.current_content)
         self._answer_committed = 0
+        self._stream_code = None
         self._response_agent_mode = self.agent_mode
         self._thinking_collapsed = False
         self.current_thinking = None
@@ -952,13 +964,23 @@ class ChatWindow(Adw.ApplicationWindow):
         tail = text[self._answer_committed :]
         end = max((match.end() for match in _CODE_BLOCK_PATTERN.finditer(tail)), default=0)
         if end:
+            if self._stream_code is not None:
+                self.current_content.remove(self._stream_code[0])
+                self._stream_code = None
             self.current_content.remove(self.current_answer)
             extractor = self.controller.commands_in if self._response_agent_mode else None
             append_markdown(self.current_content, tail[:end], extractor, self._review_command)
             self.current_content.append(self.current_answer)
             self._answer_committed += end
             tail = tail[end:]
-        self.current_answer.set_text(tail)
+        opening = re.search(r"```[^\n]*(?:\n(.*))?$", tail, re.DOTALL)
+        set_markdown_text(self.current_answer, tail[: opening.start()] if opening else tail)
+        if opening:
+            code = opening[1] or ""
+            if self._stream_code is None:
+                self._stream_code = append_code_block(self.current_content, code)
+            else:
+                self._stream_code[1].set_text(code)
 
     def _collapse_thinking(self):
         if self.current_thinking is None or self._thinking_collapsed:
@@ -996,6 +1018,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._response_row = self._response_chat_id = None
         self.current_wrapper = self.current_content = None
         self.current_answer = self.current_thinking = None
+        self._stream_code = None
         self.busy = False
         self.send_button.set_icon_name("go-up-symbolic")
         self.send_button.set_tooltip_text("Send")
