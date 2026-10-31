@@ -226,7 +226,8 @@ class MemoryStore:
             CREATE TABLE IF NOT EXISTS memories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL,
                 normalized TEXT NOT NULL UNIQUE, core INTEGER NOT NULL,
-                source_chat TEXT, evidence TEXT, created REAL, updated REAL
+                source_chat TEXT, evidence TEXT, created REAL, updated REAL,
+                search_terms TEXT NOT NULL
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5(
                 text, keywords, tokenize='porter unicode61'
@@ -285,6 +286,14 @@ class MemoryStore:
                 if action != "add" and not any(row[0] == memory_id for row in rows):
                     continue
                 if action != "delete":
+                    search_terms = proposal.get("search_terms")
+                    if action == "update" and search_terms is None:
+                        search_terms = connection.execute(
+                            "SELECT search_terms FROM memories WHERE id=?", (memory_id,)
+                        ).fetchone()[0]
+                    if not isinstance(search_terms, str) or not search_terms.strip():
+                        continue
+                    search_terms = " ".join(search_terms.split())[:200]
                     duplicate = connection.execute(
                         "SELECT id FROM memories WHERE normalized=?", (normalized,)
                     ).fetchone()
@@ -314,20 +323,30 @@ class MemoryStore:
                     if action == "add":
                         memory_id = connection.execute(
                             "INSERT INTO memories "
-                            "(text,normalized,core,source_chat,evidence,created,updated) "
-                            "VALUES (?,?,?,?,?,?,?)",
-                            (text, normalized, core, chat_id, evidence, now, now),
+                            "(text,normalized,core,source_chat,evidence,created,updated,"
+                            "search_terms) "
+                            "VALUES (?,?,?,?,?,?,?,?)",
+                            (text, normalized, core, chat_id, evidence, now, now, search_terms),
                         ).lastrowid
                     else:
                         connection.execute(
                             "UPDATE memories SET text=?,normalized=?,core=?,source_chat=?,"
-                            "evidence=?,updated=? WHERE id=?",
-                            (text, normalized, core, chat_id, evidence, now, memory_id),
+                            "evidence=?,updated=?,search_terms=? WHERE id=?",
+                            (
+                                text,
+                                normalized,
+                                core,
+                                chat_id,
+                                evidence,
+                                now,
+                                search_terms,
+                                memory_id,
+                            ),
                         )
                     connection.execute("DELETE FROM memory_search WHERE rowid=?", (memory_id,))
                     connection.execute(
                         "INSERT INTO memory_search(rowid,text,keywords) VALUES (?,?,?)",
-                        (memory_id, text, re.sub(r"[_-]", " ", text)),
+                        (memory_id, text, re.sub(r"[_-]", " ", text + " " + search_terms)),
                     )
             connection.execute(
                 "DELETE FROM memory_changes WHERE id NOT IN "
@@ -349,9 +368,9 @@ class MemoryStore:
             rows = json.loads(previous[1])
             connection.execute("DELETE FROM memories")
             connection.execute("DELETE FROM memory_search")
-            connection.executemany("INSERT INTO memories VALUES (?,?,?,?,?,?,?,?)", rows)
+            connection.executemany("INSERT INTO memories VALUES (?,?,?,?,?,?,?,?,?)", rows)
             connection.executemany(
                 "INSERT INTO memory_search(rowid,text,keywords) VALUES (?,?,?)",
-                ((row[0], row[1], re.sub(r"[_-]", " ", row[1])) for row in rows),
+                ((row[0], row[1], re.sub(r"[_-]", " ", row[1] + " " + row[8])) for row in rows),
             )
             connection.execute("DELETE FROM memory_changes WHERE id=?", (previous[0],))
