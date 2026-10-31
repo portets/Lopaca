@@ -34,7 +34,7 @@ Retrieval uses SQLite FTS5/BM25, phrase and identifier matching, and filename/se
 # TO-DO
 - Add more global settings
 - Add more individual chat settings
-- Global memories file that the RAG function uses
+- Make features list
 - Selectable assistant style.md for communication styles
 - More advanced agentic mode with more tools, web searching, etc
 
