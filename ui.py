@@ -1102,7 +1102,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._add_memory_switch(group)
         memories_row = Adw.ActionRow(title="Manage Memories", activatable=True)
         memories_row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
-        memories_row.connect("activated", lambda *_: self._show_memories())
+        memories_row.connect("activated", lambda *_: self._show_memories(dialog))
         group.add(memories_row)
         preserve_reasoning_checkbox = Adw.SwitchRow(
             title="Preserve Reasoning", active=self.controller.preserve_thinking
@@ -1233,14 +1233,35 @@ class ChatWindow(Adw.ApplicationWindow):
         handler = row.connect("notify::active", changed)
         group.add(row)
 
-    def _show_memories(self):
-        dialog, _page, group = self._settings_dialog("Global Memories")
+    def _show_memories(self, settings_dialog):
+        dialog = Adw.Dialog(title="Global Memories", content_width=660, content_height=540)
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        back = Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="Back to App Settings")
+        back.add_css_class("flat")
+        header.pack_start(back)
+        toolbar.add_top_bar(header)
+        page = Adw.PreferencesPage()
+        group = Adw.PreferencesGroup()
+        page.add(group)
+        toolbar.set_content(page)
+        dialog.set_child(toolbar)
+        dialog.return_to_settings = False
+
+        def go_back(*_):
+            dialog.return_to_settings = True
+            dialog.close()
+
+        back.connect("clicked", go_back)
+        dialog.connect(
+            "closed", lambda *_: None if dialog.return_to_settings else settings_dialog.close()
+        )
         group.set_description(
             "Edit facts, select Core for always-present memories, or delete them. "
             "Click the pencil to edit, then the checkmark to save."
         )
         for memory_id, text, core in self.controller.memories.records():
-            row = Adw.ActionRow(title=text, subtitle=f"Memory {memory_id}")
+            row = Adw.ActionRow(title=text)
             row.set_title_lines(0)
             entry = Gtk.Entry(text=text, hexpand=True, visible=False)
             row.add_prefix(entry)
@@ -1305,7 +1326,6 @@ class ChatWindow(Adw.ApplicationWindow):
                                 core_button.set_active(bool(saved[2]))
                             entry.set_visible(False)
                             row.set_title(text)
-                            row.set_subtitle(f"Memory {memory_id}")
                             edit.set_icon_name("document-edit-symbolic")
                             edit.set_tooltip_text("Edit memory")
                         else:
