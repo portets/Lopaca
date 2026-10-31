@@ -508,7 +508,13 @@ class ChatWindow(Adw.ApplicationWindow):
             GLib.source_remove(self._status_timer)
             self._status_timer = None
         self.status.set_text(text)
-        if text in ("Waiting", "Thinking", "Responding", "Assistant processing documents"):
+        if text in (
+            "Waiting",
+            "Thinking",
+            "Responding",
+            "Assistant processing documents",
+            "Updating memories",
+        ):
             self._status_timer = GLib.timeout_add(650, self._animate_status)
 
     def _animate_status(self):
@@ -974,7 +980,9 @@ class ChatWindow(Adw.ApplicationWindow):
             self._answer_committed += end
             tail = tail[end:]
         opening = re.search(r"```[^\n]*(?:\n(.*))?$", tail, re.DOTALL)
-        set_markdown_text(self.current_answer, tail[: opening.start()] if opening else tail)
+        prose = tail[: opening.start()] if opening else tail
+        self.current_answer.set_visible(bool(prose))
+        set_markdown_text(self.current_answer, prose)
         if opening:
             code = opening[1] or ""
             if self._stream_code is None:

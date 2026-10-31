@@ -653,6 +653,16 @@ class ChatController:
         memory_rows = []
         expansion = None
         reasoning_pending, reasoning_hidden = "", False
+        last_answer = None
+
+        def answer_changed(text):
+            nonlocal last_answer
+            visible = visible_memory_answer(text).rstrip() if memory_enabled else text
+            if visible != last_answer:
+                self.view.dispatch(self.view.update_answer, visible)
+                last_answer = visible
+            if memory_enabled and "<lopaca-memory>" in text:
+                self.view.dispatch(self.view.notify, "Updating memories")
 
         def thinking(text):
             nonlocal reasoning_pending, reasoning_hidden
@@ -660,6 +670,7 @@ class ChatController:
                 self.view.dispatch(self.view.update_thinking, text)
                 return
             if reasoning_hidden:
+                self.view.dispatch(self.view.notify, "Updating memories")
                 return
             reasoning_pending += text
             reasoning_hidden = "<lopaca-memory>" in reasoning_pending
@@ -667,6 +678,8 @@ class ChatController:
             reasoning_pending = "" if reasoning_hidden else reasoning_pending[len(visible) :]
             if visible:
                 self.view.dispatch(self.view.update_thinking, visible)
+            if reasoning_hidden:
+                self.view.dispatch(self.view.notify, "Updating memories")
 
         def expand(search_query):
             nonlocal expansion
@@ -752,9 +765,7 @@ class ChatController:
             preserve_thinking,
             lambda: self.stop_requested,
             thinking,
-            lambda text: self.view.dispatch(
-                self.view.update_answer, visible_memory_answer(text) if memory_enabled else text
-            ),
+            answer_changed,
             lambda context_used, tokens_per_second: self.view.dispatch(
                 self._update_inference_stats, context_used, tokens_per_second
             ),
