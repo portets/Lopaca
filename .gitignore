@@ -3,6 +3,7 @@ __pycache__/
 rag-expansion-tests-20261029/
 rag-document-enrichment-tests-20261029/
 py65-rag-benchmark-20261029/
+memory-tests-20261030/
 NOTES
 ruff-review.txt
 REPORT.md

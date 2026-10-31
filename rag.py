@@ -293,6 +293,29 @@ def _quote(text):
     return '"' + text.replace('"', '""') + '"'
 
 
+def retrieve_memories(store, query, expansion="", previous_queries=()):
+    """Fuse lexical memory searches without document chunking or another model call."""
+    query = _retrieval_query(query, previous_queries)
+    terms = _terms(query)
+    extra = [term for term in _terms(expansion) if term not in terms]
+    scores = defaultdict(float)
+    with closing(store.connect()) as connection:
+        for weight, words in ((1.0, terms), (0.5, extra)):
+            if not words:
+                continue
+            rows = connection.execute(
+                "SELECT memory_search.rowid,memory_search.text FROM memory_search "
+                "JOIN memories ON memories.id=memory_search.rowid "
+                "WHERE memories.core=0 AND memory_search MATCH ? "
+                "ORDER BY bm25(memory_search) LIMIT 20",
+                (" OR ".join(_quote(term) for term in words),),
+            ).fetchall()
+            for rank, (memory_id, _text) in enumerate(rows, 1):
+                scores[memory_id] += weight / (60 + rank)
+        records = {row[0]: row for row in connection.execute("SELECT id,text,core FROM memories")}
+    return [records[key] for key in sorted(scores, key=scores.get, reverse=True)[:6]]
+
+
 def _sections(text, filename):
     """Find Markdown sections and code definitions with standard-library tools."""
     lines = text.splitlines(keepends=True)

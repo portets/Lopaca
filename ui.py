@@ -1076,6 +1076,11 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def _show_app_settings(self):
         dialog, page, group = self._settings_dialog("App Settings")
+        self._add_memory_switch(group)
+        memories_row = Adw.ActionRow(title="Manage Memories", activatable=True)
+        memories_row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+        memories_row.connect("activated", lambda *_: self._show_memories())
+        group.add(memories_row)
         preserve_reasoning_checkbox = Adw.SwitchRow(
             title="Preserve Reasoning", active=self.controller.preserve_thinking
         )
@@ -1094,7 +1099,7 @@ class ChatWindow(Adw.ApplicationWindow):
 
         preserve_reasoning_handler = preserve_reasoning_checkbox.connect("notify::active", changed)
         expansion_row = Adw.SwitchRow(
-            title="Expand Document Searches", active=self.controller.rag_query_expansion
+            title="Expand Document and Memory Searches", active=self.controller.rag_query_expansion
         )
         expansion_row.set_tooltip_text(
             "Ask the current model for related search terms before retrieval. Adds prompt latency."
@@ -1162,6 +1167,7 @@ class ChatWindow(Adw.ApplicationWindow):
     def _show_chat_settings(self, chat_id):
         chat_settings = self.controller.get_chat_settings(chat_id)
         dialog, _page, group = self._settings_dialog("Chat Settings")
+        self._add_memory_switch(group, chat_id)
         code_agent_checkbox = Adw.SwitchRow(title="Code Agent", active=chat_settings["code_agent"])
         code_agent_checkbox.set_tooltip_text(
             "Let the assistant suggest terminal commands for explicit approval"
@@ -1178,6 +1184,109 @@ class ChatWindow(Adw.ApplicationWindow):
 
         handler = code_agent_checkbox.connect("notify::active", changed)
         group.add(code_agent_checkbox)
+        dialog.present(self)
+
+    def _add_memory_switch(self, group, chat_id=None):
+        enabled = (
+            self.controller.global_memories
+            if chat_id is None
+            else self.controller.get_chat_settings(chat_id)["global_memories"]
+        )
+        row = Adw.SwitchRow(title="Global Memories", active=enabled)
+        row.set_tooltip_text(
+            "Recall and learn personal memories across chats. "
+            "Both app and chat settings must be enabled."
+        )
+
+        def changed(row, _param):
+            try:
+                self.controller.set_global_memories(row.get_active(), chat_id)
+            except OSError as exc:
+                with row.handler_block(handler):
+                    row.set_active(not row.get_active())
+                self._show_alert("Could not save memory settings", str(exc))
+
+        handler = row.connect("notify::active", changed)
+        group.add(row)
+
+    def _show_memories(self):
+        dialog, _page, group = self._settings_dialog("Global Memories")
+        group.set_description(
+            "Edit facts, select Core for always-present memories, or delete them. "
+            "Changes are saved with the buttons on each row."
+        )
+        undo_row = Adw.ActionRow(title="Undo Last Memory Change", activatable=True)
+
+        def undo(*_):
+            try:
+                self.controller.memories.undo()
+                dialog.close()
+                self._show_memories()
+            except Exception as exc:
+                self._show_alert("Could not restore memories", str(exc))
+
+        undo_row.connect("activated", undo)
+        group.add(undo_row)
+        for memory_id, text, core in self.controller.memories.records():
+            row = Adw.EntryRow(title=f"Memory {memory_id}", text=text)
+            entry = row
+            controls = Gtk.Box(spacing=6)
+            core_button = Gtk.CheckButton(label="Core", active=bool(core))
+            controls.append(core_button)
+            save = Gtk.Button(icon_name="document-save-symbolic", tooltip_text="Save memory")
+            delete = Gtk.Button(icon_name="user-trash-symbolic", tooltip_text="Delete memory")
+
+            def change(
+                _button,
+                *,
+                memory_id=memory_id,
+                entry=entry,
+                core_button=core_button,
+                row=row,
+                delete=False,
+            ):
+                text = entry.get_text().strip()
+                try:
+                    self.controller.memories.apply(
+                        [
+                            {
+                                "action": "delete" if delete else "update",
+                                "id": memory_id,
+                                "text": text,
+                                "kind": "core" if core_button.get_active() else "casual",
+                                "evidence": text or "Delete memory",
+                            }
+                        ],
+                        text or "Delete memory",
+                        "manual",
+                        {memory_id},
+                    )
+                    if delete:
+                        group.remove(row)
+                    else:
+                        saved = next(
+                            (
+                                record
+                                for record in self.controller.memories.records()
+                                if record[0] == memory_id
+                            ),
+                            None,
+                        )
+                        if saved and saved[1] == text:
+                            core_button.set_active(bool(saved[2]))
+                        else:
+                            self._show_alert(
+                                "Memory was not saved", "Check for duplicate or empty text."
+                            )
+                except Exception as exc:
+                    self._show_alert("Could not change memory", str(exc))
+
+            save.connect("clicked", change)
+            delete.connect("clicked", lambda button, change=change: change(button, delete=True))
+            controls.append(save)
+            controls.append(delete)
+            row.add_suffix(controls)
+            group.add(row)
         dialog.present(self)
 
     def _confirm_delete_chat(self, chat_id):

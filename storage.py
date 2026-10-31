@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import time
@@ -69,8 +70,9 @@ class ChatStore:
         except FileNotFoundError:
             data = {}
         except OSError, json.JSONDecodeError:
-            return {"code_agent": False, "created": time.time()}
+            return {"code_agent": False, "global_memories": False, "created": time.time()}
         data["code_agent"] = data.get("code_agent", Settings.code_agent) is True
+        data["global_memories"] = data.get("global_memories", Settings.global_memories) is True
         if not isinstance(data.get("created"), (int, float)):
             data["created"] = time.time()
         return data
@@ -209,3 +211,143 @@ class ChatStore:
             for key in order_keys:
                 settings[key] = [item for item in settings[key] if item != chat_id]
             self.save_app_settings(settings)
+
+
+class MemoryStore:
+    """Bounded user facts; models propose changes, never SQL or filesystem operations."""
+
+    def __init__(self, path, settings):
+        self.path, self.settings = Path(path), settings
+
+    def connect(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.path, timeout=5)
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL,
+                normalized TEXT NOT NULL UNIQUE, core INTEGER NOT NULL,
+                source_chat TEXT, evidence TEXT, created REAL, updated REAL
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5(
+                text, keywords, tokenize='porter unicode61'
+            );
+            CREATE TABLE IF NOT EXISTS memory_changes (
+                id INTEGER PRIMARY KEY, before TEXT NOT NULL, changed REAL NOT NULL
+            );
+        """)
+        return connection
+
+    def records(self):
+        with closing(self.connect()) as connection:
+            return connection.execute(
+                "SELECT id,text,core FROM memories ORDER BY core DESC,updated DESC,id DESC"
+            ).fetchall()
+
+    def apply(self, proposals, user_text, chat_id, allowed_ids):
+        """Apply validated, evidenced proposals atomically, retaining bounded undo snapshots."""
+        if not isinstance(proposals, list):
+            return
+        with closing(self.connect()) as connection, connection:
+            for proposal in proposals[:8]:
+                if not isinstance(proposal, dict):
+                    continue
+                action, memory_id = proposal.get("action"), proposal.get("id")
+                if not isinstance(action, str) or action not in {"add", "update", "delete"}:
+                    continue
+                if action == "add":
+                    memory_id = None
+                evidence = proposal.get("evidence")
+                if (
+                    not isinstance(evidence, str)
+                    or not evidence.strip()
+                    or " ".join(evidence.casefold().split())
+                    not in " ".join(user_text.casefold().split())
+                ):
+                    continue
+                if action != "add" and (type(memory_id) is not int or memory_id not in allowed_ids):
+                    continue
+                text = proposal.get("text", "")
+                if not isinstance(text, str):
+                    continue
+                text = " ".join(text.split())
+                if action != "delete" and not 1 <= len(text) <= 500:
+                    continue
+                kind = proposal.get("kind")
+                if action != "delete" and (
+                    not isinstance(kind, str) or kind not in {"core", "casual"}
+                ):
+                    continue
+                normalized = " ".join(re.findall(r"\w+", text.casefold()))
+                if action != "delete" and not normalized:
+                    continue
+                core = kind == "core"
+                rows = connection.execute("SELECT id,text,core FROM memories").fetchall()
+                if action != "add" and not any(row[0] == memory_id for row in rows):
+                    continue
+                if action != "delete":
+                    duplicate = connection.execute(
+                        "SELECT id FROM memories WHERE normalized=?", (normalized,)
+                    ).fetchone()
+                    if duplicate and duplicate[0] != memory_id:
+                        continue
+                    others = [row for row in rows if row[0] != memory_id]
+                    if action == "add" and len(rows) >= self.settings.memory_records:
+                        continue
+                    if core and (
+                        sum(bool(row[2]) for row in others) >= self.settings.memory_core_records
+                        or sum(len(row[1]) for row in others if row[2]) + len(text)
+                        > self.settings.memory_core_chars
+                    ):
+                        core = False
+                connection.execute(
+                    "INSERT INTO memory_changes(before,changed) VALUES (?,?)",
+                    (
+                        json.dumps(connection.execute("SELECT * FROM memories").fetchall()),
+                        time.time(),
+                    ),
+                )
+                if action == "delete":
+                    connection.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+                    connection.execute("DELETE FROM memory_search WHERE rowid=?", (memory_id,))
+                else:
+                    now = time.time()
+                    if action == "add":
+                        memory_id = connection.execute(
+                            "INSERT INTO memories "
+                            "(text,normalized,core,source_chat,evidence,created,updated) "
+                            "VALUES (?,?,?,?,?,?,?)",
+                            (text, normalized, core, chat_id, evidence, now, now),
+                        ).lastrowid
+                    else:
+                        connection.execute(
+                            "UPDATE memories SET text=?,normalized=?,core=?,source_chat=?,"
+                            "evidence=?,updated=? WHERE id=?",
+                            (text, normalized, core, chat_id, evidence, now, memory_id),
+                        )
+                    connection.execute("DELETE FROM memory_search WHERE rowid=?", (memory_id,))
+                    connection.execute(
+                        "INSERT INTO memory_search(rowid,text,keywords) VALUES (?,?,?)",
+                        (memory_id, text, re.sub(r"[_-]", " ", text)),
+                    )
+            connection.execute(
+                "DELETE FROM memory_changes WHERE id NOT IN "
+                "(SELECT id FROM memory_changes ORDER BY id DESC LIMIT 20)"
+            )
+
+    def undo(self):
+        """Restore the most recent bounded snapshot, including its search index."""
+        with closing(self.connect()) as connection, connection:
+            previous = connection.execute(
+                "SELECT id,before FROM memory_changes ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if previous is None:
+                return
+            rows = json.loads(previous[1])
+            connection.execute("DELETE FROM memories")
+            connection.execute("DELETE FROM memory_search")
+            connection.executemany("INSERT INTO memories VALUES (?,?,?,?,?,?,?,?)", rows)
+            connection.executemany(
+                "INSERT INTO memory_search(rowid,text,keywords) VALUES (?,?,?)",
+                ((row[0], row[1], re.sub(r"[_-]", " ", row[1])) for row in rows),
+            )
+            connection.execute("DELETE FROM memory_changes WHERE id=?", (previous[0],))
