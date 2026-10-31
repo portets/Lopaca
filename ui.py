@@ -319,12 +319,12 @@ class ChatWindow(Adw.ApplicationWindow):
         self.chat_scroll.add_css_class("undershoot-bottom")
         self.chat_scroll.set_child(list_overlay)
         self.chat_scroll.set_vexpand(True)
-        self.chat_scroll.set_margin_bottom(8)
+        self.chat_scroll.set_margin_bottom(0)
         sidebar.append(self.chat_scroll)
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         footer.set_margin_start(10)
         footer.set_margin_end(10)
-        footer.set_margin_bottom(12)
+        footer.set_margin_bottom(4)  # Smaller values move disk usage and settings downward.
         usage = Gtk.CenterBox()
         usage.add_css_class("muted")
         usage.set_hexpand(True)
@@ -1102,7 +1102,8 @@ class ChatWindow(Adw.ApplicationWindow):
             title="Expand Document and Memory Searches", active=self.controller.rag_query_expansion
         )
         expansion_row.set_tooltip_text(
-            "Ask the current model for related search terms before retrieval. Adds prompt latency."
+            "Ask the current model for related search terms before retrieval. "
+            "Adds slight prompt latency."
         )
 
         def expansion_changed(row, _param):
@@ -1213,28 +1214,23 @@ class ChatWindow(Adw.ApplicationWindow):
         dialog, _page, group = self._settings_dialog("Global Memories")
         group.set_description(
             "Edit facts, select Core for always-present memories, or delete them. "
-            "Changes are saved with the buttons on each row."
+            "Click the pencil to edit, then the checkmark to save."
         )
-        undo_row = Adw.ActionRow(title="Undo Last Memory Change", activatable=True)
-
-        def undo(*_):
-            try:
-                self.controller.memories.undo()
-                dialog.close()
-                self._show_memories()
-            except Exception as exc:
-                self._show_alert("Could not restore memories", str(exc))
-
-        undo_row.connect("activated", undo)
-        group.add(undo_row)
         for memory_id, text, core in self.controller.memories.records():
-            row = Adw.EntryRow(title=f"Memory {memory_id}", text=text)
-            entry = row
+            row = Adw.ActionRow(title=text, subtitle=f"Memory {memory_id}")
+            row.set_title_lines(0)
+            entry = Gtk.Entry(text=text, hexpand=True, visible=False)
+            row.add_prefix(entry)
             controls = Gtk.Box(spacing=6)
             core_button = Gtk.CheckButton(label="Core", active=bool(core))
             controls.append(core_button)
-            save = Gtk.Button(icon_name="document-save-symbolic", tooltip_text="Save memory")
-            delete = Gtk.Button(icon_name="user-trash-symbolic", tooltip_text="Delete memory")
+            edit = Gtk.Button(icon_name="document-edit-symbolic", tooltip_text="Edit memory")
+            edit.add_css_class("flat")
+            edit.set_valign(Gtk.Align.CENTER)
+            delete = Gtk.Button(icon_name="window-close-symbolic", tooltip_text="Delete memory")
+            delete.set_child(Gtk.Image(icon_name="window-close-symbolic", pixel_size=24))
+            delete.add_css_class("flat")
+            delete.set_valign(Gtk.Align.CENTER)
 
             def change(
                 _button,
@@ -1243,8 +1239,17 @@ class ChatWindow(Adw.ApplicationWindow):
                 entry=entry,
                 core_button=core_button,
                 row=row,
+                edit=edit,
                 delete=False,
             ):
+                if not delete and not entry.get_visible():
+                    row.set_title("")
+                    row.set_subtitle("")
+                    entry.set_visible(True)
+                    edit.set_icon_name("object-select-symbolic")
+                    edit.set_tooltip_text("Save memory")
+                    entry.grab_focus()
+                    return
                 text = entry.get_text().strip()
                 try:
                     self.controller.memories.apply(
@@ -1273,7 +1278,13 @@ class ChatWindow(Adw.ApplicationWindow):
                             None,
                         )
                         if saved and saved[1] == text:
-                            core_button.set_active(bool(saved[2]))
+                            with core_button.handler_block(core_button.memory_handler):
+                                core_button.set_active(bool(saved[2]))
+                            entry.set_visible(False)
+                            row.set_title(text)
+                            row.set_subtitle(f"Memory {memory_id}")
+                            edit.set_icon_name("document-edit-symbolic")
+                            edit.set_tooltip_text("Edit memory")
                         else:
                             self._show_alert(
                                 "Memory was not saved", "Check for duplicate or empty text."
@@ -1281,10 +1292,19 @@ class ChatWindow(Adw.ApplicationWindow):
                 except Exception as exc:
                     self._show_alert("Could not change memory", str(exc))
 
-            save.connect("clicked", change)
+            def core_changed(button, memory_id=memory_id):
+                try:
+                    self.controller.memories.set_core(memory_id, button.get_active())
+                except Exception as exc:
+                    with button.handler_block(button.memory_handler):
+                        button.set_active(not button.get_active())
+                    self._show_alert("Could not change core memory", str(exc))
+
+            core_button.memory_handler = core_button.connect("toggled", core_changed)
+            edit.connect("clicked", change)
             delete.connect("clicked", lambda button, change=change: change(button, delete=True))
-            controls.append(save)
             controls.append(delete)
+            row.add_suffix(edit)
             row.add_suffix(controls)
             group.add(row)
         dialog.present(self)

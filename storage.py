@@ -334,6 +334,10 @@ class MemoryStore:
                 "(SELECT id FROM memory_changes ORDER BY id DESC LIMIT 20)"
             )
 
+    def set_core(self, memory_id, core):
+        with closing(self.connect()) as connection, connection:
+            connection.execute("UPDATE memories SET core=? WHERE id=?", (bool(core), memory_id))
+
     def undo(self):
         """Restore the most recent bounded snapshot, including its search index."""
         with closing(self.connect()) as connection, connection:
