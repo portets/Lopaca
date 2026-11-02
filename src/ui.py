@@ -1127,67 +1127,110 @@ class ChatWindow(Adw.ApplicationWindow):
         return dialog, page, group
 
     def _show_app_settings(self):
-        dialog, page, group = self._settings_dialog("App Settings")
-        self._add_memory_switch(group)
-        memories_row = Adw.ActionRow(title="Manage Memories", activatable=True)
-        memories_row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
-        memories_row.connect("activated", lambda *_: self._show_memories(dialog))
-        group.add(memories_row)
-        preserve_reasoning_checkbox = Adw.SwitchRow(
-            title="Preserve Reasoning", active=self.controller.preserve_thinking
-        )
-        preserve_reasoning_checkbox.set_tooltip_text(
-            "Allow model to remember previous thinking blocks."
-        )
-        group.add(preserve_reasoning_checkbox)
+        self._show_settings()
 
-        def changed(button, _param):
+    def _show_chat_settings(self, chat_id):
+        self._show_settings(chat_id)
+
+    def _show_settings(self, chat_id=None):
+        dialog, page, group = self._settings_dialog(
+            "App Settings" if chat_id is None else "Chat Settings"
+        )
+        settings = self.controller.get_chat_settings(chat_id)
+        group.set_title("Default Chat Settings" if chat_id is None else "Chat Settings")
+        if chat_id is not None:
+            page.set_description("Changes override app defaults for this chat. 'X' denotes an override.")
+        overrides = self.controller.get_chat_overrides(chat_id) if chat_id is not None else set()
+        markers = []
+        setting_controls = {}
+
+        def update_markers():
+            for marker, key, button in markers:
+                active = not isinstance(button, Gtk.CheckButton) or button.get_active()
+                overridden = key in overrides and active
+                marker.set_opacity(1 if overridden else 0)
+                marker.set_sensitive(overridden)
+
+        def delete_override(_button, key):
             try:
-                self.controller.set_preserve_reasoning(button.get_active())
+                self.controller.set_setting(key, None, chat_id)
             except OSError as exc:
-                with button.handler_block(preserve_reasoning_handler):
-                    button.set_active(not button.get_active())
-                self._show_alert("Could not save app settings", str(exc))
+                self._show_alert("Could not delete override", str(exc))
+                return
+            settings[key] = self.controller.get_chat_settings(chat_id)[key]
+            overrides.discard(key)
+            for button, handler, choice in setting_controls[key]:
+                with button.handler_block(handler):
+                    button.set_active(
+                        settings[key] is True if choice is None else settings[key] == choice
+                    )
+            update_markers()
 
-        preserve_reasoning_handler = preserve_reasoning_checkbox.connect("notify::active", changed)
-        expansion_row = Adw.SwitchRow(
-            title="Expand Document and Memory Searches", active=self.controller.rag_query_expansion
+        def add_control(row, button, key):
+            if chat_id is None:
+                row.add_suffix(button)
+            else:
+                box = Gtk.Box(spacing=8)
+                marker = Gtk.Button(tooltip_text="Delete override", valign=Gtk.Align.CENTER)
+                marker.set_child(Gtk.Image(icon_name="window-close-symbolic", pixel_size=24))
+                marker.add_css_class("flat")
+                marker.connect("clicked", delete_override, key)
+                box.append(marker)
+                box.append(button)
+                row.add_suffix(box)
+                markers.append((marker, key, button))
+                update_markers()
+            row.set_activatable_widget(button)
+
+        def add_switch(key, title, tooltip):
+            row = Adw.ActionRow(title=title)
+            button = Gtk.Switch(active=settings[key] is True, valign=Gtk.Align.CENTER)
+            add_control(row, button, key)
+            row.set_tooltip_text(tooltip)
+
+            def changed(row, _param):
+                try:
+                    self.controller.set_setting(key, row.get_active(), chat_id)
+                    settings[key] = row.get_active()
+                    overrides.add(key)
+                    update_markers()
+                except OSError as exc:
+                    with row.handler_block(handler):
+                        row.set_active(settings[key] is True)
+                    self._show_alert("Could not save settings", str(exc))
+
+            handler = button.connect("notify::active", changed)
+            setting_controls[key] = [(button, handler, None)]
+            group.add(row)
+
+        add_switch(
+            "global_memories",
+            "Global Memories",
+            "Recall and learn personal memories across chats.",
         )
-        expansion_row.set_tooltip_text(
+        if chat_id is None:
+            memories_row = Adw.ActionRow(title="Manage Memories", activatable=True)
+            memories_row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+            memories_row.connect("activated", lambda *_: self._show_memories(dialog))
+            group.add(memories_row)
+        add_switch(
+            "preserve_reasoning",
+            "Preserve Reasoning",
+            "Allow model to remember previous thinking blocks.",
+        )
+        add_switch(
+            "rag_query_expansion",
+            "Expand Document and Memory Searches",
             "Ask the current model for related search terms before retrieval. "
-            "Adds slight prompt latency."
+            "Adds slight prompt latency.",
+        )
+        add_switch(
+            "rag_model_indexing",
+            "Model-Assisted Document Indexing (SLOW)",
+            "Modestly improves document info retrieval. CAN BE SLOW, best used with t/s > 80.",
         )
 
-        def expansion_changed(row, _param):
-            try:
-                self.controller.set_rag_query_expansion(row.get_active())
-            except OSError as exc:
-                with row.handler_block(expansion_handler):
-                    row.set_active(not row.get_active())
-                self._show_alert("Could not save app settings", str(exc))
-
-        expansion_handler = expansion_row.connect("notify::active", expansion_changed)
-        group.add(expansion_row)
-        indexing_row = Adw.SwitchRow(
-            title="Model-Assisted Document Indexing (SLOW)",
-            active=self.controller.rag_model_indexing,
-        )
-        indexing_row.set_tooltip_text(
-            "Modestly improves document info retrieval. CAN BE SLOW, best used with t/s > 80."
-        )
-
-        def indexing_changed(row, _param):
-            try:
-                self.controller.set_rag_model_indexing(row.get_active())
-            except OSError as exc:
-                with row.handler_block(indexing_handler):
-                    row.set_active(not row.get_active())
-                self._show_alert("Could not save app settings", str(exc))
-
-        indexing_handler = indexing_row.connect("notify::active", indexing_changed)
-        group.add(indexing_row)
-
-        def add_choices(title, options, attribute, setter):
+        def add_choices(title, options, key, setter):
             choice_group = Adw.PreferencesGroup(title=title)
             page.add(choice_group)
             controls = {}
@@ -1197,13 +1240,14 @@ class ChatWindow(Adw.ApplicationWindow):
                     return
                 try:
                     setter(value)
+                    settings[key] = value
+                    overrides.add(key)
+                    update_markers()
                 except OSError as exc:
-                    previous_button, previous_handler = controls[
-                        getattr(self.controller, attribute)
-                    ]
+                    previous_button, previous_handler = controls[settings[key]]
                     with previous_button.handler_block(previous_handler):
                         previous_button.set_active(True)
-                    self._show_alert("Could not save app settings", str(exc))
+                    self._show_alert("Could not save settings", str(exc))
 
             radio_group = None
             for value, label in options:
@@ -1212,72 +1256,30 @@ class ChatWindow(Adw.ApplicationWindow):
                     radio_group = button
                 else:
                     button.set_group(radio_group)
-                button.set_active(value == getattr(self.controller, attribute))
+                button.set_active(value == settings[key])
                 handler = button.connect("toggled", choice_changed, value)
                 controls[value] = button, handler
                 row = Adw.ActionRow(title=label)
-                row.add_suffix(button)
-                row.set_activatable_widget(button)
+                add_control(row, button, key)
                 choice_group.add(row)
+            setting_controls[key] = [
+                (button, handler, value) for value, (button, handler) in controls.items()
+            ]
 
         add_choices(
-            "Conversation Style",
+            "Default Conversation Style" if chat_id is None else "Conversation Style",
             CONVERSATION_STYLE_OPTIONS,
             "conversation_style",
-            self.controller.set_conversation_style,
+            lambda value: self.controller.set_setting("conversation_style", value, chat_id),
         )
-        add_choices(
-            "Unpinned Chat Sort",
-            CHAT_SORT_OPTIONS,
-            "chat_sort",
-            self.controller.set_chat_sort,
-        )
+        if chat_id is None:
+            add_choices(
+                "Unpinned Chat Sort",
+                CHAT_SORT_OPTIONS,
+                "chat_sort",
+                self.controller.set_chat_sort,
+            )
         dialog.present(self)
-
-    def _show_chat_settings(self, chat_id):
-        chat_settings = self.controller.get_chat_settings(chat_id)
-        dialog, _page, group = self._settings_dialog("Chat Settings")
-        self._add_memory_switch(group, chat_id)
-        code_agent_checkbox = Adw.SwitchRow(title="Code Agent", active=chat_settings["code_agent"])
-        code_agent_checkbox.set_tooltip_text(
-            "Let the assistant suggest terminal commands for explicit approval"
-        )
-        code_agent_checkbox.set_sensitive(self.controller.settings.enable_command_approval)
-
-        def changed(button, _param):
-            try:
-                self.controller.set_agent_mode(chat_id, button.get_active())
-            except OSError as exc:
-                with button.handler_block(handler):
-                    button.set_active(not button.get_active())
-                self._show_alert("Could not save chat settings", str(exc))
-
-        handler = code_agent_checkbox.connect("notify::active", changed)
-        group.add(code_agent_checkbox)
-        dialog.present(self)
-
-    def _add_memory_switch(self, group, chat_id=None):
-        enabled = (
-            self.controller.global_memories
-            if chat_id is None
-            else self.controller.get_chat_settings(chat_id)["global_memories"]
-        )
-        row = Adw.SwitchRow(title="Global Memories", active=enabled)
-        row.set_tooltip_text(
-            "Recall and learn personal memories across chats. "
-            "Both app and chat settings must be enabled."
-        )
-
-        def changed(row, _param):
-            try:
-                self.controller.set_global_memories(row.get_active(), chat_id)
-            except OSError as exc:
-                with row.handler_block(handler):
-                    row.set_active(not row.get_active())
-                self._show_alert("Could not save memory settings", str(exc))
-
-        handler = row.connect("notify::active", changed)
-        group.add(row)
 
     def _show_memories(self, settings_dialog):
         dialog = Adw.Dialog(title="Global Memories", content_width=660, content_height=540)

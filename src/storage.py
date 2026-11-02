@@ -70,9 +70,7 @@ class ChatStore:
         except FileNotFoundError:
             data = {}
         except OSError, json.JSONDecodeError:
-            return {"code_agent": False, "global_memories": False, "created": time.time()}
-        data["code_agent"] = data.get("code_agent", Settings.code_agent) is True
-        data["global_memories"] = data.get("global_memories", Settings.global_memories) is True
+            return {"created": time.time()}
         if not isinstance(data.get("created"), (int, float)):
             data["created"] = time.time()
         return data
@@ -129,7 +127,7 @@ class ChatStore:
         try:
             settings = _read_json_object(settings_path)
         except FileNotFoundError:
-            settings = {"code_agent": Settings.code_agent}
+            settings = {}
         settings.update(
             {key: value for key, value in data.items() if key not in {"messages", "pinned"}}
         )

@@ -48,7 +48,15 @@ class Settings:
     rag_indexing_batch_chars: int = 6000
     rag_indexing_reasoning_tokens: int = 1024
     rag_indexing_output_tokens: int = 192
-    code_agent: bool = True
     enable_command_approval: bool = True
     command_scan_chars: int = 262144
     command_scan_files: int = 8
+
+
+CHAT_SETTING_DEFAULTS = {
+    "global_memories": Settings.global_memories,
+    "preserve_reasoning": Settings.preserve_thinking,
+    "rag_query_expansion": Settings.rag_query_expansion,
+    "rag_model_indexing": Settings.rag_model_indexing,
+    "conversation_style": Settings.conversation_style,
+}

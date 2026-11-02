@@ -20,7 +20,7 @@ from agentic import (
     write_file,
 )
 from rag import DocumentIndexer, format_context, read_document, retrieve, retrieve_memories
-from settings import Settings
+from settings import CHAT_SETTING_DEFAULTS, Settings
 from storage import ChatStore, MemoryStore
 
 MEMORY_INSTRUCTION = (
@@ -453,20 +453,7 @@ class ChatController:
         self.view = view
         self.store.ensure()
         app_settings = self.store.load_app_settings()
-        self.preserve_thinking = (
-            app_settings.get("preserve_reasoning", self.settings.preserve_thinking) is True
-        )
-        self.rag_query_expansion = (
-            app_settings.get("rag_query_expansion", self.settings.rag_query_expansion) is True
-        )
-        self.document_indexer.enabled = (
-            app_settings.get("rag_model_indexing", self.settings.rag_model_indexing) is True
-        )
         self.chat_sort = app_settings["chat_sort"]
-        self.conversation_style = app_settings["conversation_style"]
-        self.global_memories = (
-            app_settings.get("global_memories", self.settings.global_memories) is True
-        )
         threading.Thread(target=self._monitor_connection, daemon=True).start()
         chats = self.store.list()
         active_chat = app_settings.get("active_chat")
@@ -535,13 +522,8 @@ class ChatController:
         if self.chat:
             self._drafts[self.chat["id"]] = self.view.prompt_text(strip=False)
         self.chat = self.store.load(chat_id)
-        self.document_indexer.configure(
-            self.document_indexer.enabled, self.store.documents(chat_id)
-        )
-        self.document_indexer.schedule(self.store.documents(chat_id))
-        self.agent_mode = (
-            self.get_chat_settings(chat_id)["code_agent"] and self.settings.enable_command_approval
-        )
+        self._apply_chat_settings()
+        self.agent_mode = self.settings.enable_command_approval
         self.view.set_agent_mode(self.agent_mode)
         self.view.show_chat(self.chat, self.store.folder(chat_id))
         self.refresh()
@@ -649,25 +631,40 @@ class ChatController:
         except OSError as exc:
             self.view.notify(f"Could not open folder: {exc}")
 
-    def get_chat_settings(self, chat_id):
-        return self.store.load_settings(chat_id)
+    def get_chat_settings(self, chat_id=None):
+        settings = CHAT_SETTING_DEFAULTS | self.store.load_app_settings()
+        if chat_id is not None:
+            settings.update(self.store.load_settings(chat_id))
+        return settings
 
-    def set_preserve_reasoning(self, enabled):
-        app_settings = self.store.load_app_settings()
-        app_settings["preserve_reasoning"] = bool(enabled)
-        self.store.save_app_settings(app_settings)
-        self.preserve_thinking = bool(enabled)
+    def get_chat_overrides(self, chat_id):
+        return set(self.store.load_settings(chat_id))
 
-    def set_global_memories(self, enabled, chat_id=None):
-        if chat_id is None:
-            settings = self.store.load_app_settings()
-            settings["global_memories"] = bool(enabled)
-            self.store.save_app_settings(settings)
-            self.global_memories = bool(enabled)
+    def _apply_chat_settings(self):
+        settings = self.get_chat_settings(self.chat["id"])
+        self.global_memories = settings["global_memories"] is True
+        self.preserve_thinking = settings["preserve_reasoning"] is True
+        self.rag_query_expansion = settings["rag_query_expansion"] is True
+        self.conversation_style = settings["conversation_style"]
+        folder = self.store.documents(self.chat["id"])
+        self.document_indexer.configure(settings["rag_model_indexing"] is True, folder)
+        self.document_indexer.schedule(folder)
+
+    def set_setting(self, key, value, chat_id=None):
+        """Save a setting; None removes a chat override."""
+        settings = (
+            self.store.load_app_settings() if chat_id is None else self.store.load_settings(chat_id)
+        )
+        if chat_id is not None and value is None:
+            settings.pop(key, None)
         else:
-            settings = self.store.load_settings(chat_id)
-            settings["global_memories"] = bool(enabled)
+            settings[key] = value
+        if chat_id is None:
+            self.store.save_app_settings(settings)
+        else:
             self.store.save_settings(chat_id, settings)
+        if self.chat and (chat_id is None or chat_id == self.chat["id"]):
+            self._apply_chat_settings()
 
     def set_chat_sort(self, sort_mode):
         app_settings = self.store.load_app_settings()
@@ -675,46 +672,6 @@ class ChatController:
         self.store.save_app_settings(app_settings)
         self.chat_sort = sort_mode
         self.refresh()
-
-    def set_conversation_style(self, style):
-        app_settings = self.store.load_app_settings()
-        app_settings["conversation_style"] = style
-        self.store.save_app_settings(app_settings)
-        self.conversation_style = style
-
-    def set_rag_query_expansion(self, enabled):
-        app_settings = self.store.load_app_settings()
-        app_settings["rag_query_expansion"] = bool(enabled)
-        self.store.save_app_settings(app_settings)
-        self.rag_query_expansion = bool(enabled)
-
-    @property
-    def rag_model_indexing(self):
-        return self.document_indexer.enabled
-
-    def set_rag_model_indexing(self, enabled):
-        app_settings = self.store.load_app_settings()
-        app_settings["rag_model_indexing"] = bool(enabled)
-        self.store.save_app_settings(app_settings)
-        self.document_indexer.configure(bool(enabled), self.document_indexer.active_folder)
-        if self.chat:
-            self.document_indexer.schedule(self.store.documents(self.chat["id"]))
-
-    def set_agent_mode(self, chat_id, enabled):
-        chat_settings = self.get_chat_settings(chat_id)
-        chat_settings["code_agent"] = bool(enabled)
-        self.store.save_settings(chat_id, chat_settings)
-        if not self.chat or self.chat["id"] != chat_id:
-            return
-        self.agent_mode = enabled and self.settings.enable_command_approval
-        self.view.set_agent_mode(self.agent_mode)
-        if self.busy:
-            return
-        self.view.render_history(self.chat["messages"])
-        if self.agent_mode:
-            self.view.notify("Code agent enabled: fenced shell commands will need your approval")
-        else:
-            self.view.set_status(self.idle_status())
 
     def send(self, text):
         if self.busy or not self.chat:
@@ -773,10 +730,8 @@ class ChatController:
     def _respond(self, messages, preserve_thinking, query, folder, agent_mode, query_expansion):
         retrieved = []
         history = messages[:-1]
-        memory_enabled = (
-            self.global_memories
-            and self.store.load_settings(self._generation_chat_id)["global_memories"]
-        )
+        generation_settings = self.get_chat_settings(self._generation_chat_id)
+        memory_enabled = generation_settings["global_memories"] is True
         memory_rows = []
         expansion = None
         reasoning_pending, reasoning_hidden = "", False
@@ -865,7 +820,7 @@ class ChatController:
                 "role": "system",
                 "content": build_system_prompt(
                     agent_mode,
-                    getattr(self, "conversation_style", self.settings.conversation_style),
+                    generation_settings["conversation_style"],
                 )
                 + (
                     MEMORY_INSTRUCTION
@@ -910,8 +865,7 @@ class ChatController:
             if (
                 not error
                 and not self.stop_requested
-                and self.global_memories
-                and self.store.load_settings(self._generation_chat_id)["global_memories"]
+                and self.get_chat_settings(self._generation_chat_id)["global_memories"] is True
             ):
                 _, footer = split_memory_footer(answer)
                 if footer.startswith("<lopaca-memory>") and footer.rstrip().endswith(
