@@ -5,7 +5,7 @@ import re
 
 import gi
 
-from settings import CHAT_SORT_OPTIONS
+from settings import CHAT_SORT_OPTIONS, CONVERSATION_STYLE_OPTIONS
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
@@ -1168,35 +1168,52 @@ class ChatWindow(Adw.ApplicationWindow):
 
         indexing_handler = indexing_row.connect("notify::active", indexing_changed)
         group.add(indexing_row)
-        sort_group = Adw.PreferencesGroup(title="Unpinned Chat Sort")
-        page.add(sort_group)
-        sort_controls = {}
 
-        def sort_changed(button, sort_mode):
-            if not button.get_active():
-                return
-            try:
-                self.controller.set_chat_sort(sort_mode)
-            except OSError as exc:
-                previous_button, previous_handler = sort_controls[self.controller.chat_sort]
-                with previous_button.handler_block(previous_handler):
-                    previous_button.set_active(True)
-                self._show_alert("Could not save app settings", str(exc))
+        def add_choices(title, options, attribute, setter):
+            choice_group = Adw.PreferencesGroup(title=title)
+            page.add(choice_group)
+            controls = {}
 
-        radio_group = None
-        for sort_mode, label in CHAT_SORT_OPTIONS:
-            button = Gtk.CheckButton(valign=Gtk.Align.CENTER)
-            if radio_group is None:
-                radio_group = button
-            else:
-                button.set_group(radio_group)
-            button.set_active(sort_mode == self.controller.chat_sort)
-            sort_handler = button.connect("toggled", sort_changed, sort_mode)
-            sort_controls[sort_mode] = button, sort_handler
-            row = Adw.ActionRow(title=label)
-            row.add_suffix(button)
-            row.set_activatable_widget(button)
-            sort_group.add(row)
+            def choice_changed(button, value):
+                if not button.get_active():
+                    return
+                try:
+                    setter(value)
+                except OSError as exc:
+                    previous_button, previous_handler = controls[
+                        getattr(self.controller, attribute)
+                    ]
+                    with previous_button.handler_block(previous_handler):
+                        previous_button.set_active(True)
+                    self._show_alert("Could not save app settings", str(exc))
+
+            radio_group = None
+            for value, label in options:
+                button = Gtk.CheckButton(valign=Gtk.Align.CENTER)
+                if radio_group is None:
+                    radio_group = button
+                else:
+                    button.set_group(radio_group)
+                button.set_active(value == getattr(self.controller, attribute))
+                handler = button.connect("toggled", choice_changed, value)
+                controls[value] = button, handler
+                row = Adw.ActionRow(title=label)
+                row.add_suffix(button)
+                row.set_activatable_widget(button)
+                choice_group.add(row)
+
+        add_choices(
+            "Conversation Style",
+            CONVERSATION_STYLE_OPTIONS,
+            "conversation_style",
+            self.controller.set_conversation_style,
+        )
+        add_choices(
+            "Unpinned Chat Sort",
+            CHAT_SORT_OPTIONS,
+            "chat_sort",
+            self.controller.set_chat_sort,
+        )
         dialog.present(self)
 
     def _show_chat_settings(self, chat_id):

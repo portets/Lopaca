@@ -7,6 +7,11 @@ CHAT_SORT_OPTIONS = (
     ("creation_date", "Creation Date"),
     ("user_selectable", "User Selectable"),
 )
+CONVERSATION_STYLE_OPTIONS = (
+    ("casual", "Casual"),
+    ("neutral", "Neutral"),
+    ("technical", "Technical"),
+)
 
 
 @dataclass(frozen=True)
@@ -28,6 +33,7 @@ class Settings:
     # Injected by llama-server when its reasoning budget runs out.
     reasoning_budget_message: str = "Reasoning budget exceeded, continuing..."
     chat_sort: str = "recently_used"
+    conversation_style: str = "neutral"
     max_context_chars: int = 12000
     chunk_chars: int = 1100
     chunk_overlap: int = 140

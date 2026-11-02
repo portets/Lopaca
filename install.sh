@@ -9,6 +9,9 @@ mkdir -p -- "$INSTALL_DIR" "$APPLICATIONS_DIR"
 if [[ ! "$SCRIPT_DIR" -ef "$INSTALL_DIR" ]]; then
     cp -- "$SCRIPT_DIR"/*.py "$INSTALL_DIR/"
 fi
+if [[ ! "$SCRIPT_DIR/style.md" -ef "$INSTALL_DIR/../style.md" ]]; then
+    cp -- "$SCRIPT_DIR/style.md" "$INSTALL_DIR/../style.md"
+fi
 
 # Escape special characters for a quoted desktop-entry Exec argument.
 LAUNCH_PATH=$(printf '%s' "$INSTALL_DIR/main.py" | sed \

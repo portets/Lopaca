@@ -10,7 +10,7 @@ import uuid
 from contextlib import closing
 from pathlib import Path
 
-from settings import CHAT_SORT_OPTIONS, Settings
+from settings import CHAT_SORT_OPTIONS, CONVERSATION_STYLE_OPTIONS, Settings
 
 APP_DIR = Path.home() / ".local" / "share" / "lopaca"
 CHATS_DIR = APP_DIR / "chats"
@@ -96,6 +96,8 @@ class ChatStore:
             )
         if data.get("chat_sort") not in dict(CHAT_SORT_OPTIONS):
             data["chat_sort"] = Settings.chat_sort
+        if data.get("conversation_style") not in dict(CONVERSATION_STYLE_OPTIONS):
+            data["conversation_style"] = Settings.conversation_style
         return data
 
     def save_app_settings(self, settings):
