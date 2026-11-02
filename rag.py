@@ -21,6 +21,8 @@ class DocumentIndexer:
     def __init__(self, settings, generate_questions, model_lock, on_processing):
         self.settings = settings
         self.enabled = settings.rag_model_indexing
+        self.active_folder = None
+        self._revision = 0
         self._generate_questions = generate_questions
         self._model_lock = model_lock
         self._on_processing = on_processing
@@ -34,6 +36,12 @@ class DocumentIndexer:
         self._active = None
         self._lock = threading.Lock()
         threading.Thread(target=self._run, daemon=True).start()
+
+    def configure(self, enabled, folder):
+        with self._lock:
+            if (self.enabled, self.active_folder) != (enabled, folder):
+                self._revision += 1
+                self.enabled, self.active_folder = enabled, folder
 
     def schedule(self, folder):
         with self._lock:
@@ -70,11 +78,15 @@ class DocumentIndexer:
                         state = connection.execute(
                             "SELECT value FROM index_state WHERE key = 'model_indexing'"
                         ).fetchone()
+                        if self.enabled and folder != self.active_folder:
+                            continue  # Keep ordinary indexes fresh without using the model.
                         if changed or (
                             state != (version,)
                             and (not self.enabled or time.monotonic() >= self._retry_after)
                         ):
                             self._update_hints(connection, folder)
+            except InterruptedError:
+                pass  # Settings/chat changes cancel work without delaying the next chat.
             except Exception as exc:
                 self._retry_after = time.monotonic() + self.settings.rag_indexing_retry_interval
                 logging.warning("Could not index documents in %s: %s", folder, exc)
@@ -124,14 +136,12 @@ class DocumentIndexer:
             return
         # Chat requests wait for indexing before acquiring this same lock.
         with self._model_lock:
-            if not self.enabled:
+            if not self.enabled or folder != self.active_folder:
                 return
             self._on_processing(True)
             written = 0
             try:
                 for job, questions in self._question_batches(jobs, folder, stamps):
-                    if not self.enabled:
-                        return
                     rowid, source, section, body, key, search_text = job
                     if not _unchanged(folder / source, stamps[source]):
                         continue
@@ -140,7 +150,13 @@ class DocumentIndexer:
                         result = connection.execute(
                             "UPDATE chunks SET keywords = ? "
                             "WHERE rowid = ? AND source = ? AND section = ? AND body = ?",
-                            (search_text + " " + questions, rowid, source, section, body),
+                            (
+                                search_text + (" " + questions if self.enabled else ""),
+                                rowid,
+                                source,
+                                section,
+                                body,
+                            ),
                         )
                         if result.rowcount:
                             connection.execute(
@@ -164,6 +180,8 @@ class DocumentIndexer:
         """Bound request sizes without splitting or merging the indexed passages."""
         batch, size = [], 0
         for job in jobs:
+            if folder != self.active_folder:
+                return
             _, source, section, body, _, _ = job
             if not _unchanged(folder / source, stamps[source]):
                 continue
@@ -172,29 +190,34 @@ class DocumentIndexer:
                 len(batch) >= max(1, self.settings.rag_indexing_batch_size)
                 or size + length > max(1, self.settings.rag_indexing_batch_chars)
             ):
-                yield from self._generate_batch(batch)
+                yield from self._generate_batch(batch, folder)
                 batch, size = [], 0
             batch.append(job)
             size += length
         if batch:
-            yield from self._generate_batch(batch)
+            yield from self._generate_batch(batch, folder)
 
-    def _generate_batch(self, batch):
-        if not self.enabled:
+    def _generate_batch(self, batch, folder):
+        revision = self._revision
+        if not self.enabled or folder != self.active_folder:
             return
         passages = [
             {"id": rowid, "source": source, "section": section, "body": body}
             for rowid, source, section, body, _key, _search_text in batch
         ]
         try:
-            questions = self._generate_questions(passages)
+            questions = self._generate_questions(
+                passages, stopped=lambda: revision != self._revision
+            )
         except ValueError:
+            if revision != self._revision:
+                raise InterruptedError("Document processing cancelled") from None
             # Smaller requests help models that struggle to keep several IDs straight.
             if len(batch) == 1:
                 raise
             middle = len(batch) // 2
-            yield from self._generate_batch(batch[:middle])
-            yield from self._generate_batch(batch[middle:])
+            yield from self._generate_batch(batch[:middle], folder)
+            yield from self._generate_batch(batch[middle:], folder)
         else:
             for job in batch:
                 yield job, questions[job[0]]

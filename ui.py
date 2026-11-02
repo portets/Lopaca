@@ -1008,7 +1008,7 @@ class ChatWindow(Adw.ApplicationWindow):
         append_markdown(
             self.current_wrapper,
             answer.strip(),
-            self.controller.commands_in if self.agent_mode else None,
+            self.controller.commands_in if self._response_agent_mode else None,
             self._review_command,
         )
         if self.current_thinking:

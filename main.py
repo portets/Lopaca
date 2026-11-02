@@ -160,7 +160,7 @@ class LlamaClient:
             self.settings.rag_expansion_timeout,
         )
 
-    def document_questions(self, passages):
+    def document_questions(self, passages, stopped=lambda: False):
         """Generate search-only questions, never factual replacements for source text."""
         text = self._complete(
             "For EACH source passage, independently write three short questions a non-specialist "
@@ -176,6 +176,7 @@ class LlamaClient:
             self.settings.rag_indexing_timeout,
             reasoning_effort="low",
             grammar=document_grammar(passages),
+            stopped=stopped,
         ).strip()
         if text.startswith("```") and text.endswith("```"):
             text = text.split("\n", 1)[-1][:-3].strip()
@@ -208,7 +209,15 @@ class LlamaClient:
         return questions_by_id
 
     def _complete(
-        self, instruction, content, max_tokens, timeout, *, reasoning_effort=None, grammar=None
+        self,
+        instruction,
+        content,
+        max_tokens,
+        timeout,
+        *,
+        reasoning_effort=None,
+        grammar=None,
+        stopped=lambda: False,
     ):
         body = {
             "model": self.settings.model,
@@ -216,7 +225,7 @@ class LlamaClient:
                 {"role": "system", "content": instruction},
                 {"role": "user", "content": content},
             ],
-            "stream": False,
+            "stream": grammar is not None,
             "temperature": 0,
             "max_tokens": max_tokens,
             "chat_template_kwargs": (
@@ -229,6 +238,8 @@ class LlamaClient:
             # Also pass through template kwargs for servers predating top-level support.
             body["reasoning_effort"] = reasoning_effort
         if grammar is not None:
+            if stopped():
+                raise InterruptedError("Document processing cancelled")
             # Inspect the actual generation prefix, including template thinking settings.
             # JSON-only sampling while a prefixed <think> is open produces no final answer.
             request = urllib.request.Request(
@@ -258,8 +269,26 @@ class LlamaClient:
             method="POST",
         )
         try:
+            if stopped():
+                raise InterruptedError("Document processing cancelled")
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 self.active_response = response
+                if body["stream"]:
+                    parts = []
+                    for raw in response:
+                        if stopped():
+                            raise InterruptedError("Document processing cancelled")
+                        if not raw.startswith(b"data:"):
+                            continue
+                        packet = raw[5:].strip()
+                        if packet == b"[DONE]":
+                            break
+                        chunk = json.loads(packet)
+                        choice = (chunk.get("choices") or [{}])[0]
+                        parts.append(choice.get("delta", {}).get("content") or "")
+                    if stopped():
+                        raise InterruptedError("Document processing cancelled")
+                    return "".join(parts)
                 return json.load(response)["choices"][0]["message"].get("content") or ""
         finally:
             self.active_response = None
@@ -469,6 +498,9 @@ class ChatController:
         if self.chat:
             self._drafts[self.chat["id"]] = self.view.prompt_text(strip=False)
         self.chat = self.store.load(chat_id)
+        self.document_indexer.configure(
+            self.document_indexer.enabled, self.store.documents(chat_id)
+        )
         self.document_indexer.schedule(self.store.documents(chat_id))
         self.agent_mode = (
             self.get_chat_settings(chat_id)["code_agent"] and self.settings.enable_command_approval
@@ -621,9 +653,9 @@ class ChatController:
         app_settings = self.store.load_app_settings()
         app_settings["rag_model_indexing"] = bool(enabled)
         self.store.save_app_settings(app_settings)
-        self.document_indexer.enabled = bool(enabled)
-        for folder in self.store.root.iterdir():
-            self.document_indexer.schedule(folder / "documents")
+        self.document_indexer.configure(bool(enabled), self.document_indexer.active_folder)
+        if self.chat:
+            self.document_indexer.schedule(self.store.documents(self.chat["id"]))
 
     def set_agent_mode(self, chat_id, enabled):
         chat_settings = self.get_chat_settings(chat_id)
