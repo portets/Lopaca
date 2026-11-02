@@ -1,6 +1,6 @@
-__pycache__/
-.ruff_cache/
+src/__pycache__/
+src/.ruff_cache/
 tests/
+src/ruff-review.txt
 NOTES
-ruff-review.txt
 REPORT.md

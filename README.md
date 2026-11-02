@@ -7,7 +7,7 @@ Python 3.14+ is required. For any recent Ubuntu-based distros WITHOUT gnome you 
 ```
 sudo apt install python3-gi gir1.2-adw-1
 ```
-Edit settings.py if you need to change your server URL, default is currently latest llama-server default.
+Edit src/settings.py if you need to change your server URL, default is currently latest llama-server default.
 
 # Usage
 Start an instance of llama-server with your favorite LLM. Mostly tested with Qwen3.6 and 3.8 27b.\

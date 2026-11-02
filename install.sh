@@ -2,15 +2,16 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_DIR="$SCRIPT_DIR/src"
 INSTALL_DIR="$HOME/.local/share/lopaca/app"
 APPLICATIONS_DIR="$HOME/.local/share/applications"
 
 mkdir -p -- "$INSTALL_DIR" "$APPLICATIONS_DIR"
-if [[ ! "$SCRIPT_DIR" -ef "$INSTALL_DIR" ]]; then
-    cp -- "$SCRIPT_DIR"/*.py "$INSTALL_DIR/"
+if [[ ! "$SOURCE_DIR" -ef "$INSTALL_DIR" ]]; then
+    cp -- "$SOURCE_DIR"/*.py "$INSTALL_DIR/"
 fi
-if [[ ! "$SCRIPT_DIR/style.md" -ef "$INSTALL_DIR/../style.md" ]]; then
-    cp -- "$SCRIPT_DIR/style.md" "$INSTALL_DIR/../style.md"
+if [[ ! "$SOURCE_DIR/style.md" -ef "$INSTALL_DIR/../style.md" ]]; then
+    cp -- "$SOURCE_DIR/style.md" "$INSTALL_DIR/../style.md"
 fi
 
 # Escape special characters for a quoted desktop-entry Exec argument.
