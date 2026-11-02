@@ -703,8 +703,11 @@ class ChatWindow(Adw.ApplicationWindow):
         adjustment = self.chat_scroll.get_vadjustment()
         if row.get_height() <= 0 or adjustment.get_page_size() <= 0:
             return True
-        limit = max(adjustment.get_lower(), adjustment.get_upper() - adjustment.get_page_size())
-        adjustment.set_value(max(adjustment.get_lower(), min(limit, row.get_allocation().y)))
+        page_size = adjustment.get_page_size()
+        limit = max(adjustment.get_lower(), adjustment.get_upper() - page_size)
+        # Start at the top; scroll only enough to reveal a selected row below the viewport.
+        target = row.get_allocation().y + row.get_height() - page_size
+        adjustment.set_value(max(adjustment.get_lower(), min(limit, target)))
         return False
 
     def _set_chat_header(self, row, previous):

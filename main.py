@@ -67,6 +67,24 @@ def visible_memory_answer(text):
     return text
 
 
+def document_grammar(passages):
+    """Constrain each expected passage ID and its three search questions."""
+    records = [
+        json.dumps('{"id":' + str(passage["id"]) + ',"questions":[')
+        + ' ws string ws "," ws string ws "," ws string ws "]}"'
+        for passage in passages
+    ]
+    return (
+        'answer ::= "{\\"results\\":[" ws '
+        + ' ws "," ws '.join(records)
+        + ' ws "]}" ws\n'
+        + r"""ws ::= [ \t\n\r]{0,16}
+string ::= "\"" char{1,240} "\""
+char ::= [^"\\\x00-\x1F] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F]{4})
+"""
+    )
+
+
 def build_system_prompt(agent_mode):
     prompt = (
         "You are a helpful assistant. Answer clearly. Lopaca appends an application-supplied "
@@ -157,6 +175,7 @@ class LlamaClient:
             + self.settings.rag_indexing_output_tokens * len(passages),
             self.settings.rag_indexing_timeout,
             reasoning_effort="low",
+            grammar=document_grammar(passages),
         ).strip()
         if text.startswith("```") and text.endswith("```"):
             text = text.split("\n", 1)[-1][:-3].strip()
@@ -188,7 +207,9 @@ class LlamaClient:
             raise ValueError("The model omitted document passages from its search questions")
         return questions_by_id
 
-    def _complete(self, instruction, content, max_tokens, timeout, *, reasoning_effort=None):
+    def _complete(
+        self, instruction, content, max_tokens, timeout, *, reasoning_effort=None, grammar=None
+    ):
         body = {
             "model": self.settings.model,
             "messages": [
@@ -207,6 +228,26 @@ class LlamaClient:
         if reasoning_effort is not None:
             # Also pass through template kwargs for servers predating top-level support.
             body["reasoning_effort"] = reasoning_effort
+        if grammar is not None:
+            # Inspect the actual generation prefix, including template thinking settings.
+            # JSON-only sampling while a prefixed <think> is open produces no final answer.
+            request = urllib.request.Request(
+                self.settings.server_url.rstrip("/").removesuffix("/v1") + "/apply-template",
+                data=json.dumps(body).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.settings.api_key}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                prefix = json.load(response)["prompt"].rstrip()
+            root = (
+                "root ::= !</think>* </think> answer\n"
+                if prefix.endswith("<think>")
+                else "root ::= answer\n"
+            )
+            body["grammar"] = root + grammar
         request = urllib.request.Request(
             self.settings.server_url.rstrip("/") + "/chat/completions",
             data=json.dumps(body).encode(),
