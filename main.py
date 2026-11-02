@@ -31,7 +31,8 @@ MEMORY_INSTRUCTION = (
     "answers. Write concise, self-contained facts, resolving pronouns from the conversation. "
     "Distinguish liking, using and knowing something; preserve any stated proficiency. "
     "For every new fact or correction, emit a literal footer after your answer, outside code "
-    "fences. Promising to remember saves nothing. Omit the footer if no change is needed. "
+    "fences. Promising to remember saves nothing. Always append exactly one footer on a new "
+    "line; use [] if no change is needed. "
     "Each add/update needs text, kind, search_terms, and evidence quoted from the CURRENT user "
     "message. Choose core for stable personal background, ongoing circumstances, needs or "
     "preferences likely to help across different conversations, even when the next question "
@@ -57,14 +58,22 @@ MEMORY_INSTRUCTION = (
 )
 
 
-def visible_memory_answer(text):
-    """Hide complete/incomplete proposals, including opening tags split across tokens."""
+def split_memory_footer(text, *, line_start=True):
+    """Separate a line-start footer, withholding partial opening tags while streaming."""
     opening = "<lopaca-memory>"
-    text = text.split(opening, 1)[0]
-    for length in range(1, len(opening)):
-        if text.endswith(opening[:length]):
-            return text[:-length]
-    return text
+    start = 0 if line_start and text.startswith(opening) else text.find("\n" + opening)
+    if start >= 0:
+        start += text[start] == "\n"
+        return text[:start], text[start:]
+    _, newline, tail = text.rpartition("\n")
+    if (line_start or newline) and tail and opening.startswith(tail):
+        return text[: -len(tail)], tail
+    return text, ""
+
+
+def visible_memory_answer(text):
+    """Hide the footer without hiding inline mentions of its marker."""
+    return split_memory_footer(text)[0]
 
 
 def document_grammar(passages):
@@ -736,19 +745,22 @@ class ChatController:
         memory_rows = []
         expansion = None
         reasoning_pending, reasoning_hidden = "", False
+        reasoning_line_start = True
         last_answer = None
 
         def answer_changed(text):
             nonlocal last_answer
-            visible = visible_memory_answer(text).rstrip() if memory_enabled else text
+            visible, footer = split_memory_footer(text) if memory_enabled else (text, "")
+            if memory_enabled:
+                visible = visible.rstrip()
             if visible != last_answer:
                 self.view.dispatch(self.view.update_answer, visible)
                 last_answer = visible
-            if memory_enabled and "<lopaca-memory>" in text:
+            if footer.startswith("<lopaca-memory>"):
                 self.view.dispatch(self.view.notify, "Updating memories")
 
         def thinking(text):
-            nonlocal reasoning_pending, reasoning_hidden
+            nonlocal reasoning_pending, reasoning_hidden, reasoning_line_start
             if not memory_enabled:
                 self.view.dispatch(self.view.update_thinking, text)
                 return
@@ -756,12 +768,15 @@ class ChatController:
                 self.view.dispatch(self.view.notify, "Updating memories")
                 return
             reasoning_pending += text
-            reasoning_hidden = "<lopaca-memory>" in reasoning_pending
-            visible = visible_memory_answer(reasoning_pending)
-            reasoning_pending = "" if reasoning_hidden else reasoning_pending[len(visible) :]
+            visible, reasoning_pending = split_memory_footer(
+                reasoning_pending, line_start=reasoning_line_start
+            )
+            reasoning_hidden = reasoning_pending.startswith("<lopaca-memory>")
             if visible:
+                reasoning_line_start = visible.endswith("\n")
                 self.view.dispatch(self.view.update_thinking, visible)
             if reasoning_hidden:
+                reasoning_pending = ""
                 self.view.dispatch(self.view.notify, "Updating memories")
 
         def expand(search_query):
@@ -861,15 +876,20 @@ class ChatController:
                 and self.global_memories
                 and self.store.load_settings(self._generation_chat_id)["global_memories"]
             ):
-                block = re.search(r"<lopaca-memory>(.*?)</lopaca-memory>\s*$", answer, re.DOTALL)
-                if block:
+                _, footer = split_memory_footer(answer)
+                if footer.startswith("<lopaca-memory>") and footer.rstrip().endswith(
+                    "</lopaca-memory>"
+                ):
                     try:
-                        self.memories.apply(
-                            json.loads(block[1]),
-                            query,
-                            self._generation_chat_id,
-                            {row[0] for row in memory_rows},
-                        )
+                        data = footer.removeprefix("<lopaca-memory>").lstrip()
+                        operations, end = json.JSONDecoder().raw_decode(data)
+                        if operations and data[end:].strip() == "</lopaca-memory>":
+                            self.memories.apply(
+                                operations,
+                                query,
+                                self._generation_chat_id,
+                                {row[0] for row in memory_rows},
+                            )
                     except Exception as exc:
                         self.view.dispatch(self.view.notify, f"Could not save memories: {exc}")
             answer = visible_memory_answer(answer)
