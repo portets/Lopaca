@@ -1,0 +1,26 @@
+[
+  {
+    "mode": "off",
+    "requests": 3,
+    "valid": 3,
+    "mean_seconds": 18.248333333333335,
+    "questions": 27,
+    "base_top1": 2,
+    "hinted_top1": 8,
+    "base_top5": 2,
+    "hinted_top5": 8,
+    "retrieval_cases": 9
+  },
+  {
+    "mode": "low",
+    "requests": 3,
+    "valid": 3,
+    "mean_seconds": 47.764,
+    "questions": 27,
+    "base_top1": 2,
+    "hinted_top1": 6,
+    "base_top5": 2,
+    "hinted_top5": 7,
+    "retrieval_cases": 9
+  }
+]

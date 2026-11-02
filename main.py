@@ -174,7 +174,6 @@ class LlamaClient:
             self.settings.rag_indexing_reasoning_tokens
             + self.settings.rag_indexing_output_tokens * len(passages),
             self.settings.rag_indexing_timeout,
-            reasoning_effort="low",
             grammar=document_grammar(passages),
             stopped=stopped,
         ).strip()
