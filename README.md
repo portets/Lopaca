@@ -32,14 +32,13 @@ Retrieval uses SQLite FTS5/BM25, phrase and identifier matching, and filename/se
 **Model-Assisted Document Indexing** in App settings optionally allows the LLM to help process documents for better info retrieval. Very slow and depends on your model speed. Modest quality improvement. Recommended for t/s greater than 80.
 
 # TO-DO
-- Add more global settings
-- Add more individual chat settings
+- Selectable thinking levels
+- Context compression using RAG once a limit is hit
 - Make features list
-- Selectable assistant style.md for communication styles
 - More advanced agentic mode with more tools, web searching, etc
 
 # Further TO-DOs
-- Context compression using RAG once a limit is hit
+- Add image sending to llm for vision equipped models(not image gen)
 - Make llama-server launchable within Lopaca with parameters
 - Add support for other llm servers
 - Add Image and Code tabs, image can connect to stable-diffusion.cpp
