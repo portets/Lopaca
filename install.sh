@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_DIR="$HOME/.local/share/lopaca"
+INSTALL_DIR="$HOME/.local/share/lopaca/app"
 APPLICATIONS_DIR="$HOME/.local/share/applications"
 
 mkdir -p -- "$INSTALL_DIR" "$APPLICATIONS_DIR"
