@@ -791,7 +791,7 @@ class ChatController:
             if visible != last_answer:
                 self.view.dispatch(self.view.update_answer, visible)
                 last_answer = visible
-            if footer.startswith("<lopaca-memory>"):
+            if re.match(r"<lopaca-memory>\s*\[\s*\{", footer):
                 self.view.dispatch(self.view.notify, "Updating memories")
 
         def thinking(text):
@@ -800,7 +800,6 @@ class ChatController:
                 self.view.dispatch(self.view.update_thinking, text)
                 return
             if reasoning_hidden:
-                self.view.dispatch(self.view.notify, "Updating memories")
                 return
             reasoning_pending += text
             visible, reasoning_pending = split_memory_footer(
@@ -812,7 +811,6 @@ class ChatController:
                 self.view.dispatch(self.view.update_thinking, visible)
             if reasoning_hidden:
                 reasoning_pending = ""
-                self.view.dispatch(self.view.notify, "Updating memories")
 
         def expand(search_query):
             nonlocal expansion

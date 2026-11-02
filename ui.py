@@ -244,6 +244,8 @@ class ChatWindow(Adw.ApplicationWindow):
         self._activity_status = "Not Connected"
         self._processing_documents = False
         self._notification_timer = None
+        self._notification_deadline = 0
+        self._notification_model_busy = False
         self._response_row = None
         self._response_chat_id = None
         self._scroll_idle_id = None
@@ -476,6 +478,16 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def set_status(self, text):
         self._activity_status = text
+        if (
+            self._notification_timer is not None
+            and self._notification_model_busy
+            and not self.controller.busy
+            and text in ("Ready", "Disconnected", "Not Connected")
+            and self._notification_deadline - GLib.get_monotonic_time() > 1_000_000
+        ):
+            GLib.source_remove(self._notification_timer)
+            self._notification_deadline = GLib.get_monotonic_time() + 1_000_000
+            self._notification_timer = GLib.timeout_add(1000, self._restore_status)
         if self._notification_timer is None:
             self._display_status(
                 "Assistant processing documents" if self._processing_documents else text
@@ -492,9 +504,15 @@ class ChatWindow(Adw.ApplicationWindow):
         if self._notification_timer is not None:
             GLib.source_remove(self._notification_timer)
         self._display_status(text)
+        self._notification_model_busy = self.controller.busy
+        self._notification_deadline = GLib.get_monotonic_time() + 3_000_000
         self._notification_timer = GLib.timeout_add(3000, self._restore_status)
 
     def _restore_status(self):
+        if self.controller.busy and self._status_text == "Updating memories":
+            self._notification_deadline = GLib.get_monotonic_time() + 3_000_000
+            self._notification_timer = GLib.timeout_add(3000, self._restore_status)
+            return False
         self._notification_timer = None
         self.set_status(self._activity_status)
         return False
