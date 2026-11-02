@@ -167,6 +167,11 @@ class LlamaClient:
             json.dumps({"question": query, "recent_messages": recent[::-1]}),
             96,
             self.settings.rag_expansion_timeout,
+            grammar=(
+                'answer ::= phrase ("," ws phrase){0,5}\n'
+                "phrase ::= [^,\\x00-\\x1F]{1,160}\n"
+                'ws ::= " "?\n'
+            ),
         )
 
     def document_questions(self, passages, stopped=lambda: False):
@@ -249,7 +254,7 @@ class LlamaClient:
             if stopped():
                 raise InterruptedError("Document processing cancelled")
             # Inspect the actual generation prefix, including template thinking settings.
-            # JSON-only sampling while a prefixed <think> is open produces no final answer.
+            # Answer-only sampling while a prefixed <think> is open produces no final answer.
             request = urllib.request.Request(
                 self.settings.server_url.rstrip("/").removesuffix("/v1") + "/apply-template",
                 data=json.dumps(body).encode(),
