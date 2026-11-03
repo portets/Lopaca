@@ -464,7 +464,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.thinking_label = Gtk.Label(label="Thinking Budget")
         self.thinking_label.add_css_class("muted")
         actions.append(self.thinking_label)
-        self.thinking_dropdown = Gtk.DropDown.new_from_strings(["Default"])
+        self.thinking_dropdown = Gtk.DropDown.new_from_strings(["auto"])
         self.thinking_dropdown.add_css_class("thinking-dropdown")
         self.thinking_dropdown.set_valign(Gtk.Align.CENTER)
         self.thinking_dropdown.set_margin_end(8)
@@ -493,7 +493,7 @@ class ChatWindow(Adw.ApplicationWindow):
             self.thinking_dropdown.set_selected(
                 self._thinking_values.index(current) if current in self._thinking_values else 0
             )
-        self.thinking_dropdown.set_tooltip_text(title + " · first entry uses the server default")
+        self.thinking_dropdown.set_tooltip_text(title + " · auto chooses effort for each prompt")
 
     def _thinking_selected(self, dropdown, _param):
         selected = dropdown.get_selected()
