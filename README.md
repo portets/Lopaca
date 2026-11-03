@@ -1,4 +1,4 @@
-# Lopaca
+# <img src="./lopaca.svg" width="50" height="50" align="center" alt="Lopaca Logo"> Lopaca
 Lopaca is a llama-server GUI frontend written in python using standard libraries, currently designed for Linux with GTK but others will come later. Primarily designed for local model usage with local documents. Features include RAG document support and rudimentary agentic support.
 
 # Requirements
