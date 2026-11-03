@@ -115,6 +115,9 @@ window.lopaca-main, .transcript-scroll, .transcript {
 .thinking, .thinking button, .thinking label {
     font-weight: normal;
 }
+.thinking-dropdown label {
+    font-weight: normal;
+}
 .muted {
     color: alpha(@window_fg_color,0.62);
     font-size: 0.9em;
@@ -458,11 +461,49 @@ class ChatWindow(Adw.ApplicationWindow):
         hint.set_hexpand(True)
         hint.add_css_class("muted")
         actions.append(hint)
+        self.thinking_label = Gtk.Label(label="Thinking Budget")
+        self.thinking_label.add_css_class("muted")
+        actions.append(self.thinking_label)
+        self.thinking_dropdown = Gtk.DropDown.new_from_strings(["Default"])
+        self.thinking_dropdown.add_css_class("thinking-dropdown")
+        self.thinking_dropdown.set_valign(Gtk.Align.CENTER)
+        self.thinking_dropdown.set_margin_end(8)
+        self._thinking_values = [None]
+        self._thinking_handler = self.thinking_dropdown.connect(
+            "notify::selected", self._thinking_selected
+        )
+        actions.append(self.thinking_dropdown)
         actions.append(self.send_button)
         inner.append(actions)
         main.append(compose)
         self.send_button.add_css_class("send-stop")
         self._prompt_changed()
+
+    def update_thinking_options(self):
+        key, title, choices = self.controller.thinking_choices()
+        self.thinking_label.set_text(title)
+        self._thinking_values = [value for value, _ in choices]
+        current = (
+            self.controller.get_chat_settings(self.controller.chat["id"]).get(key)
+            if self.controller.chat
+            else None
+        )
+        with self.thinking_dropdown.handler_block(self._thinking_handler):
+            self.thinking_dropdown.set_model(Gtk.StringList.new([label for _, label in choices]))
+            self.thinking_dropdown.set_selected(
+                self._thinking_values.index(current) if current in self._thinking_values else 0
+            )
+        self.thinking_dropdown.set_tooltip_text(title + " · first entry uses the server default")
+
+    def _thinking_selected(self, dropdown, _param):
+        selected = dropdown.get_selected()
+        if selected >= len(self._thinking_values):
+            return
+        try:
+            self.controller.set_thinking(self._thinking_values[selected])
+        except OSError as exc:
+            self.update_thinking_options()
+            self._show_alert("Could not save thinking setting", str(exc))
 
     def dispatch(self, callback, *args):
         GLib.idle_add(callback, *args)
@@ -1139,7 +1180,9 @@ class ChatWindow(Adw.ApplicationWindow):
         settings = self.controller.get_chat_settings(chat_id)
         group.set_title("Default Chat Settings" if chat_id is None else "Chat Settings")
         if chat_id is not None:
-            page.set_description("Changes override app defaults for this chat. 'X' denotes an override.")
+            page.set_description(
+                "Changes override app defaults for this chat. 'X' denotes an override."
+            )
         overrides = self.controller.get_chat_overrides(chat_id) if chat_id is not None else set()
         markers = []
         setting_controls = {}

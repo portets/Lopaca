@@ -145,12 +145,11 @@ class LlamaClient:
             with suppress(Exception):
                 response.close()
 
-    def context_capacity(self):
-        """Read llama-server's per-slot context size when its props endpoint exists."""
+    def server_properties(self):
+        """Read capabilities from the loaded model's actual chat template."""
         base_url = self.settings.server_url.rstrip("/").removesuffix("/v1")
         with urllib.request.urlopen(base_url + "/props", timeout=3) as response:
-            props = json.load(response)
-        return int(props["default_generation_settings"]["n_ctx"])
+            return json.load(response)
 
     def connected(self):
         base_url = self.settings.server_url.rstrip("/").removesuffix("/v1")
@@ -329,10 +328,23 @@ class LlamaClient:
             self.active_response = None
 
     def stream(
-        self, messages, preserve_thinking, stopped, on_thinking, on_answer, on_stats, on_notice
+        self,
+        messages,
+        preserve_thinking,
+        stopped,
+        on_thinking,
+        on_answer,
+        on_stats,
+        on_notice,
+        thinking=None,
     ):
         url = self.settings.server_url.rstrip("/") + "/chat/completions"
-        budget_message = self.settings.reasoning_budget_message
+        thinking = thinking or {}
+        budget_message = (
+            ""
+            if thinking.get("reasoning_budget_tokens") == 0
+            else self.settings.reasoning_budget_message
+        )
         body = {
             "model": self.settings.model,
             "messages": messages,
@@ -343,6 +355,10 @@ class LlamaClient:
             "chat_template_kwargs": {"preserve_thinking": preserve_thinking},
             "reasoning_budget_message": f" -\n{budget_message}" if budget_message else "",
         }
+        body["chat_template_kwargs"].update(thinking.get("chat_template_kwargs", {}))
+        body.update(
+            {key: value for key, value in thinking.items() if key != "chat_template_kwargs"}
+        )
         if self.settings.max_tokens is not None:
             body["max_tokens"] = self.settings.max_tokens
         request = urllib.request.Request(
@@ -445,6 +461,7 @@ class ChatController:
         self._generation_context_used = None
         self._chat_speeds = {}
         self._drafts = {}
+        self._thinking_levels = []
         self._disk_sizes, self._disk_total = {}, None
         self.connected = None
         self.was_connected = False
@@ -480,7 +497,6 @@ class ChatController:
         return False
 
     def _monitor_connection(self):
-        capacity = None
         while True:
             with suppress(OSError):
                 for folder in self.store.root.iterdir():
@@ -490,15 +506,70 @@ class ChatController:
             except Exception:
                 connected = False
             self.view.dispatch(self._connection_changed, connected)
-            if connected and capacity is None:
+            if connected:
                 try:
-                    capacity = self.client.context_capacity()
-                    self.view.dispatch(self.view.set_context_capacity, capacity)
+                    props = self.client.server_properties()
+                    self.view.dispatch(self._server_properties_changed, props)
                 except Exception:
                     pass
             sizes, total = self.store.disk_usage()
             self.view.dispatch(self._update_disk_usage, sizes, total)
             time.sleep(self.settings.connection_check_interval)
+
+    def _server_properties_changed(self, props):
+        capacity = props.get("default_generation_settings", {}).get("n_ctx")
+        if isinstance(capacity, int):
+            self.view.set_context_capacity(capacity)
+        levels = props.get("chat_template_caps", {}).get("reasoning_effort_levels", [])
+        levels = (
+            list(dict.fromkeys(level for level in levels if isinstance(level, str)))
+            if isinstance(levels, list)
+            else []
+        )
+        if levels != self._thinking_levels:
+            self._thinking_levels = levels
+            self.view.update_thinking_options()
+        return False
+
+    def thinking_choices(self):
+        if self._thinking_levels:
+            return (
+                "thinking_level",
+                "Thinking Level:",
+                [(None, "default"), ("none", "none")]
+                + [(level, level) for level in self._thinking_levels if level != "none"],
+            )
+        return (
+            "thinking_budget",
+            "Thinking Budget:",
+            [
+                (None, "default"),
+                (0, "0"),
+                (2048, "2048"),
+                (8192, "8192"),
+                (-1, "unlimited"),
+            ],
+        )
+
+    def set_thinking(self, value):
+        key, _, _ = self.thinking_choices()
+        self.set_setting(key, value, self.chat["id"])
+
+    def thinking_parameters(self):
+        key, _, choices = self.thinking_choices()
+        value = self.get_chat_settings(self.chat["id"]).get(key)
+        if value is None or value not in [choice for choice, _ in choices]:
+            return {}
+        if value in ("none", 0):
+            return {
+                "reasoning_budget_tokens": 0,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+        if key == "thinking_budget":
+            # -1 selects the launch default in llama-server; use an effectively
+            # unbounded positive budget so Unlimited overrides a finite launch budget.
+            return {"reasoning_budget_tokens": 2_147_483_647 if value == -1 else value}
+        return {"reasoning_effort": value, "chat_template_kwargs": {"reasoning_effort": value}}
 
     def _show_disk_usage(self):
         if self.chat:
@@ -523,6 +594,7 @@ class ChatController:
             self._drafts[self.chat["id"]] = self.view.prompt_text(strip=False)
         self.chat = self.store.load(chat_id)
         self._apply_chat_settings()
+        self.view.update_thinking_options()
         self.agent_mode = self.settings.enable_command_approval
         self.view.set_agent_mode(self.agent_mode)
         self.view.show_chat(self.chat, self.store.folder(chat_id))
@@ -696,6 +768,7 @@ class ChatController:
             messages.append(item)
         self._generation_chat_id = self.chat["id"]
         self._generation_context_used = None
+        self._generation_thinking = self.thinking_parameters()
         self.busy = True
         self.stop_requested = False
         self.view.begin_response()
@@ -860,6 +933,7 @@ class ChatController:
                 self._update_inference_stats, context_used, tokens_per_second
             ),
             lambda text: self.view.dispatch(self.view.notify, text),
+            getattr(self, "_generation_thinking", None),
         )
         if memory_enabled:
             if (
