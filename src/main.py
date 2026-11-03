@@ -12,7 +12,7 @@ from pathlib import Path
 
 from agentic import (
     CODING_INSTRUCTION,
-    GET_INFO_TOOL,
+    RUNTIME_TOOLS,
     extract_commands,
     handle_tool_call,
     parse_file_heredoc,
@@ -494,7 +494,7 @@ class LlamaClient:
         body = {
             "model": self.settings.model,
             "messages": messages,
-            "tools": [GET_INFO_TOOL],
+            "tools": RUNTIME_TOOLS,
             "tool_choice": "none" if tools_disabled else "auto",
             "stream": True,
             "temperature": self.settings.temperature,

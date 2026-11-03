@@ -10,7 +10,9 @@ import shutil
 import subprocess
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 _COMMAND_BLOCK_PATTERN = re.compile(r"```(?:bash|sh|shell)\s*\n(.*?)```", re.IGNORECASE | re.DOTALL)
 
@@ -25,6 +27,18 @@ GET_INFO_TOOL = {
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
 }
+GET_DATETIME_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_datetime",
+        "description": (
+            "Returns the current local date and time in ISO 8601 format, "
+            "with the time zone name and day of the week."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+RUNTIME_TOOLS = [GET_INFO_TOOL, GET_DATETIME_TOOL]
 
 
 def get_info():
@@ -42,18 +56,41 @@ def get_info():
     return info
 
 
+def get_datetime():
+    """Read the host clock; use an IANA zone when available, otherwise the local zone name."""
+    now = datetime.now().astimezone()
+    zone = os.environ.get("TZ", "").removeprefix(":")
+    if "TZ" not in os.environ:
+        with suppress(OSError, ValueError):
+            zone = str(Path("/etc/localtime").resolve().relative_to("/usr/share/zoneinfo"))
+    if zone.startswith("/usr/share/zoneinfo/"):
+        zone = zone.removeprefix("/usr/share/zoneinfo/")
+    if zone:
+        try:
+            now = now.astimezone(ZoneInfo(zone))
+        except ZoneInfoNotFoundError, ValueError:
+            zone = ""
+    return {
+        "datetime": now.isoformat(timespec="seconds"),
+        "timezone": zone or now.tzname(),
+        "weekday": now.strftime("%A"),
+    }
+
+
 def handle_tool_call(call):
-    """Only the read-only get_info function is callable without command approval."""
+    """Dispatch only the explicitly listed read-only tools without command approval."""
     function = call["function"]
-    if function["name"] != "get_info":
-        return json.dumps({"error": "Unknown tool. Only get_info is available."})
+    name = function["name"]
+    handler = {"get_info": get_info, "get_datetime": get_datetime}.get(name)
+    if handler is None:
+        return json.dumps({"error": f"Unknown tool: {name}."})
     try:
         arguments = json.loads(function["arguments"] or "{}")
     except json.JSONDecodeError:
-        return json.dumps({"error": "get_info expects an empty JSON object."})
+        return json.dumps({"error": f"{name} expects an empty JSON object."})
     if arguments != {}:
-        return json.dumps({"error": "get_info takes no arguments."})
-    return json.dumps(get_info())
+        return json.dumps({"error": f"{name} takes no arguments."})
+    return json.dumps(handler())
 
 
 CODING_INSTRUCTION = (
