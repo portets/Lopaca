@@ -41,7 +41,7 @@ class ChatStore:
         return self.folder(chat_id) / "documents"
 
     def disk_usage(self):
-        """Sum file sizes in one metadata-only scan, without following symlinks."""
+        """Sum data file sizes, excluding the installed app and not following symlinks."""
         chats, total = {}, 0
         pending = [(self.root.parent, None)]
         while pending:
@@ -51,6 +51,8 @@ class ChatStore:
                     for entry in entries:
                         try:
                             if entry.is_dir(follow_symlinks=False):
+                                if folder == self.root.parent and entry.name == "app":
+                                    continue
                                 child_id = entry.name if folder == self.root else chat_id
                                 pending.append((Path(entry.path), child_id))
                             elif entry.is_file(follow_symlinks=False):
