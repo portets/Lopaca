@@ -281,10 +281,19 @@ class HorizontalScrollFrame(Gtk.Frame):
         self.overlay.set_clip_overlay(self.bar, True)
         self.set_child(self.overlay)
         self._scroll_connections = []
-        self._scroll_update_id = None
         self._outer_scroll = None
         self.connect("map", self._connect_scrollbar)
         self.connect("unmap", self._disconnect_scrollbar)
+        if isinstance(child, Gtk.Label):
+            child.connect("notify::label", lambda *_: self.update_content_width())
+            self.update_content_width()
+
+    def update_content_width(self, child=None):
+        """Scroll at the content's bounded natural width instead of wrapping to the bubble."""
+        if child is None:
+            child = self.scroll.get_child().get_child()
+        child.set_size_request(-1, -1)
+        child.set_size_request(child.measure(Gtk.Orientation.HORIZONTAL, -1)[1], -1)
 
     def _connect_scrollbar(self, _widget):
         self._outer_scroll = self.get_ancestor(Gtk.ScrolledWindow)
@@ -293,25 +302,18 @@ class HorizontalScrollFrame(Gtk.Frame):
             vertical = self._outer_scroll.get_vadjustment()
             adjustments.extend([(vertical, "changed"), (vertical, "value-changed")])
         for adjustment, signal in adjustments:
-            handler = adjustment.connect(signal, self._queue_scrollbar_update)
+            # Reposition before the next paint; deferring this shows the old position briefly.
+            handler = adjustment.connect(signal, self._update_scrollbar)
             self._scroll_connections.append((adjustment, handler))
-        self._queue_scrollbar_update()
+        self._update_scrollbar()
 
     def _disconnect_scrollbar(self, _widget):
         for adjustment, handler in self._scroll_connections:
             adjustment.disconnect(handler)
         self._scroll_connections.clear()
-        if self._scroll_update_id is not None:
-            GLib.source_remove(self._scroll_update_id)
-            self._scroll_update_id = None
         self._outer_scroll = None
 
-    def _queue_scrollbar_update(self, *_args):
-        if self._scroll_update_id is None:
-            self._scroll_update_id = GLib.idle_add(self._update_scrollbar)
-
-    def _update_scrollbar(self):
-        self._scroll_update_id = None
+    def _update_scrollbar(self, *_args):
         horizontal = self.scroll.get_hadjustment()
         overflow = horizontal.get_upper() > horizontal.get_page_size() + 1
         self.bar.set_visible(overflow)
@@ -328,13 +330,13 @@ class HorizontalScrollFrame(Gtk.Frame):
                 content = content.get_child()
             valid, position = self.overlay.compute_point(content, Graphene.Point().init(0, 0))
             if valid:
-                # Adjustment coordinates include the content's outer margin.
+                # Include the content margin and match GTK's truncated scroll offset.
                 vertical = self._outer_scroll.get_vadjustment()
                 below_view = (
                     position.y
                     + content.get_margin_top()
                     + self.overlay.get_height()
-                    - (vertical.get_value() + vertical.get_page_size())
+                    - (int(vertical.get_value()) + vertical.get_page_size())
                 )
                 margin = min(
                     max(0, round(below_view)), max(0, self.overlay.get_height() - bar_height)
@@ -370,7 +372,7 @@ class MarkdownTable(HorizontalScrollFrame):
                 labels = []
                 for column, xalign in enumerate(alignment):
                     label = markdown_label()
-                    label.set_wrap(False)
+                    label.set_max_width_chars(500)
                     label.set_xalign(xalign)
                     label.set_hexpand(True)
                     label.add_css_class("table-cell")
@@ -383,7 +385,9 @@ class MarkdownTable(HorizontalScrollFrame):
                 self.cells.append(labels)
             for column, value in enumerate(row):
                 if row_index >= len(previous_rows) or previous_rows[row_index][column] != value:
-                    set_markdown_text(self.cells[row_index][column], value)
+                    label = self.cells[row_index][column]
+                    set_markdown_text(label, value)
+                    self.update_content_width(label)
         self.data = data
 
 
@@ -421,6 +425,9 @@ class MarkdownText(Gtk.Box):
 
 def append_code_block(parent, text):
     label = Gtk.Label(label=text, xalign=0, yalign=0)
+    label.set_wrap(True)
+    label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+    label.set_max_width_chars(500)
     label.set_selectable(True)
     label.add_css_class("code-block")
     frame = HorizontalScrollFrame(label)
