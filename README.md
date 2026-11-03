@@ -20,7 +20,7 @@ To install:
 ./install.sh
 ```
 Or right click and run as program. May need to check Properties/Executable as Program first.\
-Installs to ~/.local/share/lopaca/app/ with a shortcut menu entry at ~/.local/share/applications/Lopaca.desktop.\
+Installs to ~/.local/share/lopaca/app/ with a shortcut menu entry at ~/.local/share/applications/app.lopaca.Lopaca.desktop.\
 Then just run it using your menu shortcut.
 
 # Local documents
@@ -32,7 +32,6 @@ Retrieval uses SQLite FTS5/BM25, phrase and identifier matching, and filename/se
 **Model-Assisted Document Indexing** in App settings optionally allows the LLM to help process documents for better info retrieval. Very slow and depends on your model speed. Modest quality improvement. Recommended for t/s greater than 80.
 
 # TO-DO
-- Selectable thinking levels
 - Context compression using RAG once a limit is hit
 - Make features list
 - More advanced agentic mode with more tools, web searching, etc

@@ -461,7 +461,7 @@ class ChatWindow(Adw.ApplicationWindow):
         hint.set_hexpand(True)
         hint.add_css_class("muted")
         actions.append(hint)
-        self.thinking_label = Gtk.Label(label="Thinking Budget")
+        self.thinking_label = Gtk.Label(label="Thinking budget")
         self.thinking_label.add_css_class("muted")
         actions.append(self.thinking_label)
         self.thinking_dropdown = Gtk.DropDown.new_from_strings(["auto"])
@@ -1708,7 +1708,7 @@ class ChatWindow(Adw.ApplicationWindow):
 
 class Lopaca(Adw.Application):
     def __init__(self, controller):
-        super().__init__(application_id="io.github.lopaca.Client")
+        super().__init__(application_id="app.lopaca.Lopaca")
         self.controller = controller
         GLib.set_application_name("Lopaca")
 

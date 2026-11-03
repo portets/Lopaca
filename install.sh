@@ -21,7 +21,7 @@ LAUNCH_PATH=$(printf '%s' "$INSTALL_DIR/main.py" | sed \
     -e 's/\\/\\\\\\\\/g' -e 's/["$`]/\\\\&/g' -e 's/%/%%/g')
 ICON_PATH=$(printf '%s' "$INSTALL_DIR/lopaca.svg" | sed 's/\\/\\\\/g')
 
-cat > "$APPLICATIONS_DIR/Lopaca.desktop" <<EOF
+cat > "$APPLICATIONS_DIR/app.lopaca.Lopaca.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Lopaca

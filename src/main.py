@@ -646,7 +646,7 @@ class ChatController:
     def idle_status(self):
         if self.connected:
             return "Ready"
-        return "Disconnected" if self.was_connected else "Not Connected"
+        return "Disconnected" if self.was_connected else "Not connected"
 
     def _connection_changed(self, connected):
         changed = self.connected is None or self.connected != connected
@@ -696,13 +696,13 @@ class ChatController:
         if self._thinking_levels:
             return (
                 "thinking_level",
-                "Thinking Level:",
+                "Thinking level:",
                 [(None, "auto"), ("none", "none")]
                 + [(level, level) for level in self._thinking_levels if level != "none"],
             )
         return (
             "thinking_budget",
-            "Thinking Budget:",
+            "Thinking budget:",
             [
                 (None, "auto"),
                 (0, "0"),
