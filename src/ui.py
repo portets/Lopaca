@@ -101,6 +101,21 @@ window.lopaca-main, .transcript-scroll, .transcript {
 .code-block {
     font-family: monospace;
 }
+.markdown-table {
+    border: 1px solid @borders;
+    border-radius: 6px;
+}
+.table-cell {
+    padding: 5px 8px;
+}
+.table-heading {
+    font-weight: bold;
+    background-color: alpha(@theme_fg_color,0.06);
+    border-bottom: 1px solid @borders;
+}
+.table-alternate {
+    background-color: alpha(@theme_fg_color,0.025);
+}
 .thinking {
     background-color: alpha(@theme_fg_color,0.065);
     border-left: 3px solid @accent_color;
@@ -187,34 +202,240 @@ def set_markdown_text(label, text):
     label.set_markup(value)
 
 
-def append_code_block(parent, text):
-    frame = Gtk.Frame()
-    frame.add_css_class("code-block-frame")
-    label = Gtk.Label(label=text, xalign=0, yalign=0)
+def table_cells(line):
+    """Split Markdown cells, preserving escaped pipes as literal text."""
+    cells = re.split(r"(?<!\\)\|", line.strip())
+    if not cells[0]:
+        cells.pop(0)
+    if cells and not cells[-1]:
+        cells.pop()
+    return [cell.strip().replace(r"\|", "|") for cell in cells]
+
+
+def markdown_blocks(text):
+    """Yield prose and pipe tables; fenced code is handled by append_markdown."""
+    lines = text.splitlines(keepends=True)
+    start = index = 0
+    while index + 1 < len(lines):
+        header, separators = table_cells(lines[index]), table_cells(lines[index + 1])
+        if (
+            not re.search(r"(?<!\\)\|", lines[index])
+            or len(header) != len(separators)
+            or not separators
+            or not all(re.fullmatch(r":?-+:?", cell) for cell in separators)
+        ):
+            index += 1
+            continue
+        if start < index:
+            yield "prose", "".join(lines[start:index]).strip("\n")
+        alignment = [
+            0.5
+            if cell.startswith(":") and cell.endswith(":")
+            else 1.0
+            if cell.endswith(":")
+            else 0.0
+            for cell in separators
+        ]
+        rows = [header]
+        index += 2
+        while (
+            index < len(lines)
+            and lines[index].strip()
+            and ("|" in lines[index] or len(header) == 1)
+        ):
+            cells = table_cells(lines[index])
+            rows.append((cells + [""] * len(header))[: len(header)])
+            index += 1
+        yield "table", (alignment, rows)
+        start = index
+    if start < len(lines):
+        yield "prose", "".join(lines[start:]).strip("\n") if start else text
+
+
+def markdown_label(text=""):
+    label = Gtk.Label(xalign=0, yalign=0)
     label.set_wrap(True)
     label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
     label.set_selectable(True)
+    set_markdown_text(label, text)
+    return label
+
+
+class HorizontalScrollFrame(Gtk.Frame):
+    """Bordered Markdown content with a scrollbar at its visible bottom edge."""
+
+    def __init__(self, child):
+        super().__init__()
+        self.scroll = Gtk.ScrolledWindow()
+        self.scroll.set_policy(Gtk.PolicyType.EXTERNAL, Gtk.PolicyType.NEVER)
+        self.scroll.set_propagate_natural_width(True)
+        self.scroll.set_propagate_natural_height(True)
+        self.scroll.set_child(child)
+        self.bar = Gtk.Scrollbar(
+            orientation=Gtk.Orientation.HORIZONTAL, adjustment=self.scroll.get_hadjustment()
+        )
+        self.bar.set_valign(Gtk.Align.END)
+        self.bar.set_visible(False)
+        self.overlay = Gtk.Overlay(child=self.scroll)
+        self.overlay.add_overlay(self.bar)
+        self.overlay.set_clip_overlay(self.bar, True)
+        self.set_child(self.overlay)
+        self._scroll_connections = []
+        self._scroll_update_id = None
+        self._outer_scroll = None
+        self.connect("map", self._connect_scrollbar)
+        self.connect("unmap", self._disconnect_scrollbar)
+
+    def _connect_scrollbar(self, _widget):
+        self._outer_scroll = self.get_ancestor(Gtk.ScrolledWindow)
+        adjustments = [(self.scroll.get_hadjustment(), "changed")]
+        if self._outer_scroll is not None:
+            vertical = self._outer_scroll.get_vadjustment()
+            adjustments.extend([(vertical, "changed"), (vertical, "value-changed")])
+        for adjustment, signal in adjustments:
+            handler = adjustment.connect(signal, self._queue_scrollbar_update)
+            self._scroll_connections.append((adjustment, handler))
+        self._queue_scrollbar_update()
+
+    def _disconnect_scrollbar(self, _widget):
+        for adjustment, handler in self._scroll_connections:
+            adjustment.disconnect(handler)
+        self._scroll_connections.clear()
+        if self._scroll_update_id is not None:
+            GLib.source_remove(self._scroll_update_id)
+            self._scroll_update_id = None
+        self._outer_scroll = None
+
+    def _queue_scrollbar_update(self, *_args):
+        if self._scroll_update_id is None:
+            self._scroll_update_id = GLib.idle_add(self._update_scrollbar)
+
+    def _update_scrollbar(self):
+        self._scroll_update_id = None
+        horizontal = self.scroll.get_hadjustment()
+        overflow = horizontal.get_upper() > horizontal.get_page_size() + 1
+        self.bar.set_visible(overflow)
+        bar_height = (
+            self.bar.measure(Gtk.Orientation.VERTICAL, -1)[1] - self.bar.get_margin_bottom()
+            if overflow
+            else 0
+        )
+        self.scroll.set_margin_bottom(bar_height)
+        margin = 0
+        if overflow and self._outer_scroll is not None:
+            content = self._outer_scroll.get_child()
+            if isinstance(content, Gtk.Viewport):
+                content = content.get_child()
+            valid, position = self.overlay.compute_point(content, Graphene.Point().init(0, 0))
+            if valid:
+                # Adjustment coordinates include the content's outer margin.
+                vertical = self._outer_scroll.get_vadjustment()
+                below_view = (
+                    position.y
+                    + content.get_margin_top()
+                    + self.overlay.get_height()
+                    - (vertical.get_value() + vertical.get_page_size())
+                )
+                margin = min(
+                    max(0, round(below_view)), max(0, self.overlay.get_height() - bar_height)
+                )
+        self.bar.set_margin_bottom(margin)
+        return False
+
+
+class MarkdownTable(HorizontalScrollFrame):
+    """Keep columns aligned and update only changed cells during streaming."""
+
+    def __init__(self, data):
+        self.grid = Gtk.Grid()
+        super().__init__(self.grid)
+        self.add_css_class("markdown-table")
+        self.cells = []
+        self.data = ([], [])
+        self.set_data(data)
+
+    def set_data(self, data):
+        alignment, rows = data
+        previous_alignment, previous_rows = self.data
+        if alignment != previous_alignment:
+            while (child := self.grid.get_first_child()) is not None:
+                self.grid.remove(child)
+            self.cells.clear()
+            previous_rows = []
+        while len(self.cells) > len(rows):
+            for label in self.cells.pop():
+                self.grid.remove(label)
+        for row_index, row in enumerate(rows):
+            if row_index == len(self.cells):
+                labels = []
+                for column, xalign in enumerate(alignment):
+                    label = markdown_label()
+                    label.set_wrap(False)
+                    label.set_xalign(xalign)
+                    label.set_hexpand(True)
+                    label.add_css_class("table-cell")
+                    if row_index == 0:
+                        label.add_css_class("table-heading")
+                    elif row_index % 2 == 0:
+                        label.add_css_class("table-alternate")
+                    self.grid.attach(label, column, row_index, 1, 1)
+                    labels.append(label)
+                self.cells.append(labels)
+            for column, value in enumerate(row):
+                if row_index >= len(previous_rows) or previous_rows[row_index][column] != value:
+                    set_markdown_text(self.cells[row_index][column], value)
+        self.data = data
+
+
+class MarkdownText(Gtk.Box):
+    """Share prose/table rendering between stored messages and the streaming tail."""
+
+    def __init__(self, text=""):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.blocks = []
+        self.set_text(text)
+
+    def set_text(self, text):
+        blocks = list(markdown_blocks(text))
+        for index, (kind, value) in enumerate(blocks):
+            if index >= len(self.blocks) or self.blocks[index][0] != kind:
+                while len(self.blocks) > index:
+                    self.remove(self.blocks.pop()[1])
+                child = MarkdownTable(value) if kind == "table" else markdown_label(value)
+                self.append(child)
+            else:
+                _, child, previous = self.blocks[index]
+                if value != previous:
+                    if kind == "table":
+                        child.set_data(value)
+                    else:
+                        set_markdown_text(child, value)
+            block = (kind, child, value)
+            if index == len(self.blocks):
+                self.blocks.append(block)
+            else:
+                self.blocks[index] = block
+        while len(self.blocks) > len(blocks):
+            self.remove(self.blocks.pop()[1])
+
+
+def append_code_block(parent, text):
+    label = Gtk.Label(label=text, xalign=0, yalign=0)
+    label.set_selectable(True)
     label.add_css_class("code-block")
-    frame.set_child(label)
+    frame = HorizontalScrollFrame(label)
+    frame.add_css_class("code-block-frame")
     parent.append(frame)
     return frame, label
 
 
 def append_markdown(parent, text, command_extractor=None, command_handler=None):
-    """Append safe inline Markdown and fenced code blocks."""
-
-    def add_label(value):
-        label = Gtk.Label(xalign=0, yalign=0)
-        label.set_wrap(True)
-        label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        label.set_selectable(True)
-        set_markdown_text(label, value)
-        parent.append(label)
+    """Append safe Markdown, tables, and fenced code or command blocks."""
 
     last = 0
     for match in _CODE_BLOCK_PATTERN.finditer(text):
         if text[last : match.start()]:
-            add_label(text[last : match.start()])
+            parent.append(MarkdownText(text[last : match.start()]))
         commands = command_extractor(match.group(0)) if command_extractor else []
         if commands:
             for command in commands:
@@ -226,7 +447,7 @@ def append_markdown(parent, text, command_extractor=None, command_handler=None):
             append_code_block(parent, match.group(1).rstrip("\n"))
         last = match.end()
     if text[last:] or not last:
-        add_label(text[last:])
+        parent.append(MarkdownText(text[last:]))
 
 
 class ChatWindow(Adw.ApplicationWindow):
@@ -965,10 +1186,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.send_button.add_css_class("destructive-action")
         self.set_status("Waiting")
         self.current_wrapper = self.append_message("assistant", "")
-        self.current_answer = Gtk.Label(label="", xalign=0, yalign=0)
-        self.current_answer.set_wrap(True)
-        self.current_answer.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        self.current_answer.set_selectable(True)
+        self.current_answer = MarkdownText()
         self.current_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.current_content.append(self.current_answer)
         self.current_wrapper.append(self.current_content)
@@ -1044,7 +1262,7 @@ class ChatWindow(Adw.ApplicationWindow):
         opening = re.search(r"```[^\n]*(?:\n(.*))?$", tail, re.DOTALL)
         prose = tail[: opening.start()] if opening else tail
         self.current_answer.set_visible(bool(prose))
-        set_markdown_text(self.current_answer, prose)
+        self.current_answer.set_text(prose)
         if opening:
             code = opening[1] or ""
             if self._stream_code is None:
