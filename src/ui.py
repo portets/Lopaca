@@ -1699,6 +1699,7 @@ class ChatWindow(Adw.ApplicationWindow):
         return False
 
     def show_command_error(self, error):
+        self.set_status(self.controller.idle_status())
         self.notify(f"Command failed: {error}")
         self.append_message("assistant", f"Command could not be started: {error}")
         self.scroll_bottom()

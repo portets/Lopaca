@@ -425,7 +425,7 @@ def parse_file_heredoc(command):
     )
 
 
-def command_needs_terminal(args):
+def command_needs_terminal(args, cwd=None):
     if not args or Path(args[0]).name.lower() not in {"python", "python3", "pypy", "pypy3"}:
         return False
     for arg in args[1:]:
@@ -434,6 +434,8 @@ def command_needs_terminal(args):
         try:
             # Match command preparation: an unresolved ~user may be a literal directory.
             script_path = Path(os.path.expanduser(arg))  # noqa: PTH111
+            if not script_path.is_absolute() and cwd is not None:
+                script_path = Path(cwd) / script_path
             text = script_path.read_text(encoding="utf-8", errors="replace")
             return bool(
                 re.search(r"\binput\s*\(|\bgetpass\s*\(|\bcurses\b|\btty\.setraw\s*\(", text)
@@ -461,7 +463,7 @@ def prepare_command(command):
 
 def run_command(args, cwd):
     """Run a reviewed command and return ``(output, exit_code, note)``."""
-    if command_needs_terminal(args):
+    if command_needs_terminal(args, cwd):
         terminal, option = shutil.which("x-terminal-emulator"), "-e"
         if not terminal:
             terminal, option = shutil.which("gnome-terminal"), "--"
@@ -478,7 +480,15 @@ def run_command(args, cwd):
             start_new_session=True,
         )
         return "", 0, "Interactive program opened in a terminal window."
-    result = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=120, shell=False)
+    result = subprocess.run(
+        args,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        shell=False,
+    )
     return (result.stdout + result.stderr).strip(), result.returncode, None
 
 
