@@ -2,6 +2,7 @@
 
 import html
 import re
+from datetime import datetime
 
 import gi
 
@@ -92,6 +93,12 @@ window.lopaca-main, .transcript-scroll, .transcript {
     font-weight: 700;
     opacity: 0.68;
 }
+.message-time {
+    opacity: 0;
+}
+.message-row:hover .message-time {
+    opacity: 1;
+}
 .code-block-frame {
     background-color: alpha(@theme_fg_color,0.035);
     border: 1px solid alpha(@theme_fg_color,0.20);
@@ -164,6 +171,23 @@ _CODE_BLOCK_PATTERN = re.compile(
     r"^ {0,3}(`{3,}|~{3,})([^\n]*)\n(.*?)^ {0,3}\1[ \t]*(?=\n|$)",
     re.DOTALL | re.MULTILINE,
 )
+
+
+def message_time(timestamp, now=None):
+    date = datetime.fromtimestamp(timestamp)
+    days = ((now or datetime.now()).date() - date.date()).days
+    clock = f"{date.hour % 12 or 12}:{date.minute:02d} {'AM' if date.hour < 12 else 'PM'}"
+    if days == 0:
+        return clock
+    prefix = date.strftime("%a") if 0 < days < 7 else f"{date.strftime('%b')} {date.day}"
+    return f"{prefix} {clock}"
+
+
+def message_day(date, now=None):
+    days = ((now or datetime.now()).date() - date).days
+    return (
+        "Today" if days == 0 else "Yesterday" if days == 1 else f"{date.strftime('%b')} {date.day}"
+    )
 
 
 class BubbleLayout(Gtk.LayoutManager):
@@ -866,6 +890,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._apply_css()
         self._build_ui()
         controller.attach(self)
+        GLib.timeout_add_seconds(60, self._refresh_message_dates)
         self.chat_list.add_tick_callback(self._scroll_initial_chat)
 
     def _apply_css(self):
@@ -1265,9 +1290,13 @@ class ChatWindow(Adw.ApplicationWindow):
         return False
 
     def _adjustment_value_changed(self, adjustment):
-        if self._scroll_guard:
-            return
-        self.follow_output = self._is_near_bottom(adjustment)
+        first = self.transcript.get_first_child()
+        if first is not None and hasattr(first, "message_date") and first.get_opacity() == 0:
+            row = first.get_next_sibling()
+            if row is not None and adjustment.get_value() > first.get_height() + row.get_height():
+                first.set_opacity(1)
+        if not self._scroll_guard:
+            self.follow_output = self._is_near_bottom(adjustment)
 
     def _adjustment_changed(self, _adjustment):
         self.scroll_bottom()
@@ -1280,6 +1309,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.folder_label.set_text(f"Chat folder: {folder}")
         self.render_history(chat["messages"])
         if self.busy and chat["id"] == self._response_chat_id:
+            self._append_message_day(self._response_row.timestamp)
             self.transcript.append(self._response_row)
             self.scroll_bottom(True)
         stats = chat.get("inference_stats", {})
@@ -1472,10 +1502,44 @@ class ChatWindow(Adw.ApplicationWindow):
                 message.get("role"),
                 message.get("content", ""),
                 message.get("reasoning_content", ""),
+                message["timestamp"],
             )
+        first = self.transcript.get_first_child()
+        if first is not None:
+            first.set_opacity(1)
         self.scroll_bottom(True)
 
-    def append_message(self, role, text, reasoning=""):
+    def _refresh_message_dates(self):
+        child = self.transcript.get_first_child()
+        now = datetime.now()
+        while child is not None:
+            if hasattr(child, "message_date"):
+                child.set_text(message_day(child.message_date, now))
+                if child.message_date != now.date():
+                    child.set_opacity(1)
+            elif hasattr(child, "timestamp"):
+                child.time_label.set_text(message_time(child.timestamp, now))
+            child = child.get_next_sibling()
+        return True
+
+    def _append_message_day(self, timestamp):
+        day = datetime.fromtimestamp(timestamp).date()
+        previous = self.transcript.get_last_child()
+        if previous is None or datetime.fromtimestamp(previous.timestamp).date() != day:
+            if previous is not None:
+                self.transcript.get_first_child().set_opacity(1)
+            separator = Gtk.Label(label=message_day(day))
+            separator.message_date = day
+            separator.add_css_class("muted")
+            separator.set_margin_top(12)
+            separator.set_margin_bottom(6)
+            separator.set_opacity(0 if previous is None else 1)
+            self.transcript.append(separator)
+        self._refresh_message_dates()
+
+    def append_message(self, role, text, reasoning="", timestamp=None):
+        timestamp = datetime.now().timestamp() if timestamp is None else timestamp
+        self._append_message_day(timestamp)
         row = Gtk.Box()
         row.set_layout_manager(BubbleLayout(role == "user"))
         row.add_css_class("message-row")
@@ -1484,7 +1548,17 @@ class ChatWindow(Adw.ApplicationWindow):
         wrapper.set_valign(Gtk.Align.START)
         wrapper.add_css_class("message")
         wrapper.add_css_class("user-message" if role == "user" else "assistant-message")
-        row.append(wrapper)
+        column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        column.append(wrapper)
+        time_label = Gtk.Label(label=message_time(timestamp))
+        time_label.add_css_class("muted")
+        time_label.add_css_class("message-time")
+        time_label.set_halign(Gtk.Align.END if role == "user" else Gtk.Align.START)
+        column.append(time_label)
+        row.append(column)
+        row.timestamp = timestamp
+        row.time_label = time_label
+        wrapper.message_row = row
         label = Gtk.Label(label="You" if role == "user" else "Assistant", xalign=0)
         label.add_css_class("message-role")
         wrapper.append(label)
@@ -1561,7 +1635,7 @@ class ChatWindow(Adw.ApplicationWindow):
         body.tail_text = ""
         self._append_thinking_body(body, text)
 
-    def begin_response(self):
+    def begin_response(self, timestamp=None):
         self.busy = True
         self.send_button.set_sensitive(True)
         self.send_button.set_icon_name("window-close-symbolic")
@@ -1569,7 +1643,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.send_button.remove_css_class("suggested-action")
         self.send_button.add_css_class("destructive-action")
         self.set_status("Waiting")
-        self.current_wrapper = self.append_message("assistant", "")
+        self.current_wrapper = self.append_message("assistant", "", timestamp=timestamp)
         self.current_answer = MarkdownText()
         self.current_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.current_content.append(self.current_answer)
@@ -1580,7 +1654,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._thinking_collapsed = False
         self.current_thinking = None
         self.scroll_bottom(True)
-        self._response_row = self.current_wrapper.get_parent()
+        self._response_row = self.current_wrapper.message_row
         self._response_chat_id = self.chat["id"]
 
     def update_thinking(self, text):

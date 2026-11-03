@@ -906,14 +906,15 @@ class ChatController:
         if not text:
             return
         self._drafts.pop(self.chat["id"], None)
-        self.chat["messages"].append({"role": "user", "content": text})
-        self.chat["updated"] = time.time()
+        timestamp = time.time()
+        self.chat["messages"].append({"role": "user", "content": text, "timestamp": timestamp})
+        self.chat["updated"] = timestamp
         if self.chat["title"] == "New chat":
             self.chat["title"] = text[:42].strip() + ("…" if len(text) > 42 else "")
         self.store.save(self.chat)
         self.refresh()
         self.view.set_chat_title(self.chat["title"])
-        self.view.append_message("user", text)
+        self.view.append_message("user", text, timestamp=timestamp)
         messages = []
         for message in self.chat["messages"]:
             item = {"role": message["role"], "content": message.get("content", "")}
@@ -926,7 +927,8 @@ class ChatController:
         self._generation_thinking_options = auto_thinking_options(tuple(self._thinking_levels))
         self.busy = True
         self.stop_requested = False
-        self.view.begin_response()
+        self._generation_timestamp = time.time()
+        self.view.begin_response(self._generation_timestamp)
         threading.Thread(
             target=self._stream,
             args=(
@@ -1175,7 +1177,12 @@ class ChatController:
             else self.store.load(self._generation_chat_id)
         )
         chat["messages"].append(
-            {"role": "assistant", "content": answer.strip(), "reasoning_content": reasoning.strip()}
+            {
+                "role": "assistant",
+                "content": answer.strip(),
+                "reasoning_content": reasoning.strip(),
+                "timestamp": self._generation_timestamp,
+            }
         )
         if self._generation_context_used is not None:
             chat.setdefault("inference_stats", {})["context_used"] = self._generation_context_used
