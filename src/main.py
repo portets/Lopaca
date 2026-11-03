@@ -12,7 +12,9 @@ from pathlib import Path
 
 from agentic import (
     CODING_INSTRUCTION,
+    GET_INFO_TOOL,
     extract_commands,
+    handle_tool_call,
     parse_file_heredoc,
     prepare_command,
     run_command,
@@ -31,8 +33,9 @@ MEMORY_INSTRUCTION = (
     "answers. Write concise, self-contained facts, resolving pronouns from the conversation. "
     "Distinguish liking, using and knowing something; preserve any stated proficiency. "
     "For every new fact or correction, emit a literal footer after your answer, outside code "
-    "fences. Promising to remember saves nothing. Always append exactly one footer on a new "
-    "line, including the opening and closing tags. When no change is needed, write exactly "
+    "fences. Promising to remember saves nothing. Append exactly one footer on a new line "
+    "after your final answer, never before a tool call. Include both tags. When no change "
+    "is needed, write exactly "
     "<lopaca-memory>[]</lopaca-memory>, never a bare []. "
     "Do not discuss internal memory housekeeping in ordinary answers. "
     "Each add/update needs text, kind, search_terms, and evidence quoted from the CURRENT user "
@@ -338,6 +341,64 @@ class LlamaClient:
         on_notice,
         thinking=None,
     ):
+        """Keep read-only tool exchanges local to this request, with bounded follow-ups."""
+        history = list(messages)
+        answer, reasoning = "", ""
+        for turn in range(self.settings.max_tool_rounds + 1):
+            if stopped():
+                return answer, reasoning, None
+            prefix = answer
+            part, thought, error, calls = self._stream_turn(
+                history,
+                preserve_thinking,
+                stopped,
+                on_thinking,
+                lambda text, prefix=prefix: on_answer(prefix + text),
+                on_stats,
+                on_notice,
+                thinking,
+                turn == self.settings.max_tool_rounds,
+            )
+            answer += part
+            reasoning += ("\n\n" if reasoning and thought else "") + thought
+            if error or stopped() or not calls:
+                return answer, reasoning, error
+            if turn == self.settings.max_tool_rounds:
+                return answer, reasoning, "The model kept requesting tools without finishing."
+            history.append(
+                {
+                    "role": "assistant",
+                    "content": part or None,
+                    "reasoning_content": thought,
+                    "tool_calls": calls,
+                }
+            )
+            for call in calls:
+                if stopped():
+                    return answer, reasoning, None
+                history.append(
+                    {"role": "tool", "tool_call_id": call["id"], "content": handle_tool_call(call)}
+                )
+            # A footer belongs to the final answer, not to an intermediate tool preamble.
+            answer = visible_memory_answer(answer).rstrip()
+            if answer:
+                answer += "\n\n"
+            if reasoning:
+                on_thinking("\n\n")
+        return answer, reasoning, None
+
+    def _stream_turn(
+        self,
+        messages,
+        preserve_thinking,
+        stopped,
+        on_thinking,
+        on_answer,
+        on_stats,
+        on_notice,
+        thinking,
+        tools_disabled,
+    ):
         url = self.settings.server_url.rstrip("/") + "/chat/completions"
         thinking = thinking or {}
         budget_message = (
@@ -348,6 +409,8 @@ class LlamaClient:
         body = {
             "model": self.settings.model,
             "messages": messages,
+            "tools": [GET_INFO_TOOL],
+            "tool_choice": "none" if tools_disabled else "auto",
             "stream": True,
             "temperature": self.settings.temperature,
             "stream_options": {"include_usage": True},
@@ -371,6 +434,7 @@ class LlamaClient:
             },
         )
         reasoning_parts, answer_parts, finish_reason = [], [], None
+        tool_calls = {}
         budget_tails, budget_notified = ["", ""], False
         try:
             with urllib.request.urlopen(request, timeout=self.settings.request_timeout) as response:
@@ -391,6 +455,19 @@ class LlamaClient:
                         finish_reason = choice.get("finish_reason") or finish_reason
                     except json.JSONDecodeError:
                         continue
+                    for fragment in delta.get("tool_calls") or []:
+                        call = tool_calls.setdefault(
+                            fragment.get("index", 0),
+                            {
+                                "id": "",
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            },
+                        )
+                        call["id"] += fragment.get("id") or ""
+                        function = fragment.get("function") or {}
+                        for key in ("name", "arguments"):
+                            call["function"][key] += function.get(key) or ""
                     usage, timings = chunk.get("usage") or {}, chunk.get("timings") or {}
                     context_used = None
                     if any(key in timings for key in ("prompt_n", "cache_n", "predicted_n")):
@@ -433,7 +510,8 @@ class LlamaClient:
             error = None if stopped() else str(exc)
         finally:
             self.active_response = None
-        return "".join(answer_parts), "".join(reasoning_parts), error
+        calls = [tool_calls[index] for index in sorted(tool_calls)]
+        return "".join(answer_parts), "".join(reasoning_parts), error, calls
 
 
 class ChatController:

@@ -23,6 +23,7 @@ class Settings:
     # None lets llama-server use its configured generation limit.
     max_tokens: int | None = None
     request_timeout: int = 600
+    max_tool_rounds: int = 2
     connection_check_interval: int = 5
     preserve_thinking: bool = True
     global_memories: bool = True

@@ -1,28 +1,70 @@
-"""Small, approval-gated helpers for the optional local coding assistant."""
+"""Read-only runtime information and approval-gated command helpers."""
 
 import ast
+import json
 import os
+import platform
 import re
 import shlex
 import shutil
 import subprocess
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 _COMMAND_BLOCK_PATTERN = re.compile(r"```(?:bash|sh|shell)\s*\n(.*?)```", re.IGNORECASE | re.DOTALL)
 
+GET_INFO_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_info",
+        "description": (
+            "Get runtime info (OS name), may call when user asks about local files "
+            "or shell commands"
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+
+def get_info():
+    """Read platform details without running commands or exposing personal paths."""
+    info = {
+        "os": platform.system(),
+        "release": platform.release(),
+        "architecture": platform.machine(),
+    }
+    if info["os"] == "Linux":
+        with suppress(OSError):
+            info["distribution"] = platform.freedesktop_os_release().get("PRETTY_NAME", "Linux")
+        if desktop := os.environ.get("XDG_CURRENT_DESKTOP"):
+            info["desktop"] = desktop
+    return info
+
+
+def handle_tool_call(call):
+    """Only the read-only get_info function is callable without command approval."""
+    function = call["function"]
+    if function["name"] != "get_info":
+        return json.dumps({"error": "Unknown tool. Only get_info is available."})
+    try:
+        arguments = json.loads(function["arguments"] or "{}")
+    except json.JSONDecodeError:
+        return json.dumps({"error": "get_info expects an empty JSON object."})
+    if arguments != {}:
+        return json.dumps({"error": "get_info takes no arguments."})
+    return json.dumps(get_info())
+
+
 CODING_INSTRUCTION = (
-    " You are in a limited coding helper mode. When a terminal command would help, provide it in "
-    "a fenced bash block which will provide the user with a button, one command per line, explain "
-    "what it does, and wait for the user to click its approval button. Prefer non-destructive "
-    "commands. You may propose terminal commands even though you cannot access the filesystem "
-    "yourself: the desktop app will show each command to the user and run it only after approval. "
-    "The user is using a GUI and can use CLI or GUI programs. Do not say you cannot create or save "
-    "files as a reason to avoid proposing a command. Do not substitute operating-system "
-    "instructions or a prose-only description. Never claim a command has run until the application "
-    "reports its output. If you provide a command for making a program file you should also "
-    "provide a command for running it, also in a fenced bash block which will give the user "
-    "another button."
+    " When a request would benefit from terminal commands, explain their purpose and put each "
+    "complete command in a separate fenced bash block. Keep multiline commands, including "
+    "heredocs, together. Lopaca turns these blocks into review buttons and executes commands "
+    "only after the user approves them. Prefer non-destructive commands. You can help create "
+    "or edit files through approved commands. Never claim a command has run until Lopaca "
+    "reports its result. Commands may launch terminal or GUI programs. When providing a command "
+    "to create a program, also provide a separate command to run it. Use get_info when platform "
+    "details matter, rather than guessing the OS."
 )
 
 _RISK_RULES = tuple(
