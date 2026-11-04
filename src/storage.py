@@ -40,6 +40,9 @@ class ChatStore:
     def documents(self, chat_id):
         return self.folder(chat_id) / "documents"
 
+    def projects(self, chat_id):
+        return self.folder(chat_id) / "projects"
+
     def disk_usage(self):
         """Sum data file sizes, excluding the installed app and not following symlinks."""
         chats, total = {}, 0
@@ -129,6 +132,7 @@ class ChatStore:
         if not history_path.exists():
             message_start = 0
         self.documents(chat_id).mkdir(parents=True, exist_ok=True)
+        self.projects(chat_id).mkdir(exist_ok=True)
         settings_path = self.folder(chat_id) / "chat-settings.json"
         try:
             settings = _read_json_object(settings_path)

@@ -119,8 +119,8 @@ def get_datetime():
 FILE_TOOLS = [
     _tool(
         "read_file",
-        "Read source lines in the current chat's documents folder. Paths are "
-        "relative to documents/: use py65/memory.py, not documents/py65/memory.py. "
+        "Read source lines only in the current chat's documents/ and projects/ folders. "
+        "Use documents/py65/memory.py or projects/example.py. Unprefixed paths use projects/. "
         "Returns numbered lines and truncation/continuation information. No writes.",
         {
             "path": {"type": "string"},
@@ -131,7 +131,11 @@ FILE_TOOLS = [
     ),
     _tool(
         "search_files",
-        "Find files or literal text within the current chat's documents folder. "
+        "Find files or literal text only within the current chat's documents/ and projects/. "
+        "Searches both unless pattern starts with documents/ or projects/. Returned paths "
+        "include that prefix and can be passed directly to read_file. "
+        "Search both folders unless the request or a known file path identifies the relevant "
+        "folder; do not narrow the search based on a guess. "
         "pattern is an optional relative file glob: **/*.py searches all subfolders, "
         "folder/** lists files recursively under folder; folder/*.py searches only that level. "
         "An empty query lists paths. "
@@ -148,7 +152,7 @@ FILE_TOOLS = [
 
 
 class DocumentFiles:
-    """Bounded, read-only access beneath one request's documents folder (Linux)."""
+    """Bounded, read-only text access beneath one allowed folder (Linux)."""
 
     def __init__(self, root):
         self.root = Path(root).absolute()
@@ -156,7 +160,7 @@ class DocumentFiles:
     def _text(self, name):
         path = PurePosixPath(name)
         if not path.parts or path.is_absolute() or ".." in path.parts or "\\" in name:
-            raise ValueError("Use a relative path inside documents/ without '..'.")
+            raise ValueError("Use a relative path inside the selected folder without '..'.")
         fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             for part in path.parts[:-1]:
@@ -208,7 +212,7 @@ class DocumentFiles:
             "next_line": end + 1 if end < len(lines) else None,
         }
 
-    def search_files(self, query="", pattern="**/*", case_sensitive=False):
+    def search_files(self, query="", pattern="**/*", case_sensitive=False, *, _deadline=None):
         if (
             not isinstance(query, str)
             or not isinstance(pattern, str)
@@ -217,11 +221,11 @@ class DocumentFiles:
         ):
             raise ValueError("Use a literal query of at most 128 characters.")
         if PurePosixPath(pattern).is_absolute() or ".." in PurePosixPath(pattern).parts:
-            raise ValueError("Search patterns must stay within documents/.")
+            raise ValueError("Search patterns must stay within the selected folder.")
         if type(case_sensitive) is not bool:
             raise ValueError("case_sensitive must be boolean.")
         matches, scanned, size = [], 0, 0
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + 2 if _deadline is None else _deadline
         needle = query if case_sensitive else query.casefold()
         entries = (
             os.walk(self.root, followlinks=False)
@@ -274,6 +278,58 @@ class DocumentFiles:
         return result
 
 
+class ChatFiles:
+    """Expose two named, separately sandboxed roots; never expose the chat root itself."""
+
+    def __init__(self, chat_folder):
+        self.roots = {
+            name: DocumentFiles(Path(chat_folder) / name) for name in ("projects", "documents")
+        }
+
+    def read_file(self, path, start_line=1, line_count=100):
+        if not isinstance(path, str):
+            raise ValueError("Use a projects/... or documents/... path.")
+        root, separator, relative = path.partition("/")
+        if root not in self.roots or not separator:
+            root, relative = "projects", path
+        result = self.roots[root].read_file(relative, start_line, line_count)
+        result["path"] = f"{root}/{relative}"
+        return result
+
+    def search_files(self, query="", pattern="**/*", case_sensitive=False):
+        if not isinstance(pattern, str) or len(pattern) > 256:
+            raise ValueError("Use a relative pattern of at most 256 characters.")
+        root, separator, relative = pattern.partition("/")
+        scoped = root in self.roots and bool(separator)
+        roots = [root] if scoped else self.roots
+        matches, scanned, truncated = [], 0, False
+        deadline = time.monotonic() + 2
+        for name in roots:
+            if self.roots[name].root.is_symlink():
+                continue
+            result = self.roots[name].search_files(
+                query,
+                relative if scoped else pattern,
+                case_sensitive,
+                _deadline=deadline,
+            )
+            matches.extend(
+                {**match, "path": f"{name}/{match['path']}"} for match in result["matches"]
+            )
+            scanned += result["files_scanned"]
+            truncated |= result["truncated"]
+            if len(matches) >= 20 or time.monotonic() > deadline:
+                truncated = True
+                break
+        result = {"matches": matches[:20], "truncated": truncated, "files_scanned": scanned}
+        if not matches:
+            result["hint"] = (
+                "Use **/* to discover files in documents/ and projects/, or restrict the "
+                "pattern to documents/** or projects/**. Patterns match files, not directories."
+            )
+        return result
+
+
 def handle_tool_call(call, files=None):
     """Dispatch only explicitly listed read-only tools without command approval."""
     function = call["function"]
@@ -300,7 +356,11 @@ CODING_INSTRUCTION = (
     "or edit files through approved commands. Never claim a command has run until Lopaca "
     "reports its result. Commands may launch terminal or GUI programs. When providing a command "
     "to create a program, also provide a separate command to run it. Use get_osinfo when platform "
-    "details matter, rather than guessing the OS."
+    "details matter, rather than guessing the OS. Commands run in this chat's projects/ folder: "
+    "use relative paths such as example.py, not projects/example.py, when creating or running "
+    "files there. Prefer this workspace unless the user requests another location. "
+    "To inspect those files, use read_file with projects/example.py; document references use "
+    "documents/... paths. File tools can access only these two folders in the current chat."
 )
 
 _RISK_RULES = tuple(

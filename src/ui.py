@@ -2385,7 +2385,7 @@ class ChatWindow(Adw.ApplicationWindow):
         toolbar.set_content(box)
         for text in (
             description,
-            f"Working directory: {self.controller.store.folder(self.chat['id'])}",
+            f"Working directory: {self.controller.store.projects(self.chat['id'])}",
         ):
             label = Gtk.Label(label=text, xalign=0)
             label.set_wrap(True)
