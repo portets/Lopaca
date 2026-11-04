@@ -939,6 +939,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._response_row = None
         self._response_chat_id = None
         self._scroll_idle_id = None
+        self._history_reveal_id = None
         self._chat_rows = []
         self._dragged_row = None
         self._drag_pointer_y = None
@@ -1631,6 +1632,9 @@ class ChatWindow(Adw.ApplicationWindow):
         return self.controller.move_chat(chat_id, row.chat_id, after) if row is not None else False
 
     def render_history(self, messages):
+        if self._history_reveal_id is not None:
+            self.transcript_scroll.remove_tick_callback(self._history_reveal_id)
+        self.transcript_scroll.set_opacity(0)
         while (child := self.transcript.get_first_child()) is not None:
             self.transcript.remove(child)
         for message in messages:
@@ -1646,6 +1650,21 @@ class ChatWindow(Adw.ApplicationWindow):
         if first is not None:
             first.set_opacity(1)
         self.scroll_bottom(True)
+        first_frame = True
+
+        def reveal(scroll, _clock):
+            nonlocal first_frame
+            if first_frame:
+                first_frame = False
+                return True
+            if self._scroll_idle_id is not None:
+                return True
+            scroll.set_opacity(1)
+            self._history_reveal_id = None
+            return False
+
+        # Allow layout and its deferred scroll update before exposing the rebuilt viewport.
+        self._history_reveal_id = self.transcript_scroll.add_tick_callback(reveal)
 
     def _refresh_message_dates(self):
         child = self.transcript.get_first_child()
