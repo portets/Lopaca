@@ -241,21 +241,26 @@ def read_document(path):
     """Read common text encodings, skipping likely binary and unsupported documents."""
     try:
         with path.open("rb") as source:
-            sample = source.read(8192)
-            if sample.startswith(b"%PDF-"):
-                return None
-            if sample.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
-                encodings = ("utf-32",)
-            elif sample.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
-                encodings = ("utf-16",)
-            else:
-                controls = sum(byte < 32 and byte not in b"\t\n\r\v\f\b\x1b" for byte in sample)
-                if b"\0" in sample or controls > len(sample) * 0.05:
-                    return None
-                encodings = ("utf-8-sig", "cp1252", "latin-1")
-            data = sample + source.read()
+            return read_document_stream(source)
     except OSError:
         return None
+
+
+def read_document_stream(source):
+    """Decode a binary stream using the same text checks for RAG and file tools."""
+    sample = source.read(8192)
+    if sample.startswith(b"%PDF-"):
+        return None
+    if sample.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        encodings = ("utf-32",)
+    elif sample.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        encodings = ("utf-16",)
+    else:
+        controls = sum(byte < 32 and byte not in b"\t\n\r\v\f\b\x1b" for byte in sample)
+        if b"\0" in sample or controls > len(sample) * 0.05:
+            return None
+        encodings = ("utf-8-sig", "cp1252", "latin-1")
+    data = sample + source.read()
     for encoding in encodings:
         try:
             text = data.decode(encoding)

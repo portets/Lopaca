@@ -1,6 +1,7 @@
 """Read-only runtime information and approval-gated command helpers."""
 
 import ast
+import io
 import json
 import locale
 import os
@@ -8,23 +9,28 @@ import platform
 import re
 import shlex
 import shutil
+import stat
 import subprocess
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from functools import cache
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from rag import read_document_stream
 
 _COMMAND_BLOCK_PATTERN = re.compile(r"```(?:bash|sh|shell)\s*\n(.*?)```", re.IGNORECASE | re.DOTALL)
 
-GET_INFO_TOOL = {
+# These tools run in Lopaca via handle_tool_call, not llama-server's built-in tool API.
+GET_OSINFO_TOOL = {
     "type": "function",
     "function": {
-        "name": "get_info",
+        "name": "get_osinfo",
         "description": (
-            "Get runtime info (OS name), may call when user asks about local files "
-            "or shell commands"
+            "Get host OS, distribution, architecture and desktop details when platform "
+            "information matters. Does not read user files."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
@@ -41,10 +47,10 @@ GET_DATETIME_TOOL = {
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
 }
-RUNTIME_TOOLS = [GET_INFO_TOOL, GET_DATETIME_TOOL]
+RUNTIME_TOOLS = [GET_OSINFO_TOOL, GET_DATETIME_TOOL]
 
 
-def get_info():
+def get_osinfo():
     """Read platform details without running commands or exposing personal paths."""
     info = {
         "os": platform.system(),
@@ -111,20 +117,191 @@ def get_datetime():
     }
 
 
-def handle_tool_call(call):
-    """Dispatch only the explicitly listed read-only tools without command approval."""
+def _file_tool(name, description, properties, required):
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+FILE_TOOLS = [
+    _file_tool(
+        "read_file",
+        "Read source lines in the current chat's documents folder. Paths are "
+        "relative to documents/: use py65/memory.py, not documents/py65/memory.py. "
+        "Returns numbered lines and truncation/continuation information. No writes.",
+        {
+            "path": {"type": "string"},
+            "start_line": {"type": "integer", "minimum": 1},
+            "line_count": {"type": "integer", "minimum": 1, "maximum": 160},
+        },
+        ["path"],
+    ),
+    _file_tool(
+        "search_files",
+        "Find files or literal text within the current chat's documents folder. "
+        "pattern is an optional relative file glob: **/*.py searches all subfolders, "
+        "folder/** lists files recursively under folder; folder/*.py searches only that level. "
+        "An empty query lists paths. "
+        "Otherwise searches filenames and text, returning numbered matches. No shell or regex. "
+        "Read a known path directly instead of searching again.",
+        {
+            "query": {"type": "string"},
+            "pattern": {"type": "string"},
+            "case_sensitive": {"type": "boolean"},
+        },
+        [],
+    ),
+]
+
+
+class DocumentFiles:
+    """Bounded, read-only access beneath one request's documents folder (Linux)."""
+
+    def __init__(self, root):
+        self.root = Path(root).absolute()
+
+    def _text(self, name):
+        path = PurePosixPath(name)
+        if not path.parts or path.is_absolute() or ".." in path.parts or "\\" in name:
+            raise ValueError("Use a relative path inside documents/ without '..'.")
+        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            for part in path.parts[:-1]:
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+            source = os.open(path.parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+            with os.fdopen(source, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise ValueError("Only regular text files are supported.")
+                data = stream.read(2_097_153)
+            if len(data) > 2_097_152:
+                raise ValueError("File exceeds the 2 MiB limit.")
+            result = read_document_stream(io.BytesIO(data))
+            if result is None:
+                raise ValueError("Unsupported/binary document.")
+            return result
+        finally:
+            os.close(fd)
+
+    def read_file(self, path, start_line=1, line_count=100):
+        if (
+            type(start_line) is not int
+            or type(line_count) is not int
+            or start_line < 1
+            or line_count < 1
+        ):
+            raise ValueError("Line numbers/counts must be positive integers.")
+        lines = self._text(path).splitlines()
+        if start_line > len(lines) + 1:
+            raise ValueError(f"File has {len(lines)} lines.")
+        selected, chars = [], 0
+        for number in range(start_line, min(len(lines) + 1, start_line + min(line_count, 160))):
+            line = f"{number}: {lines[number - 1]}"
+            if chars + len(line) > 10000:
+                if not selected:
+                    raise ValueError("Source line exceeds the 10,000-character output limit.")
+                break
+            selected.append(line)
+            chars += len(line)
+        end = start_line + len(selected) - 1
+        return {
+            "path": path,
+            "start_line": start_line,
+            "end_line": end,
+            "total_lines": len(lines),
+            "text": "\n".join(selected),
+            "truncated": end < len(lines),
+            "next_line": end + 1 if end < len(lines) else None,
+        }
+
+    def search_files(self, query="", pattern="**/*", case_sensitive=False):
+        if (
+            not isinstance(query, str)
+            or not isinstance(pattern, str)
+            or len(query) > 128
+            or len(pattern) > 256
+        ):
+            raise ValueError("Use a literal query of at most 128 characters.")
+        if PurePosixPath(pattern).is_absolute() or ".." in PurePosixPath(pattern).parts:
+            raise ValueError("Search patterns must stay within documents/.")
+        if type(case_sensitive) is not bool:
+            raise ValueError("case_sensitive must be boolean.")
+        matches, scanned, size = [], 0, 0
+        deadline = time.monotonic() + 2
+        needle = query if case_sensitive else query.casefold()
+        for directory, folders, files in os.walk(self.root, followlinks=False):
+            if time.monotonic() > deadline:
+                return {"matches": matches[:20], "truncated": True, "files_scanned": scanned}
+            folders[:] = sorted(
+                folder for folder in folders if not (Path(directory) / folder).is_symlink()
+            )
+            for filename in sorted(files):
+                relative = (Path(directory) / filename).relative_to(self.root).as_posix()
+                scanned += 1
+                if (
+                    scanned > 2000
+                    or size > 16_777_216
+                    or time.monotonic() > deadline
+                    or len(matches) >= 20
+                ):
+                    return {"matches": matches[:20], "truncated": True, "files_scanned": scanned}
+                if not PurePosixPath(relative).full_match(pattern):
+                    continue
+                try:
+                    text = self._text(relative)
+                except OSError, ValueError:
+                    continue
+                size += len(text)
+                if not query or needle in (relative if case_sensitive else relative.casefold()):
+                    matches.append({"path": relative})
+                if query:
+                    for number, line in enumerate(text.splitlines(), 1):
+                        if needle in (line if case_sensitive else line.casefold()):
+                            matches.append({"path": relative, "line": number, "text": line[:240]})
+                            if len(matches) >= 20:
+                                break
+        result = {
+            "matches": matches[:20],
+            "truncated": len(matches) >= 20,
+            "files_scanned": scanned,
+        }
+        if not matches:
+            result["hint"] = (
+                "No matches for this query/pattern combination. "
+                "Patterns match files, not directories. "
+                "Use **/* to discover paths, or folder/** to include a folder's subdirectories. "
+                "For text searches, try a shorter literal query or a broader pattern."
+            )
+        return result
+
+
+def handle_tool_call(call, files=None):
+    """Dispatch only explicitly listed read-only tools without command approval."""
     function = call["function"]
     name = function["name"]
-    handler = {"get_info": get_info, "get_datetime": get_datetime}.get(name)
-    if handler is None:
-        return json.dumps({"error": f"Unknown tool: {name}."})
+    handlers = {"get_osinfo": get_osinfo, "get_datetime": get_datetime}
+    if files is not None:
+        handlers.update(read_file=files.read_file, search_files=files.search_files)
     try:
+        if name not in handlers:
+            raise ValueError(f"Unknown or unavailable tool: {name}.")
         arguments = json.loads(function["arguments"] or "{}")
-    except json.JSONDecodeError:
-        return json.dumps({"error": f"{name} expects an empty JSON object."})
-    if arguments != {}:
-        return json.dumps({"error": f"{name} takes no arguments."})
-    return json.dumps(handler())
+        if not isinstance(arguments, dict):
+            raise ValueError("Tool arguments must be a JSON object.")
+        return json.dumps(handlers[name](**arguments))
+    except (OSError, ValueError, TypeError) as exc:
+        return json.dumps({"error": str(exc)})
 
 
 CODING_INSTRUCTION = (
@@ -134,7 +311,7 @@ CODING_INSTRUCTION = (
     "only after the user approves them. Prefer non-destructive commands. You can help create "
     "or edit files through approved commands. Never claim a command has run until Lopaca "
     "reports its result. Commands may launch terminal or GUI programs. When providing a command "
-    "to create a program, also provide a separate command to run it. Use get_info when platform "
+    "to create a program, also provide a separate command to run it. Use get_osinfo when platform "
     "details matter, rather than guessing the OS."
 )
 
