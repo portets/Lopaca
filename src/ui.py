@@ -717,12 +717,10 @@ class MarkdownText(Gtk.Box):
                 self.blocks.append(block)
             else:
                 self.blocks[index] = block
-            if self.boxed:
-                label = child if isinstance(child, Gtk.Label) else getattr(child, "body", None)
-                if isinstance(label, Gtk.Label):
-                    label.set_max_width_chars(500)
-                    label.set_size_request(-1, -1)
-                    label.set_size_request(label.measure(Gtk.Orientation.HORIZONTAL, -1)[1], -1)
+            if self.boxed and isinstance(child, Gtk.Label):
+                child.set_max_width_chars(500)
+                child.set_size_request(-1, -1)
+                child.set_size_request(child.measure(Gtk.Orientation.HORIZONTAL, -1)[1], -1)
             if kind == "text":
                 for name, offset in child.markdown_anchors:
                     anchor, suffix = name, 1
@@ -774,7 +772,7 @@ def render_markdown_block(kind, value, widget=None):
         )
     elif kind == "code":
         if widget is None:
-            widget, _label = append_code_block(None, value)
+            widget = append_code_block(None, value)[0]
         else:
             widget.scroll.get_child().get_child().set_text(value)
     elif kind == "quote":
@@ -899,7 +897,7 @@ class ChatWindow(Adw.ApplicationWindow):
         super().__init__(application=app, title="Lopaca")
         self.add_css_class("lopaca-main")
         self.controller, self.chat = controller, None
-        self.busy = self.agent_mode = False
+        self.busy = False
         self.follow_output = True
         self.current_wrapper = self.current_answer = self.current_thinking = None
         self.context_capacity = self.context_used = self.tokens_per_second = None
@@ -1047,7 +1045,7 @@ class ChatWindow(Adw.ApplicationWindow):
             icon_name="emblem-system-symbolic", tooltip_text="App Settings"
         )
         settings_button.add_css_class("flat")
-        settings_button.connect("clicked", lambda *_: self._show_app_settings())
+        settings_button.connect("clicked", lambda *_: self._show_settings())
         footer.append(settings_button)
         sidebar.append(footer)
         root.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
@@ -1314,9 +1312,6 @@ class ChatWindow(Adw.ApplicationWindow):
         self.chat_usage.set_text(f"Chat: {format_size(chat_size)}")
         self.total_usage.set_text(f"Total: {format_size(total_size)}")
 
-    def set_agent_mode(self, enabled):
-        self.agent_mode = enabled
-
     def _prompt_changed(self):
         self.send_button.set_sensitive(self.busy or bool(self.prompt_text()))
 
@@ -1415,7 +1410,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 ),
                 ("Open Folder", lambda chat_id=chat["id"]: self.controller.open_folder(chat_id)),
                 ("Add Documents", lambda chat_id=chat["id"]: self._choose_documents(chat_id)),
-                ("Chat Settings", lambda chat_id=chat["id"]: self._show_chat_settings(chat_id)),
+                ("Chat Settings", lambda chat_id=chat["id"]: self._show_settings(chat_id)),
                 ("Delete Chat", lambda chat_id=chat["id"]: self._confirm_delete_chat(chat_id)),
             )
             for index, (title, callback) in enumerate(choices):
@@ -1626,9 +1621,7 @@ class ChatWindow(Adw.ApplicationWindow):
         if reasoning:
             self._create_thinking_widget(wrapper, reasoning, True)
         if text:
-            extractor = (
-                self.controller.commands_in if role == "assistant" and self.agent_mode else None
-            )
+            extractor = self.controller.commands_in if role == "assistant" else None
             append_markdown(wrapper, text, extractor, self._review_command)
         self.transcript.append(row)
         if role == "user":
@@ -1711,7 +1704,6 @@ class ChatWindow(Adw.ApplicationWindow):
         self.current_wrapper.append(self.current_content)
         self._answer_committed = 0
         self._stream_code = None
-        self._response_agent_mode = self.agent_mode
         self._thinking_collapsed = False
         self.current_thinking = None
         self.scroll_bottom(True)
@@ -1773,8 +1765,9 @@ class ChatWindow(Adw.ApplicationWindow):
                 self.current_content.remove(self._stream_code[0])
                 self._stream_code = None
             self.current_content.remove(self.current_answer)
-            extractor = self.controller.commands_in if self._response_agent_mode else None
-            append_markdown(self.current_content, tail[:end], extractor, self._review_command)
+            append_markdown(
+                self.current_content, tail[:end], self.controller.commands_in, self._review_command
+            )
             self.current_content.append(self.current_answer)
             self._answer_committed += end
             tail = tail[end:]
@@ -1807,7 +1800,7 @@ class ChatWindow(Adw.ApplicationWindow):
         append_markdown(
             self.current_wrapper,
             answer.strip(),
-            self.controller.commands_in if self._response_agent_mode else None,
+            self.controller.commands_in,
             self._review_command,
         )
         if self.current_thinking:
@@ -1897,26 +1890,17 @@ class ChatWindow(Adw.ApplicationWindow):
         dialog.present(self)
         entry.grab_focus()
 
-    @staticmethod
-    def _settings_dialog(title):
-        dialog = Adw.PreferencesDialog(title=title, content_width=660, content_height=540)
+    def _show_settings(self, chat_id=None):
+        dialog = Adw.PreferencesDialog(
+            title="App Settings" if chat_id is None else "Chat Settings",
+            content_width=660,
+            content_height=540,
+        )
         dialog.set_search_enabled(False)
         page = Adw.PreferencesPage()
         dialog.add(page)
         group = Adw.PreferencesGroup()
         page.add(group)
-        return dialog, page, group
-
-    def _show_app_settings(self):
-        self._show_settings()
-
-    def _show_chat_settings(self, chat_id):
-        self._show_settings(chat_id)
-
-    def _show_settings(self, chat_id=None):
-        dialog, page, group = self._settings_dialog(
-            "App Settings" if chat_id is None else "Chat Settings"
-        )
         settings = self.controller.get_chat_settings(chat_id)
         group.set_title("Default Chat Settings" if chat_id is None else "Chat Settings")
         if chat_id is not None:
@@ -2119,7 +2103,6 @@ class ChatWindow(Adw.ApplicationWindow):
             ):
                 if not delete and not entry.get_visible():
                     row.set_title("")
-                    row.set_subtitle("")
                     entry.set_visible(True)
                     edit.set_icon_name("object-select-symbolic")
                     edit.set_tooltip_text("Save memory")

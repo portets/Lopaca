@@ -23,30 +23,29 @@ from rag import read_document_stream
 
 _COMMAND_BLOCK_PATTERN = re.compile(r"```(?:bash|sh|shell)\s*\n(.*?)```", re.IGNORECASE | re.DOTALL)
 
+
+def _tool(name, description, properties=None, required=()):
+    parameters = {"type": "object", "properties": properties or {}, "required": list(required)}
+    if properties is not None:
+        parameters["additionalProperties"] = False
+    return {
+        "type": "function",
+        "function": {"name": name, "description": description, "parameters": parameters},
+    }
+
+
 # These tools run in Lopaca via handle_tool_call, not llama-server's built-in tool API.
-GET_OSINFO_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "get_osinfo",
-        "description": (
-            "Get host OS, distribution, architecture and desktop details when platform "
-            "information matters. Does not read user files."
-        ),
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-}
-GET_DATETIME_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "get_datetime",
-        "description": (
-            "Returns the current local date and time in ISO 8601 format, "
-            "with the time zone name, weekday and preferred clock_format (12h or 24h). "
-            "Use clock_format when presenting times unless the user requests otherwise."
-        ),
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-}
+GET_OSINFO_TOOL = _tool(
+    "get_osinfo",
+    "Get host OS, distribution, architecture and desktop details when platform "
+    "information matters. Does not read user files.",
+)
+GET_DATETIME_TOOL = _tool(
+    "get_datetime",
+    "Returns the current local date and time in ISO 8601 format, "
+    "with the time zone name, weekday and preferred clock_format (12h or 24h). "
+    "Use clock_format when presenting times unless the user requests otherwise.",
+)
 RUNTIME_TOOLS = [GET_OSINFO_TOOL, GET_DATETIME_TOOL]
 
 
@@ -117,24 +116,8 @@ def get_datetime():
     }
 
 
-def _file_tool(name, description, properties, required):
-    return {
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": description,
-            "parameters": {
-                "type": "object",
-                "properties": properties,
-                "required": required,
-                "additionalProperties": False,
-            },
-        },
-    }
-
-
 FILE_TOOLS = [
-    _file_tool(
+    _tool(
         "read_file",
         "Read source lines in the current chat's documents folder. Paths are "
         "relative to documents/: use py65/memory.py, not documents/py65/memory.py. "
@@ -146,7 +129,7 @@ FILE_TOOLS = [
         },
         ["path"],
     ),
-    _file_tool(
+    _tool(
         "search_files",
         "Find files or literal text within the current chat's documents folder. "
         "pattern is an optional relative file glob: **/*.py searches all subfolders, "

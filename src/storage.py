@@ -123,7 +123,6 @@ class ChatStore:
 
     def save(self, data):
         chat_id = data["id"]
-        data.get("inference_stats", {}).pop("tokens_per_second", None)
         self.documents(chat_id).mkdir(parents=True, exist_ok=True)
         settings_path = self.folder(chat_id) / "chat-settings.json"
         try:
@@ -234,9 +233,6 @@ class MemoryStore:
             CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5(
                 text, keywords, tokenize='porter unicode61'
             );
-            CREATE TABLE IF NOT EXISTS memory_changes (
-                id INTEGER PRIMARY KEY, before TEXT NOT NULL, changed REAL NOT NULL
-            );
         """)
         return connection
 
@@ -247,7 +243,7 @@ class MemoryStore:
             ).fetchall()
 
     def apply(self, proposals, user_text, chat_id, allowed_ids):
-        """Apply validated, evidenced proposals atomically, retaining bounded undo snapshots."""
+        """Apply validated, evidenced proposals atomically."""
         if not isinstance(proposals, list):
             return
         with closing(self.connect()) as connection, connection:
@@ -310,13 +306,6 @@ class MemoryStore:
                         > self.settings.memory_core_chars
                     ):
                         core = False
-                connection.execute(
-                    "INSERT INTO memory_changes(before,changed) VALUES (?,?)",
-                    (
-                        json.dumps(connection.execute("SELECT * FROM memories").fetchall()),
-                        time.time(),
-                    ),
-                )
                 if action == "delete":
                     connection.execute("DELETE FROM memories WHERE id=?", (memory_id,))
                     connection.execute("DELETE FROM memory_search WHERE rowid=?", (memory_id,))
@@ -350,29 +339,7 @@ class MemoryStore:
                         "INSERT INTO memory_search(rowid,text,keywords) VALUES (?,?,?)",
                         (memory_id, text, re.sub(r"[_-]", " ", text + " " + search_terms)),
                     )
-            connection.execute(
-                "DELETE FROM memory_changes WHERE id NOT IN "
-                "(SELECT id FROM memory_changes ORDER BY id DESC LIMIT 20)"
-            )
 
     def set_core(self, memory_id, core):
         with closing(self.connect()) as connection, connection:
             connection.execute("UPDATE memories SET core=? WHERE id=?", (bool(core), memory_id))
-
-    def undo(self):
-        """Restore the most recent bounded snapshot, including its search index."""
-        with closing(self.connect()) as connection, connection:
-            previous = connection.execute(
-                "SELECT id,before FROM memory_changes ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            if previous is None:
-                return
-            rows = json.loads(previous[1])
-            connection.execute("DELETE FROM memories")
-            connection.execute("DELETE FROM memory_search")
-            connection.executemany("INSERT INTO memories VALUES (?,?,?,?,?,?,?,?,?)", rows)
-            connection.executemany(
-                "INSERT INTO memory_search(rowid,text,keywords) VALUES (?,?,?)",
-                ((row[0], row[1], re.sub(r"[_-]", " ", row[1] + " " + row[8])) for row in rows),
-            )
-            connection.execute("DELETE FROM memory_changes WHERE id=?", (previous[0],))
