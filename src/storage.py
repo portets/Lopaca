@@ -10,10 +10,7 @@ import uuid
 from contextlib import closing
 from pathlib import Path
 
-from settings import CHAT_SORT_OPTIONS, CONVERSATION_STYLE_OPTIONS, Settings
-
-APP_DIR = Path.home() / ".local" / "share" / "lopaca"
-CHATS_DIR = APP_DIR / "chats"
+from settings import CHAT_SORT_OPTIONS, CHATS_DIR, CONVERSATION_STYLE_OPTIONS, Settings
 
 
 def _read_json_object(path):

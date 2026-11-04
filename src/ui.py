@@ -2183,7 +2183,7 @@ class ChatWindow(Adw.ApplicationWindow):
             "Edit facts, select Core for always-present memories, or delete them. "
             "Click the pencil to edit, then the checkmark to save."
         )
-        for memory_id, text, core in self.controller.memories.records():
+        for memory_id, text, core in self.controller.list_memories():
             row = Adw.ActionRow(title=text)
             row.set_title_lines(0)
             entry = Gtk.Entry(text=text, hexpand=True, visible=False)
@@ -2218,31 +2218,12 @@ class ChatWindow(Adw.ApplicationWindow):
                     return
                 text = entry.get_text().strip()
                 try:
-                    self.controller.memories.apply(
-                        [
-                            {
-                                "action": "delete" if delete else "update",
-                                "id": memory_id,
-                                "text": text,
-                                "kind": "core" if core_button.get_active() else "casual",
-                                "evidence": text or "Delete memory",
-                            }
-                        ],
-                        text or "Delete memory",
-                        "manual",
-                        {memory_id},
+                    saved = self.controller.change_memory(
+                        memory_id, text, core_button.get_active(), delete=delete
                     )
                     if delete:
                         group.remove(row)
                     else:
-                        saved = next(
-                            (
-                                record
-                                for record in self.controller.memories.records()
-                                if record[0] == memory_id
-                            ),
-                            None,
-                        )
                         if saved and saved[1] == text:
                             with core_button.handler_block(core_button.memory_handler):
                                 core_button.set_active(bool(saved[2]))
@@ -2259,7 +2240,7 @@ class ChatWindow(Adw.ApplicationWindow):
 
             def core_changed(button, memory_id=memory_id):
                 try:
-                    self.controller.memories.set_core(memory_id, button.get_active())
+                    self.controller.set_memory_core(memory_id, button.get_active())
                 except Exception as exc:
                     with button.handler_block(button.memory_handler):
                         button.set_active(not button.get_active())

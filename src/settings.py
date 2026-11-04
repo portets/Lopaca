@@ -1,6 +1,10 @@
 """Runtime settings for Lopaca."""
 
 from dataclasses import dataclass
+from pathlib import Path
+
+APP_DIR = Path.home() / ".local" / "share" / "lopaca"
+CHATS_DIR = APP_DIR / "chats"
 
 CHAT_SORT_OPTIONS = (
     ("recently_used", "Recently Used"),
@@ -16,6 +20,7 @@ CONVERSATION_STYLE_OPTIONS = (
 
 @dataclass(frozen=True)
 class Settings:
+    # Model connection and generation.
     server_url: str = "http://localhost:9931/v1"
     api_key: str = "sk-no-key-required"
     model: str = "local-model"
@@ -26,6 +31,8 @@ class Settings:
     thinking_selection_timeout: int = 15
     max_tool_rounds: int = 6
     connection_check_interval: int = 5
+
+    # Conversation defaults and global memory limits.
     preserve_thinking: bool = True
     global_memories: bool = True
     memory_core_chars: int = 2000
@@ -36,6 +43,8 @@ class Settings:
     reasoning_budget_message: str = "Reasoning budget exceeded, continuing..."
     chat_sort: str = "recently_used"
     conversation_style: str = "neutral"
+
+    # Document retrieval and model-assisted indexing.
     max_context_chars: int = 12000
     chunk_chars: int = 1100
     chunk_overlap: int = 140
@@ -50,6 +59,8 @@ class Settings:
     rag_indexing_batch_chars: int = 6000
     rag_indexing_reasoning_tokens: int = 1024
     rag_indexing_output_tokens: int = 192
+
+    # Approved commands and inspection limits.
     enable_command_approval: bool = True
     command_scan_chars: int = 262144
     command_scan_files: int = 8
