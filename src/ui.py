@@ -1264,6 +1264,13 @@ class ChatWindow(Adw.ApplicationWindow):
         self._activity_status = text
         if (
             self._notification_timer is not None
+            and self._status_text == "Cancelling"
+            and not self.controller.busy
+        ):
+            GLib.source_remove(self._notification_timer)
+            self._notification_timer = None
+        if (
+            self._notification_timer is not None
             and self._notification_model_busy
             and not self.controller.busy
             and text in ("Ready", "Disconnected", "Not Connected")
@@ -1293,7 +1300,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._notification_timer = GLib.timeout_add(3000, self._restore_status)
 
     def _restore_status(self):
-        if self.controller.busy and self._status_text == "Updating memories":
+        if self.controller.busy and self._status_text in ("Updating memories", "Cancelling"):
             self._notification_deadline = GLib.get_monotonic_time() + 3_000_000
             self._notification_timer = GLib.timeout_add(3000, self._restore_status)
             return False
@@ -1316,6 +1323,7 @@ class ChatWindow(Adw.ApplicationWindow):
             "Responding",
             "Assistant processing documents",
             "Updating memories",
+            "Cancelling",
         ):
             self._status_timer = GLib.timeout_add(650, self._animate_status)
 

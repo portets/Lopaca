@@ -225,8 +225,12 @@ class LlamaClient:
     def cancel(self):
         response = self.active_response
         if response is not None:
-            with suppress(Exception):
-                response.close()
+            # HTTPResponse.close can wait for a concurrent read during server prefill.
+            def close():
+                with suppress(Exception):
+                    response.close()
+
+            threading.Thread(target=close, daemon=True).start()
 
     def server_properties(self):
         """Read capabilities from the loaded model's actual chat template."""
@@ -366,6 +370,7 @@ class LlamaClient:
                 {"role": "user", "content": content},
             ],
             "stream": grammar is not None,
+            "return_progress": grammar is not None,
             "temperature": 0,
             "max_tokens": max_tokens,
             "chat_template_kwargs": {"enable_thinking": False},
@@ -528,6 +533,7 @@ class LlamaClient:
             # The client enforces the limit; disabling parsing can leak raw tool markup.
             "tool_choice": "auto",
             "stream": True,
+            "return_progress": True,
             "temperature": self.settings.temperature,
             "stream_options": {"include_usage": True},
             "timings_per_token": True,
@@ -1206,10 +1212,10 @@ class ChatController:
         return False
 
     def stop(self):
-        if self.busy:
+        if self.busy and not self.stop_requested:
             self.stop_requested = True
+            self.view.notify("Cancelling")
             self.client.cancel()
-            self.view.set_status("Stopping generation…")
 
     @staticmethod
     def split_thinking(text):
