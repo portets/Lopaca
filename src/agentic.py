@@ -2,6 +2,7 @@
 
 import ast
 import json
+import locale
 import os
 import platform
 import re
@@ -11,6 +12,7 @@ import subprocess
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
+from functools import cache
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -33,7 +35,8 @@ GET_DATETIME_TOOL = {
         "name": "get_datetime",
         "description": (
             "Returns the current local date and time in ISO 8601 format, "
-            "with the time zone name and day of the week."
+            "with the time zone name, weekday and preferred clock_format (12h or 24h). "
+            "Use clock_format when presenting times unless the user requests otherwise."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
@@ -56,6 +59,36 @@ def get_info():
     return info
 
 
+@cache
+def _desktop_clock_settings():
+    """Use GNOME's preference when available; keep the runtime helpers usable without GI."""
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").casefold()
+    if desktop and "gnome" not in desktop and "unity" not in desktop:
+        return None
+    try:
+        from gi.repository import Gio
+
+        source = Gio.SettingsSchemaSource.get_default()
+        schema = source.lookup("org.gnome.desktop.interface", True) if source else None
+        if schema and schema.has_key("clock-format"):
+            return Gio.Settings.new_full(schema, None, None)
+    except ImportError, RuntimeError:
+        pass
+    return None
+
+
+def get_clock_format():
+    """Read the current desktop preference, falling back to the process's time locale."""
+    settings = _desktop_clock_settings()
+    if settings is not None and (value := settings.get_string("clock-format")) in ("12h", "24h"):
+        return value
+    try:
+        pattern = locale.nl_langinfo(locale.T_FMT)
+    except AttributeError, ValueError:
+        return "24h"
+    return "12h" if re.search(r"%(?:E|O)?[Ilrp]", pattern) else "24h"
+
+
 def get_datetime():
     """Read the host clock; use an IANA zone when available, otherwise the local zone name."""
     now = datetime.now().astimezone()
@@ -74,6 +107,7 @@ def get_datetime():
         "datetime": now.isoformat(timespec="seconds"),
         "timezone": zone or now.tzname(),
         "weekday": now.strftime("%A"),
+        "clock_format": get_clock_format(),
     }
 
 

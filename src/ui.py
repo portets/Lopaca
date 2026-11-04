@@ -6,6 +6,7 @@ from datetime import datetime
 
 import gi
 
+from agentic import get_clock_format
 from settings import CHAT_SORT_OPTIONS, CONVERSATION_STYLE_OPTIONS
 
 gi.require_version("Gtk", "4.0")
@@ -180,7 +181,11 @@ _CODE_BLOCK_PATTERN = re.compile(
 def message_time(timestamp, now=None):
     date = datetime.fromtimestamp(timestamp)
     days = ((now or datetime.now()).date() - date.date()).days
-    clock = f"{date.hour % 12 or 12}:{date.minute:02d} {'AM' if date.hour < 12 else 'PM'}"
+    clock = (
+        f"{date.hour:02d}:{date.minute:02d}"
+        if get_clock_format() == "24h"
+        else f"{date.hour % 12 or 12}:{date.minute:02d} {'AM' if date.hour < 12 else 'PM'}"
+    )
     if days == 0:
         return clock
     prefix = date.strftime("%a") if 0 < days < 7 else f"{date.strftime('%b')} {date.day}"
