@@ -1231,6 +1231,7 @@ class ChatController:
         return (before + after, reasoning, bool(closing)) if opening else (text, None, False)
 
     def finish_response(self, answer, reasoning, error):
+        finished_at = time.time()
         if error and "token or context limit" not in error:
             self._connection_changed(False)
         elif not self.stop_requested:
@@ -1258,12 +1259,12 @@ class ChatController:
                 "role": "assistant",
                 "content": answer.strip(),
                 "reasoning_content": reasoning.strip(),
-                "timestamp": self._generation_timestamp,
+                "timestamp": finished_at,
             }
         )
         if self._generation_context_used is not None:
             chat.setdefault("inference_stats", {})["context_used"] = self._generation_context_used
-        chat["updated"] = time.time()
+        chat["updated"] = finished_at
         self.store.save(chat, message_start=len(chat["messages"]) - 1)
         self.refresh()
         self.busy = False

@@ -101,7 +101,7 @@ window.lopaca-main, .transcript-scroll, .transcript {
 .message-time {
     opacity: 0;
 }
-.message-row:hover .message-time {
+.message:hover + .message-time {
     opacity: 1;
 }
 .code-block-frame {
@@ -1670,7 +1670,7 @@ class ChatWindow(Adw.ApplicationWindow):
             separator.message_date = day
             separator.add_css_class("muted")
             separator.set_margin_top(12)
-            separator.set_margin_bottom(6)
+            separator.set_margin_bottom(2 + separator.get_layout().get_pixel_size()[1])
             separator.set_opacity(0 if previous is None else 1)
             self.transcript.append(separator)
 
@@ -1877,6 +1877,12 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def finish_response(self, answer, reasoning):
         visible = self._response_row.get_parent() == self.transcript
+        timestamp = self.chat["messages"][-1]["timestamp"]
+        day_changed = datetime.fromtimestamp(self._response_row.timestamp).date() != (
+            datetime.fromtimestamp(timestamp).date()
+        )
+        self._response_row.timestamp = timestamp
+        self._response_row.time_label.set_text(message_time(timestamp))
         if reasoning and self.current_thinking is None:
             self.current_thinking = self._create_thinking_widget(self.current_wrapper, "", True)
         self.current_wrapper.remove(self.current_content)
@@ -1889,7 +1895,7 @@ class ChatWindow(Adw.ApplicationWindow):
         if self.current_thinking:
             self._collapse_thinking()
             self._set_thinking_body(self.current_thinking, reasoning.strip())
-        if not visible:
+        if not visible or day_changed:
             self.render_history(self.chat["messages"])
         return self.end_response()
 
