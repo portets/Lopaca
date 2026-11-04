@@ -82,6 +82,10 @@ window.lopaca-main, .transcript-scroll, .transcript {
     padding: 10px 13px;
     border-radius: 14px;
 }
+.message label {
+    caret-color: transparent;
+    -gtk-secondary-caret-color: transparent;
+}
 .user-message {
     background-color: alpha(@accent_bg_color,0.4);
 }
@@ -491,6 +495,7 @@ def activate_markdown_link(label, uri):
         if isinstance(parent, MarkdownText):
             target = parent.anchors.get(uri[1:], parent if uri == "#" else None)
             if target is not None:
+                target, offset = target if isinstance(target, tuple) else (target, 0)
                 outer = target.get_ancestor(Gtk.ScrolledWindow)
                 while outer is not None and outer.get_parent() is not None:
                     ancestor = outer.get_parent().get_ancestor(Gtk.ScrolledWindow)
@@ -503,7 +508,12 @@ def activate_markdown_link(label, uri):
                         content = content.get_child()
                     valid, point = target.compute_point(content, Graphene.Point().init(0, 0))
                     if valid:
-                        outer.get_vadjustment().set_value(point.y + content.get_margin_top())
+                        line = (
+                            target.get_layout().index_to_pos(offset).y / Pango.SCALE
+                            if offset
+                            else 0
+                        )
+                        outer.get_vadjustment().set_value(point.y + content.get_margin_top() + line)
                 return True
         parent = parent.get_parent()
     if message is not None:
@@ -512,7 +522,10 @@ def activate_markdown_link(label, uri):
             widget = pending.pop()
             if isinstance(widget, MarkdownText) and uri[1:] in widget.anchors:
                 # Reuse the same navigation path when the target is across a code fence.
-                return activate_markdown_link(widget.anchors[uri[1:]], uri)
+                target = widget.anchors[uri[1:]]
+                return activate_markdown_link(
+                    target[0] if isinstance(target, tuple) else target, uri
+                )
             child = widget.get_first_child()
             while child is not None:
                 pending.append(child)
@@ -675,6 +688,15 @@ class MarkdownText(Gtk.Box):
             for block in (prose_blocks(value) if kind == "prose" else [(kind, value)])
         ]
         blocks.extend(notes)
+        grouped = []
+        for kind, value in blocks:
+            if kind in ("prose", "heading", "item", "footnote"):
+                if not grouped or grouped[-1][0] != "text":
+                    grouped.append(("text", []))
+                grouped[-1][1].append((kind, value))
+            else:
+                grouped.append((kind, value))
+        blocks = grouped
         for index, (kind, value) in enumerate(blocks):
             if index >= len(self.blocks) or self.blocks[index][0] != kind:
                 while len(self.blocks) > index:
@@ -696,16 +718,44 @@ class MarkdownText(Gtk.Box):
                     label.set_max_width_chars(500)
                     label.set_size_request(-1, -1)
                     label.set_size_request(label.measure(Gtk.Orientation.HORIZONTAL, -1)[1], -1)
-            if kind == "heading":
-                slug = re.sub(r"[^\w\s-]", "", value[1].casefold()).replace(" ", "-")
-                anchor, suffix = slug, 1
-                while anchor in self.anchors:
-                    anchor, suffix = f"{slug}-{suffix}", suffix + 1
-                self.anchors[anchor] = child
-            elif kind == "footnote":
-                self.anchors[f"fn-{value[0]}"] = child
+            if kind == "text":
+                for name, offset in child.markdown_anchors:
+                    anchor, suffix = name, 1
+                    while anchor in self.anchors:
+                        anchor, suffix = f"{name}-{suffix}", suffix + 1
+                    self.anchors[anchor] = (child, offset)
         while len(self.blocks) > len(blocks):
             self.remove(self.blocks.pop()[1])
+
+
+def selectable_markdown(label, blocks):
+    """Use one label for adjacent headings, paragraphs and lists so selection spans them."""
+    parts, plain, previous = [], "", None
+    label.markdown_anchors = []
+    for kind, value in blocks:
+        separator = "\n" if kind == previous == "item" else "\n\n"
+        if parts:
+            parts.append(separator)
+            plain += separator
+        if kind == "heading":
+            level, text = value
+            size = ("xx-large", "x-large", "large", "medium", "medium", "small")[level - 1]
+            markup = f'<span size="{size}" weight="bold">{inline_markdown(text)}</span>'
+            anchor = re.sub(r"[^\w\s-]", "", text.casefold()).replace(" ", "-")
+            label.markdown_anchors.append((anchor, len(plain.encode("utf-8"))))
+        elif kind in ("item", "footnote"):
+            indent, marker, text = value if kind == "item" else (0, f"{value[0]}.", value[1])
+            markup = (
+                "\u2003" * min(indent // 2, 20) + html.escape(marker) + " " + inline_markdown(text)
+            )
+            if kind == "footnote":
+                label.markdown_anchors.append((f"fn-{value[0]}", len(plain.encode("utf-8"))))
+        else:
+            markup = inline_markdown(value)
+        parts.append(markup)
+        plain += html.unescape(re.sub(r"<[^>]*>", "", markup))
+        previous = kind
+    label.set_markup("".join(parts))
 
 
 def render_markdown_block(kind, value, widget=None):
@@ -728,29 +778,10 @@ def render_markdown_block(kind, value, widget=None):
             widget.add_css_class("markdown-quote")
         widget.scroll.get_child().get_child().set_text(value)
         widget.update_content_width()
-    elif kind in ("item", "footnote"):
-        if widget is None:
-            widget = Gtk.Box(spacing=8)
-            widget.marker = Gtk.Label(yalign=0)
-            widget.body = markdown_label()
-            widget.body.set_hexpand(True)
-            widget.append(widget.marker)
-            widget.append(widget.body)
-        indent, marker, content = value if kind == "item" else (0, f"{value[0]}.", value[1])
-        widget.set_margin_start(min(indent, 40) * 6)
-        widget.marker.set_text(marker)
-        set_markdown_text(widget.body, content)
     else:
         if widget is None:
             widget = markdown_label()
-        if kind == "heading":
-            level, content = value
-            size = ("xx-large", "x-large", "large", "medium", "medium", "small")[level - 1]
-            widget.set_markup(
-                f'<span size="{size}" weight="bold">{inline_markdown(content)}</span>'
-            )
-        else:
-            set_markdown_text(widget, value)
+        selectable_markdown(widget, value if kind == "text" else [(kind, value)])
     return widget
 
 
@@ -900,7 +931,32 @@ class ChatWindow(Adw.ApplicationWindow):
             Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
 
+    def _clear_message_selection(self, _gesture, _presses, x, y):
+        clicked = self.pick(x, y, Gtk.PickFlags.DEFAULT)
+        while clicked is not None and not clicked.has_css_class("message"):
+            clicked = clicked.get_parent()
+        pending = [self.transcript]
+        while pending:
+            widget = pending.pop()
+            if widget is clicked:
+                continue
+            if (
+                isinstance(widget, Gtk.Label)
+                and widget.get_selectable()
+                and widget.get_selection_bounds()[0]
+            ):
+                widget.select_region(0, 0)
+            child = widget.get_first_child()
+            while child is not None:
+                pending.append(child)
+                child = child.get_next_sibling()
+
     def _build_ui(self):
+        clicks = Gtk.GestureClick()
+        clicks.set_button(0)
+        clicks.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        clicks.connect("pressed", self._clear_message_selection)
+        self.add_controller(clicks)
         toolbar = Adw.ToolbarView()
         header_bar = Adw.HeaderBar()
         header_bar.add_css_class("app-titlebar")
