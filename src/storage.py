@@ -104,14 +104,14 @@ class ChatStore:
         self.ensure()
         _write_json(self.root.parent / "app-settings.json", settings)
 
-    def load(self, chat_id):
+    def load(self, chat_id, *, history=True):
         settings = self.load_settings(chat_id)
         data = {"id": chat_id, "title": "New chat", "created": settings["created"], "messages": []}
         for key in ("title", "created", "updated", "inference_stats"):
             if key in settings:
                 data[key] = settings[key]
         path = self.folder(chat_id) / "chat-history.sqlite"
-        if path.exists():
+        if history and path.exists():
             with closing(sqlite3.connect(path)) as connection:
                 data["messages"] = [
                     json.loads(message)
@@ -121,8 +121,13 @@ class ChatStore:
                 ]
         return data
 
-    def save(self, data):
+    def save(self, data, *, message_start=0):
         chat_id = data["id"]
+        if not 0 <= message_start <= len(data["messages"]):
+            raise ValueError("Invalid first message position")
+        history_path = self.folder(chat_id) / "chat-history.sqlite"
+        if not history_path.exists():
+            message_start = 0
         self.documents(chat_id).mkdir(parents=True, exist_ok=True)
         settings_path = self.folder(chat_id) / "chat-settings.json"
         try:
@@ -134,7 +139,7 @@ class ChatStore:
         )
         # Keep each message's optional fields without duplicating conversation data in settings.
         with (
-            closing(sqlite3.connect(self.folder(chat_id) / "chat-history.sqlite")) as connection,
+            closing(sqlite3.connect(history_path)) as connection,
             connection,
         ):
             connection.execute(
@@ -147,7 +152,7 @@ class ChatStore:
                 "WHERE messages.message != excluded.message",
                 (
                     (index, json.dumps(message, ensure_ascii=False))
-                    for index, message in enumerate(data["messages"])
+                    for index, message in enumerate(data["messages"][message_start:], message_start)
                 ),
             )
             connection.execute("DELETE FROM messages WHERE position >= ?", (len(data["messages"]),))
@@ -166,7 +171,7 @@ class ChatStore:
         self.ensure()
         with os.scandir(self.root) as entries:
             chats = [
-                self.load(entry.name)
+                self.load(entry.name, history=False)
                 for entry in entries
                 if entry.is_dir() and (Path(entry.path) / "chat-history.sqlite").exists()
             ]
@@ -195,7 +200,7 @@ class ChatStore:
 
     def add_documents(self, chat_id, paths):
         folder = self.documents(chat_id)
-        folder.mkdir(parents=True, exist_ok=True)
+        folder.mkdir(exist_ok=True)
         for path in map(Path, paths):
             if not path.is_file():
                 continue

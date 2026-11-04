@@ -3,6 +3,7 @@
 import ast
 import codecs
 import hashlib
+import itertools
 import logging
 import math
 import queue
@@ -31,7 +32,8 @@ class DocumentIndexer:
             "questions-v1:"
             + hashlib.sha256(f"{settings.server_url}:{settings.model}".encode()).hexdigest()
         )
-        self._queue = queue.Queue()
+        self._queue = queue.PriorityQueue()
+        self._sequence = itertools.count()
         self._pending = {}
         self._active = None
         self._lock = threading.Lock()
@@ -43,13 +45,15 @@ class DocumentIndexer:
                 self._revision += 1
                 self.enabled, self.active_folder = enabled, folder
 
-    def schedule(self, folder):
+    def schedule(self, folder, *, priority=False):
         with self._lock:
-            if folder in self._pending:
+            ready = self._pending.get(folder)
+            if ready is not None and not priority:
                 return
-            ready = threading.Event()
-            self._pending[folder] = ready
-            self._queue.put((folder, ready))
+            if ready is None:
+                ready = threading.Event()
+                self._pending[folder] = ready
+            self._queue.put((not priority, next(self._sequence), folder, ready))
 
     def wait(self, folder, stopped):
         """Wait for this chat's already-scheduled pass, without starting another scan."""
@@ -63,9 +67,12 @@ class DocumentIndexer:
 
     def _run(self):
         while True:
-            folder, ready = self._queue.get()
+            _priority, _sequence, folder, ready = self._queue.get()
             # Allow a follow-up check if files change during this indexing pass.
             with self._lock:
+                if self._pending.get(folder) is not ready:
+                    self._queue.task_done()  # Discard an older entry after priority promotion.
+                    continue
                 self._pending.pop(folder)
                 self._active = folder, ready
             try:

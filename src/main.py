@@ -639,6 +639,7 @@ class ChatController:
         self._generation_context_used = None
         self._chat_speeds = {}
         self._drafts = {}
+        self._document_imports = {}
         self._thinking_levels = []
         self._disk_sizes, self._disk_total = {}, None
         self.connected = None
@@ -787,7 +788,7 @@ class ChatController:
             return
         chat = self.store.load(chat_id)
         chat["title"] = title.strip()
-        self.store.save(chat)
+        self.store.save(chat, message_start=len(chat["messages"]))
         if self.chat and self.chat["id"] == chat_id:
             self.chat = chat
             self.view.set_chat_title(chat["title"])
@@ -844,6 +845,31 @@ class ChatController:
         self._drafts.pop(chat_id, None)
 
     def add_documents(self, paths):
+        chat_id = self.chat["id"]
+        ready = threading.Event()
+        self._document_imports[chat_id] = (*self._document_imports.get(chat_id, ()), ready)
+        threading.Thread(
+            target=self._import_documents, args=(list(paths), chat_id, ready), daemon=True
+        ).start()
+
+    def _import_documents(self, paths, chat_id, ready):
+        try:
+            self._add_documents(paths, chat_id)
+        finally:
+            ready.set()
+            self.view.dispatch(self._import_finished, chat_id, ready)
+
+    def _import_finished(self, chat_id, ready):
+        remaining = tuple(
+            item for item in self._document_imports.get(chat_id, ()) if item is not ready
+        )
+        if remaining:
+            self._document_imports[chat_id] = remaining
+        else:
+            self._document_imports.pop(chat_id, None)
+        return False
+
+    def _add_documents(self, paths, chat_id):
         supported, skipped = [], []
         for path in map(Path, paths):
             if read_document(path) is None:
@@ -852,13 +878,13 @@ class ChatController:
                 supported.append(path)
         if supported:
             try:
-                self.store.add_documents(self.chat["id"], supported)
-                self.document_indexer.schedule(self.store.documents(self.chat["id"]))
-                self.view.notify("Documents added to this chat's folder")
+                self.store.add_documents(chat_id, supported)
+                self.document_indexer.schedule(self.store.documents(chat_id))
+                self.view.dispatch(self.view.notify, "Documents added to this chat's folder")
             except OSError as exc:
-                self.view.notify(f"Could not add documents: {exc}")
+                self.view.dispatch(self.view.notify, f"Could not add documents: {exc}")
         if skipped:
-            self.view.show_document_warning(skipped)
+            self.view.dispatch(self.view.show_document_warning, skipped)
 
     def open_folder(self, chat_id):
         try:
@@ -922,7 +948,7 @@ class ChatController:
         self.chat["updated"] = timestamp
         if self.chat["title"] == "New chat":
             self.chat["title"] = text[:42].strip() + ("…" if len(text) > 42 else "")
-        self.store.save(self.chat)
+        self.store.save(self.chat, message_start=len(self.chat["messages"]) - 1)
         self.refresh()
         self.view.set_chat_title(self.chat["title"])
         self.view.append_message("user", text, timestamp=timestamp)
@@ -949,12 +975,21 @@ class ChatController:
                 self.store.documents(self.chat["id"]),
                 self.settings.enable_command_approval,
                 self.rag_query_expansion,
+                self._document_imports.get(self.chat["id"], ()),
             ),
             daemon=True,
         ).start()
 
-    def _stream(self, messages, preserve_thinking, query, folder, agent_mode, query_expansion):
-        self.document_indexer.schedule(folder)
+    def _stream(
+        self, messages, preserve_thinking, query, folder, agent_mode, query_expansion, imports=()
+    ):
+        # A prompt submitted during copying waits off the GTK thread for those files.
+        for ready in imports:
+            while not ready.wait(0.1):
+                if self.stop_requested:
+                    self.view.dispatch(self.finish_response, "", "", None)
+                    return
+        self.document_indexer.schedule(folder, priority=True)
         self.document_indexer.wait(folder, lambda: self.stop_requested)
         # Never hold the model lock while waiting for an indexer that needs it.
         while not self.stop_requested:
@@ -1201,7 +1236,7 @@ class ChatController:
         if self._generation_context_used is not None:
             chat.setdefault("inference_stats", {})["context_used"] = self._generation_context_used
         chat["updated"] = time.time()
-        self.store.save(chat)
+        self.store.save(chat, message_start=len(chat["messages"]) - 1)
         self.refresh()
         self.busy = False
         if self.chat["id"] == chat["id"]:
@@ -1212,13 +1247,27 @@ class ChatController:
     def commands_in(self, text):
         return extract_commands(text) if self.settings.enable_command_approval else []
 
-    def review_command(self, command):
-        risks = scan_command(command, self.store.folder(self.chat["id"]), self.settings)
+    def review_command(self, command, cwd=None):
+        cwd = self.store.folder(self.chat["id"]) if cwd is None else cwd
+        risks = scan_command(command, cwd, self.settings)
         file_write = parse_file_heredoc(command)
         if file_write:
             return "file", file_write, risks
         args, error = prepare_command(command)
         return ("error", error, risks) if error else ("command", args, risks)
+
+    def review_command_async(self, command, callback):
+        cwd = self.store.folder(self.chat["id"])
+
+        def inspect():
+            try:
+                result = self.review_command(command, cwd)
+            except Exception as exc:
+                self.view.dispatch(callback, None, str(exc))
+            else:
+                self.view.dispatch(callback, result, None)
+
+        threading.Thread(target=inspect, daemon=True).start()
 
     def create_file(self, path, contents):
         try:

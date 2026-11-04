@@ -557,6 +557,9 @@ class HorizontalScrollFrame(Gtk.Frame):
         self.overlay.add_overlay(self.bar)
         self.overlay.set_clip_overlay(self.bar, True)
         self.set_child(self.overlay)
+        self._line_widths = {}
+        self._width_signature = None
+        self._content_line_width = None
         self._scroll_connections = []
         self._outer_scroll = None
         self.connect("map", self._connect_scrollbar)
@@ -569,6 +572,24 @@ class HorizontalScrollFrame(Gtk.Frame):
         """Scroll at the content's bounded natural width instead of wrapping to the bubble."""
         if child is None:
             child = self.scroll.get_child().get_child()
+        if isinstance(child, CodeLabel):
+            context = child.get_pango_context()
+            signature = (context.get_serial(), context.get_font_description().to_string())
+            previous = self._line_widths if signature == self._width_signature else {}
+            widths = {}
+            for line in set(child.get_text().split("\n")):
+                widths[line] = (
+                    previous[line]
+                    if line in previous
+                    else child.create_pango_layout(line).get_pixel_size()[0]
+                )
+            widest = max(widths.values(), default=0)
+            unchanged = signature == self._width_signature and widest == self._content_line_width
+            self._line_widths, self._width_signature = widths, signature
+            self._content_line_width = widest
+            if unchanged:
+                return
+        # GTK still determines the exact width/cap whenever the widest line changes.
         child.set_size_request(-1, -1)
         child.set_size_request(child.measure(Gtk.Orientation.HORIZONTAL, -1)[1], -1)
 
@@ -901,6 +922,9 @@ class ChatWindow(Adw.ApplicationWindow):
         self.follow_output = True
         self.current_wrapper = self.current_answer = self.current_thinking = None
         self.context_capacity = self.context_used = self.tokens_per_second = None
+        self._review_pending = False
+        self._stream_updates = {}
+        self._stream_update_id = None
         self._thinking_pending = []
         self._thinking_flush_id = None
         self._inband_thinking = ""
@@ -1195,7 +1219,37 @@ class ChatWindow(Adw.ApplicationWindow):
             self._show_alert("Could not save thinking setting", str(exc))
 
     def dispatch(self, callback, *args):
-        GLib.idle_add(callback, *args)
+        if callback in (self.update_answer, self.controller._update_inference_stats):
+            GLib.idle_add(self._queue_stream_update, callback, args)
+        elif callback == self.controller.finish_response:
+            GLib.idle_add(self._finish_stream_update, callback, args)
+        else:
+            GLib.idle_add(callback, *args)
+
+    def _queue_stream_update(self, callback, args):
+        if callback == self.controller._update_inference_stats and callback in self._stream_updates:
+            args = tuple(
+                new if new is not None else old
+                for new, old in zip(args, self._stream_updates[callback], strict=True)
+            )
+        self._stream_updates[callback] = args
+        if self._stream_update_id is None:
+            self._stream_update_id = GLib.timeout_add(50, self._flush_stream_updates)
+        return False
+
+    def _flush_stream_updates(self):
+        self._stream_update_id = None
+        updates, self._stream_updates = self._stream_updates, {}
+        for callback, args in updates.items():
+            callback(*args)
+        return False
+
+    def _finish_stream_update(self, callback, args):
+        if self._stream_update_id is not None:
+            GLib.source_remove(self._stream_update_id)
+        self._flush_stream_updates()
+        callback(*args)
+        return False
 
     def prompt_text(self, strip=True):
         buffer = self.prompt.get_buffer()
@@ -1375,6 +1429,24 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def show_sidebar(self, chats, active_id):
         self._clear_drop_indicator()
+        signature = (
+            self.controller.chat_sort,
+            tuple(
+                (chat["id"], chat.get("title", "New chat"), chat.get("pinned", False))
+                for chat in chats
+            ),
+        )
+        if signature == getattr(self, "_sidebar_signature", None):
+            self._dragged_row = None
+            for row in self._chat_rows:
+                active = row.chat_id == active_id
+                if active:
+                    row.add_css_class("active-chat")
+                    self.chat_list.select_row(row)
+                else:
+                    row.remove_css_class("active-chat")
+            return
+        self._sidebar_signature = signature
         self._chat_rows = []
         self._dragged_row = None
         while (child := self.chat_list.get_first_child()) is not None:
@@ -1559,7 +1631,9 @@ class ChatWindow(Adw.ApplicationWindow):
                 message.get("content", ""),
                 message.get("reasoning_content", ""),
                 message["timestamp"],
+                refresh_dates=False,
             )
+        self._refresh_message_dates()
         first = self.transcript.get_first_child()
         if first is not None:
             first.set_opacity(1)
@@ -1591,11 +1665,12 @@ class ChatWindow(Adw.ApplicationWindow):
             separator.set_margin_bottom(6)
             separator.set_opacity(0 if previous is None else 1)
             self.transcript.append(separator)
-        self._refresh_message_dates()
 
-    def append_message(self, role, text, reasoning="", timestamp=None):
+    def append_message(self, role, text, reasoning="", timestamp=None, *, refresh_dates=True):
         timestamp = datetime.now().timestamp() if timestamp is None else timestamp
         self._append_message_day(timestamp)
+        if refresh_dates:
+            self._refresh_message_dates()
         row = Gtk.Box()
         row.set_layout_manager(BubbleLayout(role == "user"))
         row.add_css_class("message-row")
@@ -2206,8 +2281,28 @@ class ChatWindow(Adw.ApplicationWindow):
         )
         self._show_alert("Some documents could not be added", detail)
 
-    def _review_command(self, _button, command):
-        kind, payload, risks = self.controller.review_command(command)
+    def _review_command(self, button, command):
+        if self._review_pending:
+            self.notify("Command review already in progress.")
+            return
+        self._review_pending = True
+        chat_id = self.chat["id"]
+        button.set_sensitive(False)
+
+        def reviewed(result, error):
+            self._review_pending = False
+            button.set_sensitive(True)
+            if error:
+                self._show_alert("Could not inspect command", error)
+            elif self.chat["id"] != chat_id:
+                self.notify("Chat changed; review the command again.")
+            else:
+                self._command_reviewed(command, result)
+
+        self.controller.review_command_async(command, reviewed)
+
+    def _command_reviewed(self, command, result):
+        kind, payload, risks = result
         if kind == "file":
             path, contents = payload
             self._show_command_approval(

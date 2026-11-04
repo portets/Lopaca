@@ -223,7 +223,12 @@ class DocumentFiles:
         matches, scanned, size = [], 0, 0
         deadline = time.monotonic() + 2
         needle = query if case_sensitive else query.casefold()
-        for directory, folders, files in os.walk(self.root, followlinks=False):
+        entries = (
+            os.walk(self.root, followlinks=False)
+            if any(char in pattern for char in "*?[")
+            else [(self.root, [], [pattern])]
+        )
+        for directory, folders, files in entries:
             if time.monotonic() > deadline:
                 return {"matches": matches[:20], "truncated": True, "files_scanned": scanned}
             folders[:] = sorted(
