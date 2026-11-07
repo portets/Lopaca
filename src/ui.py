@@ -489,7 +489,13 @@ class ChatWindow(Adw.ApplicationWindow):
         self.send_button.add_css_class("suggested-action")
         self.send_button.set_valign(Gtk.Align.END)
         self.send_button.connect(
-            "clicked", lambda *_: self.controller.stop() if self.busy else self._send()
+            "clicked",
+            lambda *_: (
+                self.controller.stop()
+                if self.busy
+                and (not self.prompt_text() or self.chat["id"] != self._response_chat_id)
+                else self._send()
+            ),
         )
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         hint = Gtk.Label(label="Enter for a new line · Ctrl+Enter to send", xalign=0)
@@ -701,9 +707,20 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def _prompt_changed(self):
         self.send_button.set_sensitive(self.busy or bool(self.prompt_text()))
+        if self.busy:
+            steering = bool(self.prompt_text()) and self.chat["id"] == self._response_chat_id
+            self.send_button.set_icon_name(
+                "go-up-symbolic" if steering else "window-close-symbolic"
+            )
+            self.send_button.set_tooltip_text(
+                "Interrupt and send" if steering else "Stop generation"
+            )
 
     def _send(self):
-        if self.busy:
+        if self.busy and (
+            self.chat["id"] != self._response_chat_id
+            or self.controller._pending_steering is not None
+        ):
             return
         text = self.prompt_text()
         if text:
@@ -1017,12 +1034,15 @@ class ChatWindow(Adw.ApplicationWindow):
             separator.set_opacity(0 if previous is None else 1)
             self.transcript.append(separator)
 
-    def append_message(self, role, text, reasoning="", timestamp=None, *, refresh_dates=True):
+    def append_message(
+        self, role, text, reasoning="", timestamp=None, *, refresh_dates=True, attach=True
+    ):
         if role == "assistant":
             text = self.controller.visible_answer(text)
         timestamp = datetime.now().timestamp() if timestamp is None else timestamp
-        self._append_message_day(timestamp)
-        if refresh_dates:
+        if attach:
+            self._append_message_day(timestamp)
+        if refresh_dates and attach:
             self._refresh_message_dates()
         row = Gtk.Box()
         row.set_layout_manager(BubbleLayout(role == "user"))
@@ -1051,8 +1071,9 @@ class ChatWindow(Adw.ApplicationWindow):
         if text:
             extractor = self.controller.commands_in if role == "assistant" else None
             append_markdown(wrapper, text, extractor, self._review_command)
-        self.transcript.append(row)
-        if role == "user":
+        if attach:
+            self.transcript.append(row)
+        if role == "user" and attach:
             self.scroll_bottom(force=True)
         return wrapper
 
@@ -1117,7 +1138,7 @@ class ChatWindow(Adw.ApplicationWindow):
         body.tail_text = ""
         self._append_thinking_body(body, text)
 
-    def begin_response(self, timestamp=None):
+    def begin_response(self, timestamp=None, *, chat_id=None):
         self.busy = True
         self.send_button.set_sensitive(True)
         self.send_button.set_icon_name("window-close-symbolic")
@@ -1125,7 +1146,10 @@ class ChatWindow(Adw.ApplicationWindow):
         self.send_button.remove_css_class("suggested-action")
         self.send_button.add_css_class("destructive-action")
         self.set_status("Waiting")
-        self.current_wrapper = self.append_message("assistant", "", timestamp=timestamp)
+        chat_id = chat_id or self.chat["id"]
+        self.current_wrapper = self.append_message(
+            "assistant", "", timestamp=timestamp, attach=chat_id == self.chat["id"]
+        )
         self.current_answer = MarkdownText()
         self.current_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.current_content.append(self.current_answer)
@@ -1134,9 +1158,11 @@ class ChatWindow(Adw.ApplicationWindow):
         self._stream_code = None
         self._thinking_collapsed = False
         self.current_thinking = None
-        self.scroll_bottom(True)
+        if chat_id == self.chat["id"]:
+            self.scroll_bottom(True)
         self._response_row = self.current_wrapper.message_row
-        self._response_chat_id = self.chat["id"]
+        self._response_chat_id = chat_id
+        self._prompt_changed()
 
     def update_thinking(self, text):
         if text:

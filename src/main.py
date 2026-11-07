@@ -101,6 +101,7 @@ class ChatController:
         self.chat_sort = settings.chat_sort
         self.view = self.chat = None
         self.busy = self.stop_requested = self.updating_memories = False
+        self._pending_steering = None
         self._generation_chat_id = None
         self._generation_context_used = None
         self._generation_clarification = None
@@ -201,9 +202,9 @@ class ChatController:
         key, _, _ = self.thinking_choices()
         self.set_setting(key, value, self.chat["id"])
 
-    def thinking_parameters(self):
+    def thinking_parameters(self, chat_id=None):
         key, _, choices = self.thinking_choices()
-        value = self.get_chat_settings(self.chat["id"]).get(key)
+        value = self.get_chat_settings(chat_id or self.chat["id"]).get(key)
         if value is None or value not in [choice for choice, _ in choices]:
             return None
         return thinking_parameters(value)
@@ -430,55 +431,71 @@ class ChatController:
     def set_memory_core(self, memory_id, core):
         self.memories.set_core(memory_id, core)
 
-    def send(self, text):
-        if self.busy or not self.chat:
+    def send(self, text, chat_id=None, *, steering=False):
+        if not self.chat:
             return
         text = text.strip()
         if not text:
             return
-        self._drafts.pop(self.chat["id"], None)
-        previous = self.chat["messages"][-1] if self.chat["messages"] else {}
+        chat_id = chat_id or self.chat["id"]
+        if self.busy:
+            if chat_id == self._generation_chat_id and self._pending_steering is None:
+                self._pending_steering = text
+                self.stop()
+            return
+        chat = self.chat if chat_id == self.chat["id"] else self.store.load(chat_id)
+        settings = self.get_chat_settings(chat_id)
+        preserve_thinking = settings["preserve_reasoning"] is True
+        self._drafts.pop(chat_id, None)
+        previous = chat["messages"][-1] if chat["messages"] else {}
         self._generation_clarification = (
             previous["content"]
             if previous.get("role") == "assistant" and previous.get("memory_clarification")
             else None
         )
         timestamp = time.time()
-        self.chat["messages"].append({"role": "user", "content": text, "timestamp": timestamp})
-        self.chat["updated"] = timestamp
-        if self.chat["title"] == "New chat":
-            self.chat["title"] = text[:42].strip() + ("…" if len(text) > 42 else "")
-        self.store.save(self.chat, message_start=len(self.chat["messages"]) - 1)
+        chat["messages"].append({"role": "user", "content": text, "timestamp": timestamp})
+        chat["updated"] = timestamp
+        if chat["title"] == "New chat":
+            chat["title"] = text[:42].strip() + ("…" if len(text) > 42 else "")
+        self.store.save(chat, message_start=len(chat["messages"]) - 1)
         self.refresh()
-        self.view.set_chat_title(self.chat["title"])
-        self.view.append_message("user", text, timestamp=timestamp)
+        if chat_id == self.chat["id"]:
+            self.view.set_chat_title(chat["title"])
+            self.view.append_message("user", text, timestamp=timestamp)
         messages = []
-        for message in self.chat["messages"]:
+        for message in chat["messages"]:
             content = message.get("content", "")
             if message["role"] == "assistant":
                 content = self.visible_answer(content)
             item = {"role": message["role"], "content": content}
-            if self.preserve_thinking and message.get("reasoning_content"):
+            if preserve_thinking and message.get("reasoning_content"):
                 item["reasoning_content"] = message["reasoning_content"]
             messages.append(item)
-        self._generation_chat_id = self.chat["id"]
+        if steering:
+            messages[-1]["content"] += (
+                "\n\n[Application context: the preceding assistant turn was interrupted by the "
+                "user. Its output and reasoning are incomplete. Follow the new instructions; "
+                "reconsider unfinished reasoning and avoid repeating text already provided.]"
+            )
+        self._generation_chat_id = chat_id
         self._generation_context_used = None
-        self._generation_thinking = self.thinking_parameters()
+        self._generation_thinking = self.thinking_parameters(chat_id)
         self._generation_thinking_options = auto_thinking_options(tuple(self._thinking_levels))
         self.busy = True
         self.stop_requested = False
         self._generation_timestamp = time.time()
-        self.view.begin_response(self._generation_timestamp)
+        self.view.begin_response(self._generation_timestamp, chat_id=chat_id)
         threading.Thread(
             target=self._stream,
             args=(
                 messages,
-                self.preserve_thinking,
+                preserve_thinking,
                 text,
-                self.store.documents(self.chat["id"]),
+                self.store.documents(chat_id),
                 self.settings.enable_command_approval,
-                self.rag_query_expansion,
-                self._document_imports.get(self.chat["id"], ()),
+                settings["rag_query_expansion"] is True,
+                self._document_imports.get(chat_id, ()),
             ),
             daemon=True,
         ).start()
@@ -685,6 +702,13 @@ class ChatController:
 
     def finish_response(self, answer, reasoning, error, finished_at=None, clarification=False):
         answer = self.visible_answer(answer)
+        steering = self._pending_steering
+        self._pending_steering = None
+        if steering is not None:
+            phase = "Response" if answer.strip() else "Thinking" if reasoning.strip() else "Request"
+            answer = answer.rstrip() + f"\n\n*{phase} interrupted by user.*"
+            error = None
+            clarification = False
         finished_at = time.time() if finished_at is None else finished_at
         if error and "token or context limit" not in error:
             self._connection_changed(False)
@@ -729,6 +753,8 @@ class ChatController:
             self.view.finish_response(answer, reasoning)
         else:
             self.view.end_response()
+        if steering is not None:
+            self.send(steering, chat["id"], steering=True)
 
     def commands_in(self, text):
         return extract_commands(text) if self.settings.enable_command_approval else []
