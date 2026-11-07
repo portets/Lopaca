@@ -1018,6 +1018,8 @@ class ChatWindow(Adw.ApplicationWindow):
             self.transcript.append(separator)
 
     def append_message(self, role, text, reasoning="", timestamp=None, *, refresh_dates=True):
+        if role == "assistant":
+            text = self.controller.visible_answer(text)
         timestamp = datetime.now().timestamp() if timestamp is None else timestamp
         self._append_message_day(timestamp)
         if refresh_dates:

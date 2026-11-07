@@ -8,7 +8,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from agentic import FILE_TOOLS, RUNTIME_TOOLS, ChatFiles, handle_tool_call
-from memory import VIEW_MEMORIES_TOOL
+from memory import VIEW_MEMORIES_TOOL, memory_review
 from rag import (
     DOCUMENT_QUESTIONS_INSTRUCTION,
     QUERY_EXPANSION_GRAMMAR,
@@ -299,7 +299,7 @@ class LlamaClient:
             history.append(
                 {
                     "role": "assistant",
-                    "content": part or None,
+                    "content": memory_review(part)[0] or None,
                     "reasoning_content": thought,
                     "tool_calls": calls,
                 }
@@ -321,7 +321,7 @@ class LlamaClient:
                         "content": output,
                     }
                 )
-            answer = answer.rstrip()
+            answer = memory_review(answer)[0].rstrip()
             if answer:
                 answer += "\n\n"
             if reasoning:

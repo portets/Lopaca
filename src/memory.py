@@ -15,8 +15,9 @@ MEMORY_INSTRUCTION = (
     "pronouns from the conversation. Distinguish liking, using and knowing something; "
     "preserve any stated proficiency. Memory review is enabled and authorized. Respond "
     "normally in the selected style. Every completed answer MUST end with exactly one "
-    "hidden review decision on its own line: <memory-review>yes</memory-review> or "
-    "<memory-review>no</memory-review>. Never omit this ending, even for greetings or "
+    "hidden review decision on its own line: <memory-review>yes</memory-review>, "
+    "<memory-review>no</memory-review>, <memory-review>clarify</memory-review>, or "
+    "<memory-review>yes_clarify</memory-review>. Never omit this ending, even for greetings or "
     "messages with nothing to save. Before ending, check whether the current user message "
     "supplies durable personal facts, preferences, corrections or a request to forget. If "
     "so, choose yes. The separate editor handles duplicates and actual changes, so yes is "
@@ -30,7 +31,31 @@ MEMORY_INSTRUCTION = (
     "information that would materially improve the answer, including personalized creative "
     "work. Use supplied facts first; do not browse for ordinary general-knowledge questions "
     "or merely to prepare edits: the private editor already sees all memories. Browse at most "
-    "once per reply. Do not announce retrieval or expose memory IDs."
+    "once per reply. Do not announce retrieval or expose memory IDs. Never reproduce "
+    "application reference blocks, their JSON, or invented memory-operation markup. "
+    "After a tool result, continue your answer rather than restarting it."
+)
+
+MEMORY_INSTRUCTION += (
+    " Exception to the relevance-only and no-memory-housekeeping instructions above: after "
+    "view_memories, check the supplied facts for incompatible claims about the same "
+    "current attribute. If a clear conflict exists, you MUST append one brief neutral "
+    "clarification question after answering the user's request, even when the conflict is "
+    "unrelated. Ask about the fact itself, without mentioning databases, memory IDs or "
+    "internal operations. Do not ask about compatible facts, different historical periods, "
+    "equivalent wording or sensitive details unrelated to this conversation. Do not change "
+    "records or emit a yes review decision just because of a conflict: wait for the user's "
+    "clarification. An explicitly confirmed relationship between facts settles that "
+    "apparent conflict. Respect that relationship; do not ask again without new "
+    "conflicting information. If your visible answer asks the user to resolve conflicting "
+    "saved personal facts, end with <memory-review>clarify</memory-review> INSTEAD of yes "
+    "or no. Lopaca will remember the question and privately review the next user reply, "
+    "even if you then choose no. The clarify decision does not edit anything now. Ordinary "
+    "conversational questions are not memory clarification. Otherwise retain the ordinary "
+    "yes/no decisions. Do not ask again about a relationship already explicitly confirmed "
+    "in the supplied records. If the same user message also supplies facts needing an "
+    "ordinary edit, use yes_clarify instead of clarify to request that edit and remember "
+    "the question together."
 )
 
 # Lopaca reads the database; the model receives facts, never SQL or filesystem access.
@@ -88,6 +113,36 @@ MEMORY_EDIT_INSTRUCTION = (
     "current_user, never a quote or concatenation from older messages."
 )
 
+MEMORY_CLARIFICATION_INSTRUCTION = (
+    (
+        "When the current user resolves an apparent conflict, replace the relevant conflicting "
+        "records with one self-contained record that explicitly states their confirmed "
+        "relationship or current choice. For confirmed coexistence, combine the facts into "
+        "that record and delete the other records fully covered by it. Separate component "
+        "records alone do not preserve the clarification. Do not rewrite records outside that "
+        "clarified relationship. "
+    )
+    + MEMORY_EDIT_INSTRUCTION.replace(
+        "Do not rewrite or duplicate records already covering the same fact.",
+        "Avoid redundant changes unless a clarification resolves a previously "
+        "unstated relationship.",
+    )
+    + (
+        " A user-confirmed relationship between known facts is itself new information. Resolve "
+        "brief clarification replies using the recent question. Preserve the confirmed "
+        "relationship explicitly in self-contained memory text, not just the separate "
+        "component facts. Update or merge overlapping records when necessary, deleting only "
+        "records made redundant by that same supported change. Do not add a redundant summary "
+        "when existing records already state the relationship. Preserve qualifications and "
+        "unrelated facts. Evidence still quotes only the current reply, including a short "
+        "answer whose meaning comes from the question. Input pending_clarification is the "
+        "assistant question the user may now be answering, not evidence. If the current reply "
+        "ignores, declines or ambiguously acknowledges that question, leave the unresolved "
+        "records unchanged. Do not infer an answer from the question. Still process unrelated "
+        "new durable user facts normally."
+    )
+)
+
 MEMORY_GRAMMAR = r"""answer ::= "[" ws (operation (ws "," ws operation){0,7})? ws "]"
 operation ::= add | update | delete
 add ::= "{\"action\":\"add\",\"text\":" string ",\"kind\":" kind ",\"search_terms\":" string ",\"evidence\":" string "}"
@@ -138,34 +193,73 @@ def memory_context(rows):
     return core, casual
 
 
+def _fence_after(line, fence):
+    match = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+    if match:
+        marker, rest = match.groups()
+        if fence is None:
+            return marker
+        if marker[0] == fence[0] and len(marker) >= len(fence) and not rest.strip():
+            return None
+    return fence
+
+
+def _without_memory_references(text):
+    """Remove reserved internal blocks and their partial streams, preserving Markdown code."""
+    opening = "<lopaca-memory-references>"
+    closing = "</lopaca-memory-references>"
+    tail = text.rsplit("\n", 1)[-1].lstrip()
+    if opening not in text and not (tail and opening.startswith(tail)):
+        return text
+    parts, fence, hidden = [], None, False
+    for line in text.splitlines(keepends=True):
+        if hidden:
+            end = line.find(closing)
+            if end < 0:
+                continue
+            hidden = False
+            line = line[end + len(closing) :]
+            if not line.strip():
+                continue
+        stripped = line.lstrip(" ")
+        if fence is None and len(line) - len(stripped) <= 3:
+            candidate = stripped.rstrip()
+            if candidate == opening:
+                while parts and not parts[-1].strip():
+                    parts.pop()
+                hidden = True
+                continue
+            if candidate and opening.startswith(candidate):
+                continue
+        fence = _fence_after(line, fence)
+        parts.append(line)
+    return "".join(parts)
+
+
 def memory_review(text):
     """Hide complete or still-streaming terminal review decisions outside fenced code."""
-    trimmed = text.rstrip()
+    trimmed = _without_memory_references(text).rstrip()
     before, newline, tail = trimmed.rpartition("\n")
     candidate = tail.lstrip()
-    endings = ("<memory-review>yes</memory-review>", "<memory-review>no</memory-review>")
+    choices = ("yes", "no", "clarify", "yes_clarify")
+    endings = tuple(f"<memory-review>{choice}</memory-review>" for choice in choices)
     if (
         not candidate
         or len(tail) - len(candidate) > 3
         or tail.startswith("\t")
         or not any(ending.startswith(candidate) for ending in endings)
     ):
-        return trimmed, False
+        return trimmed, None
     fence = None
     for line in before.splitlines():
-        match = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
-        if match:
-            marker, rest = match.groups()
-            if fence is None:
-                fence = marker
-            elif marker[0] == fence[0] and len(marker) >= len(fence) and not rest.strip():
-                fence = None
+        fence = _fence_after(line, fence)
     if fence is not None:
-        return trimmed, False
-    return (before.rstrip() if newline else ""), candidate == endings[0]
+        return trimmed, None
+    decision = choices[endings.index(candidate)] if candidate in endings else None
+    return (before.rstrip() if newline else ""), decision
 
 
-def edit_memories(client, store, query, history, chat_id, *, enabled):
+def edit_memories(client, store, query, history, chat_id, *, enabled, pending_clarification=None):
     """Run one private constrained edit, rechecking cancellation/settings before writing."""
     if not enabled():
         return
@@ -175,8 +269,13 @@ def edit_memories(client, store, query, history, chat_id, *, enabled):
         "recent_messages": history,
         "current_user": query,
     }
+    if pending_clarification is not None:
+        # The brief question follows the answer; do not resend a long answer in full.
+        payload["pending_clarification"] = pending_clarification[-1000:]
     output = client._complete(
-        MEMORY_EDIT_INSTRUCTION,
+        MEMORY_CLARIFICATION_INSTRUCTION
+        if pending_clarification is not None
+        else MEMORY_EDIT_INSTRUCTION,
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         client.settings.memory_edit_output_tokens,
         client.settings.request_timeout,

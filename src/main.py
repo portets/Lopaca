@@ -24,7 +24,7 @@ from settings import CHAT_SETTING_DEFAULTS, Settings
 from storage import ChatStore, MemoryStore
 
 
-def build_system_prompt(agent_mode, style="neutral"):
+def build_system_prompt(agent_mode, style="neutral", *, memories=False):
     prompt = (
         "You are a helpful assistant. Answer clearly. "
         "Use Markdown formatting when it improves readability. "
@@ -49,6 +49,12 @@ def build_system_prompt(agent_mode, style="neutral"):
         "discuss earlier values as historical conversation "
         "facts when asked."
     )
+    if memories:
+        prompt = prompt.replace(
+            "document and memory context only when relevant;",
+            "document context only when relevant; memory context may also support "
+            "a brief question clarifying an unrelated conflicting personal fact;",
+        )
     if agent_mode:
         prompt += CODING_INSTRUCTION
     if style != "neutral":
@@ -89,6 +95,7 @@ class ChatController:
         self.busy = self.stop_requested = self.updating_memories = False
         self._generation_chat_id = None
         self._generation_context_used = None
+        self._generation_clarification = None
         self._chat_speeds = {}
         self._drafts = {}
         self._document_imports = {}
@@ -422,6 +429,12 @@ class ChatController:
         if not text:
             return
         self._drafts.pop(self.chat["id"], None)
+        previous = self.chat["messages"][-1] if self.chat["messages"] else {}
+        self._generation_clarification = (
+            previous["content"]
+            if previous.get("role") == "assistant" and previous.get("memory_clarification")
+            else None
+        )
         timestamp = time.time()
         self.chat["messages"].append({"role": "user", "content": text, "timestamp": timestamp})
         self.chat["updated"] = timestamp
@@ -433,7 +446,10 @@ class ChatController:
         self.view.append_message("user", text, timestamp=timestamp)
         messages = []
         for message in self.chat["messages"]:
-            item = {"role": message["role"], "content": message.get("content", "")}
+            content = message.get("content", "")
+            if message["role"] == "assistant":
+                content = self.visible_answer(content)
+            item = {"role": message["role"], "content": content}
             if self.preserve_thinking and message.get("reasoning_content"):
                 item["reasoning_content"] = message["reasoning_content"]
             messages.append(item)
@@ -483,6 +499,8 @@ class ChatController:
         self.view.dispatch(self.finish_response, "", "", None)
 
     def _respond(self, messages, preserve_thinking, query, folder, agent_mode, query_expansion):
+        pending = self._generation_clarification
+        self._generation_clarification = None
         retrieved = []
         history = messages[:-1]
         thinking_parameters_for_reply = self._generation_thinking
@@ -513,7 +531,7 @@ class ChatController:
 
         def answer_changed(text):
             nonlocal last_answer
-            visible = memory_review(text)[0] if memory_enabled else text
+            visible = self.visible_answer(text)
             if visible != last_answer:
                 self.view.dispatch(self.view.update_answer, visible)
                 last_answer = visible
@@ -566,6 +584,7 @@ class ChatController:
                 "content": build_system_prompt(
                     agent_mode,
                     generation_settings["conversation_style"],
+                    memories=memory_enabled,
                 )
                 + core_context,
             },
@@ -596,9 +615,17 @@ class ChatController:
         )
         finished_at = time.time()
 
+        clarification = False
         if memory_enabled:
             answer, review = memory_review(answer)
-            if review and not error and memories_enabled():
+            clarification = (
+                review in ("clarify", "yes_clarify") and not error and memories_enabled()
+            )
+            if (
+                (review in ("yes", "yes_clarify") or pending is not None)
+                and not error
+                and memories_enabled()
+            ):
                 self.updating_memories = True
                 self.view.dispatch(self.view.notify, "Updating memories")
                 try:
@@ -609,6 +636,7 @@ class ChatController:
                         recent_messages(history, limit=2),
                         self._generation_chat_id,
                         enabled=memories_enabled,
+                        pending_clarification=pending,
                     )
                 except Exception as exc:
                     if not self.stop_requested:
@@ -616,7 +644,10 @@ class ChatController:
                 finally:
                     self.updating_memories = False
 
-        self.view.dispatch(self.finish_response, answer, reasoning, error, finished_at)
+        clarification = clarification and memories_enabled()
+        self.view.dispatch(
+            self.finish_response, answer, reasoning, error, finished_at, clarification
+        )
 
     def _update_inference_stats(self, context_used, tokens_per_second):
         if context_used is not None:
@@ -634,13 +665,18 @@ class ChatController:
             self.client.cancel()
 
     @staticmethod
+    def visible_answer(text):
+        return memory_review(text)[0]
+
+    @staticmethod
     def split_thinking(text):
         """Separate in-band reasoning from the visible answer, including partial streams."""
         before, opening, rest = text.partition("<think>")
         reasoning, closing, after = rest.partition("</think>")
         return (before + after, reasoning, bool(closing)) if opening else (text, None, False)
 
-    def finish_response(self, answer, reasoning, error, finished_at=None):
+    def finish_response(self, answer, reasoning, error, finished_at=None, clarification=False):
+        answer = self.visible_answer(answer)
         finished_at = time.time() if finished_at is None else finished_at
         if error and "token or context limit" not in error:
             self._connection_changed(False)
@@ -672,6 +708,8 @@ class ChatController:
                 "timestamp": finished_at,
             }
         )
+        if clarification and answer.strip():
+            chat["messages"][-1]["memory_clarification"] = True
         if self._generation_context_used is not None:
             chat.setdefault("inference_stats", {})["context_used"] = self._generation_context_used
         chat["updated"] = finished_at
