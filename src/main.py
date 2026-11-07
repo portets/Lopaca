@@ -27,6 +27,10 @@ from storage import ChatStore, MemoryStore
 def build_system_prompt(agent_mode, style="neutral", *, memories=False):
     prompt = (
         "You are a helpful assistant. Answer clearly. "
+        "When essential information is missing or ambiguity could materially change the result, "
+        "ask one brief question about the most important missing detail before proceeding. Keep "
+        "it to one question, without a checklist or optional follow-ups. Otherwise make a "
+        "reasonable assumption and proceed; do not ask about minor preferences. "
         "Use Markdown formatting when it improves readability. "
         "Lopaca appends an application-supplied "
         "document reference block to the current question. It comes from this chat's documents/ "
