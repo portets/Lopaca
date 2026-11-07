@@ -12,7 +12,7 @@ inference runs in an external llama-server process.
 | `src/ui.py` | GTK application/window, CSS, sidebar, transcript layout, composer, settings/memory/approval dialogs, status timers and stream rendering updates. |
 | `src/markdown_ui.py` | GTK Markdown parsing and rendering, selectable text, code highlighting, tables, links, footnotes and bounded horizontal scrolling. |
 | `src/llama_client.py` | llama-server HTTP/SSE transport, capability queries, cancellation, auxiliary requests, Auto reasoning selection, reasoning parameter translation and bounded tool exchanges. |
-| `src/memory.py` | Hidden memory protocol, recall selection and budgets, stable core versus request-local casual context, and complete proposal decoding. |
+| `src/memory.py` | Memory recall and budgets, hidden review decisions, private editor instructions/grammar and validated-edit orchestration. |
 | `src/agentic.py` | Tool definitions/dispatch, runtime information, scoped file reads/searches, command extraction, risk scanning, command preparation and approved execution/file creation. |
 | `src/rag.py` | Text decoding, incremental FTS5 indexing, chunking/ranking, retrieval and citation formatting, expansion instructions/grammar, document-reference wrappers, indexing-question instructions/grammar/validation, background document indexing. |
 | `src/storage.py` | Chat folders, history/settings persistence, document copying, disk accounting, memory database transactions and atomic proposal validation. |
@@ -23,7 +23,8 @@ not import the controller implementation. `ui.py` uses `markdown_ui.py`, while n
 module is imported by the model, memory, retrieval or storage layers. The runtime clock helper
 in `agentic.py` optionally reads a desktop preference through Gio; it creates no UI widgets.
 
-`llama_client.py` uses agentic tool execution, the memory footer filter, and RAG output formats.
+`llama_client.py` uses agentic tool execution and RAG output formats. The controller invokes
+the private memory editor through the same HTTP client under the model lock.
 `memory.py` uses RAG's lexical memory retrieval. `agentic.py` reuses RAG's text decoder.
 `storage.py` depends on settings. There are no circular application-module dependencies.
 
@@ -51,14 +52,22 @@ Avoid imports from UI modules into backend modules and avoid a general-purpose `
 4. `memory.py` selects core and relevant casual records. Stable instructions and the core profile
    go in the system prefix. Fresh document references and casual memory data accompany the current
    question in request-local message copies. They are not saved as user messages.
-5. The client streams reasoning, answer text and statistics. Read-only tool calls can produce
-   request-local assistant/tool exchanges followed by another model turn. A hard client limit
-   prevents executing calls beyond the allowed number of tool rounds.
-6. Complete hidden memory proposals are decoded separately from displayed prose. Storage checks
-   evidence, allowed IDs, duplicates and limits inside database transactions.
-7. The controller persists the assistant's visible answer/reasoning and completion timestamp,
-   then finishes the UI response. Temporary references and tool exchanges are not stored as
-   ordinary chat history.
+5. The client streams reasoning, answer text and statistics. Runtime/file tool calls can produce
+   request-local exchanges and bounded follow-ups. Memory editing is not an advertised tool.
+6. With memories enabled, the main answer ends in a hidden yes/no review decision. The controller
+   strips complete/partial decisions from streamed text and saved history. Yes starts one private
+   thinking-off, grammar-constrained request with all memories and two bounded recent exchanges,
+   excluding thinking. No skips it. Disabled memories add no recall, review instruction or edit request.
+   This runs on the request worker under the existing model lock, without Auto or expansion.
+7. The editor proposes JSON operations; storage validates current-user evidence, IDs, duplicates
+   and limits. Cancellation/settings are checked before requesting and before writing. Unrelated
+   memories stay unchanged. Updating memories uses the existing animated notification lifecycle.
+8. The controller saves the main answer/reasoning and its completion timestamp (before editing),
+   then finishes the UI response. Editor prompts/results and temporary references are never saved
+   as ordinary messages. The user can cancel while the editor is working; failed editing does not
+   discard the main answer. The former native memory-tool implementation remains commented out
+   in memory.py for future experiments.
+
 
 ## Thread ownership
 

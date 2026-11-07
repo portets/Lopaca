@@ -622,7 +622,10 @@ class ChatWindow(Adw.ApplicationWindow):
         self._notification_timer = GLib.timeout_add(3000, self._restore_status)
 
     def _restore_status(self):
-        if self.controller.busy and self._status_text in ("Updating memories", "Cancelling"):
+        if self.controller.busy and (
+            self._status_text == "Cancelling"
+            or (self._status_text == "Updating memories" and self.controller.updating_memories)
+        ):
             self._notification_deadline = GLib.get_monotonic_time() + 3_000_000
             self._notification_timer = GLib.timeout_add(3000, self._restore_status)
             return False

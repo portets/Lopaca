@@ -251,9 +251,10 @@ class MemoryStore:
     def apply(self, proposals, user_text, chat_id, allowed_ids):
         """Apply validated, evidenced proposals atomically."""
         if not isinstance(proposals, list):
-            return
+            return []
+        accepted = []
         with closing(self.connect()) as connection, connection:
-            for proposal in proposals[:8]:
+            for index, proposal in enumerate(proposals[:8]):
                 if not isinstance(proposal, dict):
                     continue
                 action, memory_id = proposal.get("action"), proposal.get("id")
@@ -345,6 +346,8 @@ class MemoryStore:
                         "INSERT INTO memory_search(rowid,text,keywords) VALUES (?,?,?)",
                         (memory_id, text, re.sub(r"[_-]", " ", text + " " + search_terms)),
                     )
+                accepted.append(index)
+        return accepted
 
     def set_core(self, memory_id, core):
         with closing(self.connect()) as connection, connection:

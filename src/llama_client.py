@@ -8,7 +8,6 @@ from contextlib import suppress
 from pathlib import Path
 
 from agentic import FILE_TOOLS, RUNTIME_TOOLS, ChatFiles, handle_tool_call
-from memory import visible_memory_answer
 from rag import (
     DOCUMENT_QUESTIONS_INSTRUCTION,
     QUERY_EXPANSION_GRAMMAR,
@@ -311,8 +310,7 @@ class LlamaClient:
                         "content": handle_tool_call(call, files),
                     }
                 )
-            # A footer belongs to the final answer, not to an intermediate tool preamble.
-            answer = visible_memory_answer(answer).rstrip()
+            answer = answer.rstrip()
             if answer:
                 answer += "\n\n"
             if reasoning:

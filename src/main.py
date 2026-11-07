@@ -17,14 +17,8 @@ from agentic import (
     scan_command,
     write_file,
 )
-from llama_client import LlamaClient, auto_thinking_options, thinking_parameters
-from memory import (
-    apply_memory_footer,
-    memory_context,
-    recall_memories,
-    split_memory_footer,
-    visible_memory_answer,
-)
+from llama_client import LlamaClient, auto_thinking_options, recent_messages, thinking_parameters
+from memory import edit_memories, memory_context, memory_review, recall_memories
 from rag import DocumentIndexer, format_document_context, read_document, retrieve
 from settings import CHAT_SETTING_DEFAULTS, Settings
 from storage import ChatStore, MemoryStore
@@ -92,7 +86,7 @@ class ChatController:
         self.rag_query_expansion = settings.rag_query_expansion
         self.chat_sort = settings.chat_sort
         self.view = self.chat = None
-        self.busy = self.stop_requested = False
+        self.busy = self.stop_requested = self.updating_memories = False
         self._generation_chat_id = None
         self._generation_context_used = None
         self._chat_speeds = {}
@@ -509,38 +503,17 @@ class ChatController:
         memory_enabled = generation_settings["global_memories"] is True
         memory_rows = []
         expansion = None
-        reasoning_pending, reasoning_hidden = "", False
-        reasoning_line_start = True
         last_answer = None
 
         def answer_changed(text):
             nonlocal last_answer
-            visible, footer = split_memory_footer(text) if memory_enabled else (text, "")
-            if memory_enabled:
-                visible = visible.rstrip()
+            visible = memory_review(text)[0] if memory_enabled else text
             if visible != last_answer:
                 self.view.dispatch(self.view.update_answer, visible)
                 last_answer = visible
-            if re.match(r"<lopaca-memory>\s*\[\s*\{", footer):
-                self.view.dispatch(self.view.notify, "Updating memories")
 
         def thinking(text):
-            nonlocal reasoning_pending, reasoning_hidden, reasoning_line_start
-            if not memory_enabled:
-                self.view.dispatch(self.view.update_thinking, text)
-                return
-            if reasoning_hidden:
-                return
-            reasoning_pending += text
-            visible, reasoning_pending = split_memory_footer(
-                reasoning_pending, line_start=reasoning_line_start
-            )
-            reasoning_hidden = reasoning_pending.startswith("<lopaca-memory>")
-            if visible:
-                reasoning_line_start = visible.endswith("\n")
-                self.view.dispatch(self.view.update_thinking, visible)
-            if reasoning_hidden:
-                reasoning_pending = ""
+            self.view.dispatch(self.view.update_thinking, text)
 
         def expand(search_query):
             nonlocal expansion
@@ -612,25 +585,35 @@ class ChatController:
             thinking_parameters_for_reply,
             documents=folder,
         )
-        if memory_enabled:
-            if (
-                not error
-                and not self.stop_requested
+        finished_at = time.time()
+
+        def memories_enabled():
+            return (
+                not self.stop_requested
                 and self.get_chat_settings(self._generation_chat_id)["global_memories"] is True
-            ):
+            )
+
+        if memory_enabled:
+            answer, review = memory_review(answer)
+            if review and not error and memories_enabled():
+                self.updating_memories = True
+                self.view.dispatch(self.view.notify, "Updating memories")
                 try:
-                    apply_memory_footer(
+                    edit_memories(
+                        self.client,
                         self.memories,
-                        answer,
                         query,
+                        recent_messages(history, limit=2),
                         self._generation_chat_id,
-                        {row[0] for row in memory_rows},
+                        enabled=memories_enabled,
                     )
                 except Exception as exc:
-                    self.view.dispatch(self.view.notify, f"Could not save memories: {exc}")
-            answer = visible_memory_answer(answer)
-            reasoning = visible_memory_answer(reasoning)
-        self.view.dispatch(self.finish_response, answer, reasoning, error)
+                    if not self.stop_requested:
+                        self.view.dispatch(self.view.notify, f"Could not save memories: {exc}")
+                finally:
+                    self.updating_memories = False
+
+        self.view.dispatch(self.finish_response, answer, reasoning, error, finished_at)
 
     def _update_inference_stats(self, context_used, tokens_per_second):
         if context_used is not None:
@@ -654,8 +637,8 @@ class ChatController:
         reasoning, closing, after = rest.partition("</think>")
         return (before + after, reasoning, bool(closing)) if opening else (text, None, False)
 
-    def finish_response(self, answer, reasoning, error):
-        finished_at = time.time()
+    def finish_response(self, answer, reasoning, error, finished_at=None):
+        finished_at = time.time() if finished_at is None else finished_at
         if error and "token or context limit" not in error:
             self._connection_changed(False)
         elif not self.stop_requested:
@@ -691,6 +674,7 @@ class ChatController:
         chat["updated"] = finished_at
         self.store.save(chat, message_start=len(chat["messages"]) - 1)
         self.refresh()
+        self.updating_memories = False
         self.busy = False
         if self.chat["id"] == chat["id"]:
             self.view.finish_response(answer, reasoning)

@@ -39,6 +39,7 @@ class Settings:
     memory_context_chars: int = 4000
     memory_records: int = 500
     memory_core_records: int = 20
+    memory_edit_output_tokens: int = 800
     # Injected by llama-server when its reasoning budget runs out.
     reasoning_budget_message: str = "Reasoning budget exceeded, continuing..."
     chat_sort: str = "recently_used"
