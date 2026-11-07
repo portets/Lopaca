@@ -35,7 +35,8 @@ EOF
 printf -v MESSAGE 'Installed Lopaca to %s.\n\nLaunch it from your Applications menu.' "$INSTALL_DIR"
 # Detach GUI notifications so the launching terminal can close without closing the dialog.
 if [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && command -v zenity >/dev/null; then
-    setsid --fork zenity --info --no-markup --title='Lopaca Installed' \
+    setsid --fork zenity --info --no-markup --icon=dialog-information-symbolic \
+        --width=440 --no-wrap --title='Lopaca Installed' \
         --text="$MESSAGE" </dev/null >/dev/null 2>&1
 elif [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && command -v kdialog >/dev/null; then
     setsid --fork kdialog --title 'Lopaca Installed' \

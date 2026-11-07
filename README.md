@@ -23,6 +23,8 @@ Or right click and run as program. May need to check Properties/Executable as Pr
 Installs to ~/.local/share/lopaca/app/ with a shortcut menu entry at ~/.local/share/applications/app.lopaca.Lopaca.desktop.\
 Then just run it using your menu shortcut.
 
+To uninstall, run `./uninstall.sh`. You can keep your chats and settings or delete all Lopaca data.
+
 # Local documents
 Add readable text documents through a chat's menu, or place them in that chat's `documents/` folder. Before each prompt, a background worker checks for new, changed, and deleted files and updates `documents.sqlite` incrementally.
 
