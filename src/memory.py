@@ -26,8 +26,35 @@ MEMORY_INSTRUCTION = (
     "memory summary, JSON or operations, or announce memory housekeeping. The editor has "
     "the actual user message and prior conversation context. Do not claim memories are "
     "saved before it runs. Intermediate tool calls do not need a decision; append it after "
-    "the final visible answer."
+    "the final visible answer. Use view_memories only when supplied memories omit personal "
+    "information that would materially improve the answer, including personalized creative "
+    "work. Use supplied facts first; do not browse for ordinary general-knowledge questions "
+    "or merely to prepare edits: the private editor already sees all memories. Browse at most "
+    "once per reply. Do not announce retrieval or expose memory IDs."
 )
+
+# Lopaca reads the database; the model receives facts, never SQL or filesystem access.
+VIEW_MEMORIES_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "view_memories",
+        "description": "Browse all saved personal memories to discover useful preferences or "
+        "connections missing from supplied context. Larger lists add processing latency.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+}
+
+
+def view_memories(store, *, enabled):
+    """Return a read-only snapshot, checking effective settings at invocation time."""
+    if not enabled():
+        return json.dumps({"error": "Memories are disabled."})
+    return json.dumps({"memories": _memory_data(store.records())}, separators=(",", ":"))
+
+
+def _memory_data(rows):
+    return [{"id": row[0], "text": row[1], "kind": "core" if row[2] else "casual"} for row in rows]
+
 
 MEMORY_EDIT_INSTRUCTION = (
     "Edit the user's durable personal memories. Input JSON contains existing memories, "
@@ -93,7 +120,7 @@ def recall_memories(store, query, settings, *, expand=None, previous_queries=())
 
 def memory_context(rows):
     """Keep core profile in the stable prefix and casual recall beside the current question."""
-    data = [{"id": row[0], "text": row[1], "kind": "core" if row[2] else "casual"} for row in rows]
+    data = _memory_data(rows)
     core = (
         MEMORY_INSTRUCTION
         + "\nGlobal memories (JSON data):\n"
@@ -144,10 +171,7 @@ def edit_memories(client, store, query, history, chat_id, *, enabled):
         return
     records = store.records()
     payload = {
-        "memories": [
-            {"id": row[0], "text": row[1], "kind": "core" if row[2] else "casual"}
-            for row in records
-        ],
+        "memories": _memory_data(records),
         "recent_messages": history,
         "current_user": query,
     }

@@ -18,7 +18,7 @@ from agentic import (
     write_file,
 )
 from llama_client import LlamaClient, auto_thinking_options, recent_messages, thinking_parameters
-from memory import edit_memories, memory_context, memory_review, recall_memories
+from memory import edit_memories, memory_context, memory_review, recall_memories, view_memories
 from rag import DocumentIndexer, format_document_context, read_document, retrieve
 from settings import CHAT_SETTING_DEFAULTS, Settings
 from storage import ChatStore, MemoryStore
@@ -505,6 +505,12 @@ class ChatController:
         expansion = None
         last_answer = None
 
+        def memories_enabled():
+            return (
+                not self.stop_requested
+                and self.get_chat_settings(self._generation_chat_id)["global_memories"] is True
+            )
+
         def answer_changed(text):
             nonlocal last_answer
             visible = memory_review(text)[0] if memory_enabled else text
@@ -584,14 +590,11 @@ class ChatController:
             lambda text: self.view.dispatch(self.view.notify, text),
             thinking_parameters_for_reply,
             documents=folder,
+            memory_view=(lambda: view_memories(self.memories, enabled=memories_enabled))
+            if memory_enabled
+            else None,
         )
         finished_at = time.time()
-
-        def memories_enabled():
-            return (
-                not self.stop_requested
-                and self.get_chat_settings(self._generation_chat_id)["global_memories"] is True
-            )
 
         if memory_enabled:
             answer, review = memory_review(answer)

@@ -8,6 +8,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from agentic import FILE_TOOLS, RUNTIME_TOOLS, ChatFiles, handle_tool_call
+from memory import VIEW_MEMORIES_TOOL
 from rag import (
     DOCUMENT_QUESTIONS_INSTRUCTION,
     QUERY_EXPANSION_GRAMMAR,
@@ -264,11 +265,14 @@ class LlamaClient:
         on_notice,
         thinking=None,
         documents=None,
+        memory_view=None,
     ):
         """Keep read-only tool exchanges local to this request, with bounded follow-ups."""
         history = list(messages)
         files = ChatFiles(Path(documents).parent) if documents is not None else None
         tools = RUNTIME_TOOLS + FILE_TOOLS if files is not None else RUNTIME_TOOLS
+        if memory_view is not None:
+            tools = [*tools, VIEW_MEMORIES_TOOL]
         answer, reasoning = "", ""
         for turn in range(self.settings.max_tool_rounds + 1):
             if stopped():
@@ -303,11 +307,18 @@ class LlamaClient:
             for call in calls:
                 if stopped():
                     return answer, reasoning, None
+                if call["function"]["name"] == "view_memories" and memory_view is not None:
+                    try:
+                        output = memory_view()
+                    except Exception as exc:
+                        output = json.dumps({"error": f"Could not read memories: {exc}"})
+                else:
+                    output = handle_tool_call(call, files)
                 history.append(
                     {
                         "role": "tool",
                         "tool_call_id": call["id"],
-                        "content": handle_tool_call(call, files),
+                        "content": output,
                     }
                 )
             answer = answer.rstrip()
