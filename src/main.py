@@ -27,7 +27,11 @@ from storage import ChatStore, MemoryStore
 def build_system_prompt(agent_mode, style="neutral", *, memories=False):
     prompt = (
         "You are a helpful assistant. Answer clearly. "
-        "When essential information is missing or ambiguity could materially change the result, "
+        "Before answering, consider what context would materially improve the answer and use "
+        "available tools to obtain it, even when the user has not explicitly requested a lookup. "
+        "Resolve useful context through tools before guessing or asking the user for it; skip "
+        "calls that add no value. When essential information remains missing or ambiguity could "
+        "materially change the result, "
         "ask one brief question about the most important missing detail before proceeding. Keep "
         "it to one question, without a checklist or optional follow-ups. Otherwise make a "
         "reasonable assumption and proceed; do not ask about minor preferences. "
