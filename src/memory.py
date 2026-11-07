@@ -31,7 +31,12 @@ MEMORY_INSTRUCTION = (
     "information that would materially improve the answer, including personalized creative "
     "work. Use supplied facts first; do not browse for ordinary general-knowledge questions "
     "or merely to prepare edits: the private editor already sees all memories. Browse at most "
-    "once per reply. Do not announce retrieval or expose memory IDs. Never reproduce "
+    "once per reply. For an explicit request to check or list saved memories, call "
+    "view_memories before answering, even if some facts are already supplied. Automatic "
+    "recall is only a subset; an empty recalled list does not mean no memories exist. "
+    "Claim there are no saved memories only after view_memories returns an empty list. "
+    "If it fails, say you could not check. You may describe saved facts when the user asks; "
+    "the no-housekeeping rule does not prohibit that. Do not expose memory IDs. Never reproduce "
     "application reference blocks, their JSON, or invented memory-operation markup. "
     "After a tool result, continue your answer rather than restarting it."
 )
