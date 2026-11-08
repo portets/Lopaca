@@ -17,16 +17,123 @@ CODE_BLOCK_PATTERN = re.compile(
 
 
 _INLINE = re.compile(
-    r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])"
-    r"|(`+)(.+?)\2"
+    r"(?P<math>\\\(.{1,500}?\\\)|\\\[.{1,500}?\\\]|\$\$(?!\s).{1,500}?\$\$|(?<!\$)\$(?![\s$])[^$\n]{1,500}?(?<!\s)\$(?!\$))"
+    r"|\\([!\"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])"
+    r"|(`+)(.+?)\3"
     r'|!?\[([^\]]+)\]\(([^\s]+?)(?:\s+"[^"\n]*")?\)'
     r"|<(https?://[^<>\s]+|mailto:[^<>\s]+|[^<>\s@]+@[^<>\s@]+\.[^<>\s@]+)>"
     r"|((?:https?://|www\.)[^\s<>]+|[\w.+-]+@[\w-]+(?:\.[\w-]+)+)"
-    r"|(\*{1,3}|(?<!\w)_{1,3}|~~|==|~|\^)(?=\S)(.+?)(?<=\S)\8(?:(?![\w*_])|(?<=~)|(?<=\^))"
+    r"|(\*{1,3}|(?<!\w)_{1,3}|~~|==|~|\^)(?=\S)(.+?)(?<=\S)\9(?:(?![\w*_])|(?<=~)|(?<=\^))"
     r"|\[\^([^\]\n]+)\]"
-    r"|<(sub|sup|ins)>(.*?)</\11>",
+    r"|<(sub|sup|ins)>(.*?)</\12>",
     re.DOTALL,
 )
+
+
+_MATH_SYMBOLS = {
+    "alpha": "α",  # noqa: RUF001 - intentional Greek math symbol
+    "beta": "β",
+    "gamma": "γ",  # noqa: RUF001
+    "delta": "δ",
+    "epsilon": "ε",
+    "theta": "θ",
+    "lambda": "λ",
+    "mu": "μ",
+    "pi": "π",
+    "rho": "ρ",  # noqa: RUF001
+    "sigma": "σ",  # noqa: RUF001
+    "tau": "τ",
+    "phi": "φ",
+    "omega": "ω",
+    "Delta": "Δ",
+    "Gamma": "Γ",
+    "Lambda": "Λ",
+    "Pi": "Π",
+    "Sigma": "Σ",
+    "Omega": "Ω",
+    "propto": "∝",
+    "times": "×",  # noqa: RUF001
+    "cdot": "·",
+    "pm": "±",
+    "leq": "≤",
+    "geq": "≥",
+    "neq": "≠",
+    "approx": "≈",
+    "infty": "∞",
+    "to": "→",
+    "rightarrow": "→",
+    "partial": "∂",
+    "sum": "∑",
+    "int": "∫",
+}
+
+
+def math_markup(source):
+    """Render a small, unambiguous TeX subset; leave other formulas untouched."""
+    expression = source.strip()
+    if source.startswith(("$$", r"\(", r"\[")):
+        expression = source[2:-2].strip()
+    elif source.startswith("$"):
+        expression = source[1:-1].strip()
+    if not expression or len(expression) > 500:
+        return html.escape(source)
+
+    def parse(text):
+        parts = []
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if char == "\\":
+                command = re.match(r"\\([A-Za-z]+)", text[index:])
+                if not command:
+                    raise ValueError("unsupported math escape")
+                name = command[1]
+                index += len(command[0])
+                if name == "frac":
+                    arguments = []
+                    for _ in range(2):
+                        if index >= len(text) or text[index] != "{":
+                            raise ValueError("incomplete fraction")
+                        end = text.find("}", index + 1)
+                        if end < 0 or "{" in text[index + 1 : end]:
+                            raise ValueError("nested fraction")
+                        raw = text[index + 1 : end]
+                        value = parse(raw)
+                        if re.search(r"[+\-*/=\s]", raw):
+                            value = f"({value})"
+                        arguments.append(value)
+                        index = end + 1
+                    parts.append(f"{arguments[0]}/{arguments[1]}")
+                elif name in _MATH_SYMBOLS:
+                    parts.append(_MATH_SYMBOLS[name])
+                else:
+                    raise ValueError("unsupported math command")
+            elif char in "^_":
+                index += 1
+                if index >= len(text):
+                    raise ValueError("incomplete script")
+                if text[index] == "{":
+                    end = text.find("}", index + 1)
+                    if end < 0:
+                        raise ValueError("incomplete script")
+                    value = parse(text[index + 1 : end])
+                    index = end + 1
+                else:
+                    value = parse(text[index])
+                    index += 1
+                tag = "sup" if char == "^" else "sub"
+                parts.append(f"<{tag}>{value}</{tag}>")
+            elif char in "{}$&":
+                raise ValueError("unsupported math syntax")
+            else:
+                parts.append(html.escape(char))
+                index += 1
+        return "".join(parts)
+
+    try:
+        return parse(expression)
+    except ValueError:
+        return html.escape(source)
 
 
 def inline_markdown(text, depth=0):
@@ -36,9 +143,11 @@ def inline_markdown(text, depth=0):
     parts, start = [], 0
     for match in _INLINE.finditer(text):
         parts.append(html.escape(html.unescape(text[start : match.start()])))
-        escaped, ticks, code, title, url, autolink, bare, emphasis, body = match.groups()[:9]
+        math, escaped, ticks, code, title, url, autolink, bare, emphasis, body = match.groups()[:10]
         if match[0].startswith("!"):
             value = html.escape(match[0])
+        elif math:
+            value = math_markup(math)
         elif escaped:
             value = html.escape(escaped)
         elif ticks:
@@ -59,14 +168,14 @@ def inline_markdown(text, depth=0):
                 if re.match(r"^(?:https?://|mailto:|file:///|#)", target, re.IGNORECASE)
                 else caption
             )
-        elif match[10]:
-            number = html.escape(match[10])
+        elif match[11]:
+            number = html.escape(match[11])
             value = (
                 f'<a href="#fn-{number}" title="Go to footnote {number}"><sup>{number}</sup></a>'
             )
-        elif match[11]:
-            tag = "u" if match[11] == "ins" else match[11]
-            value = f"<{tag}>" + inline_markdown(match[12], depth + 1) + f"</{tag}>"
+        elif match[12]:
+            tag = "u" if match[12] == "ins" else match[12]
+            value = f"<{tag}>" + inline_markdown(match[13], depth + 1) + f"</{tag}>"
         else:
             tags = {
                 "*": ("i",),
