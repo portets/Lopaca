@@ -1440,6 +1440,11 @@ class ChatWindow(Adw.ApplicationWindow):
             memories_row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
             memories_row.connect("activated", lambda *_: self._show_memories(dialog))
             group.add(memories_row)
+            add_switch(
+                "global_chat_histories",
+                "Global Chat Histories",
+                "Recall relevant discussions from other chats.",
+            )
         add_switch(
             "preserve_reasoning",
             "Preserve Reasoning",

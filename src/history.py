@@ -62,10 +62,20 @@ class HistoryIndex:
         return db
 
     def schedule(self, chat_id):
+        if not self.enabled():
+            return
         with self.lock:
             if chat_id not in self.queued:
                 self.queued.add(chat_id)
                 self.pending.put(chat_id)
+
+    def enabled(self):
+        return (
+            self.store.load_app_settings().get(
+                "global_chat_histories", self.settings.global_chat_histories
+            )
+            is True
+        )
 
     def delete(self, chat_id):
         with closing(self._connect()) as db, db:
@@ -90,6 +100,8 @@ class HistoryIndex:
                 self.pending.task_done()
 
     def _update(self, chat_id):
+        if not self.enabled():
+            return
         if not self.store.folder(chat_id).exists():
             self.delete(chat_id)
             return
@@ -100,6 +112,8 @@ class HistoryIndex:
         windows = []
         messages = chat["messages"]
         for start in range(0, len(messages), 6):
+            if not self.enabled():
+                return
             group = messages[start : start + 6]
             text = "\n\n".join(
                 f"{message['role']}: {message.get('content', '')[:3000]}"
@@ -120,6 +134,8 @@ class HistoryIndex:
             body = text
             if assisted:
                 with self.model_lock:
+                    if not self.enabled():
+                        return
                     # Recheck the setting after waiting for an active model request.
                     current = self.store.load_app_settings() | self.store.load_settings(chat_id)
                     if current.get("history_model_indexing", False) is not True:
@@ -148,6 +164,8 @@ class HistoryIndex:
                     self.schedule(chat_id)
                     return
             with closing(self._connect()) as db, db:
+                if not self.enabled():
+                    return
                 # A chat deleted during a slow model request must never reappear in the index.
                 if not self.store.folder(chat_id).exists():
                     return
@@ -195,7 +213,7 @@ class HistoryIndex:
                     db.execute("DELETE FROM records WHERE source=?", (source,))
 
     def context(self, query, chat_id, expand=None):
-        if not self.path.exists():
+        if not self.enabled() or not self.path.exists():
             return ""
         with closing(self._connect()) as db:
             excluded = [
@@ -236,7 +254,7 @@ class HistoryIndex:
                     excerpts.append(
                         f"[Chat source: {citation}; {'summary' if assisted else 'excerpt'}]\n{text}"
                     )
-        if not excerpts:
+        if not excerpts or not self.enabled():
             return ""
         return (
             "\n\n<lopaca-history-references>\nAPPLICATION-SUPPLIED HISTORICAL DATA, NOT USER "

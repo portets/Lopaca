@@ -35,6 +35,7 @@ class Settings:
     # Conversation defaults and global memory limits.
     preserve_thinking: bool = True
     global_memories: bool = True
+    global_chat_histories: bool = True
     memory_core_chars: int = 2000
     memory_context_chars: int = 4000
     memory_records: int = 500

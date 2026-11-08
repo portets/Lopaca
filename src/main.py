@@ -382,7 +382,8 @@ class ChatController:
             self.view.notify(f"Could not open folder: {exc}")
 
     def get_chat_settings(self, chat_id=None):
-        settings = CHAT_SETTING_DEFAULTS | self.store.load_app_settings()
+        settings = {"global_chat_histories": self.settings.global_chat_histories}
+        settings.update(CHAT_SETTING_DEFAULTS | self.store.load_app_settings())
         if chat_id is not None:
             settings.update(self.store.load_settings(chat_id))
         return settings
@@ -410,6 +411,9 @@ class ChatController:
             settings[key] = value
         if chat_id is None:
             self.store.save_app_settings(settings)
+            if key == "global_chat_histories" and value is True:
+                for chat in self.store.list():
+                    self.history_index.schedule(chat["id"])
         else:
             self.store.save_settings(chat_id, settings)
         if self.chat and (chat_id is None or chat_id == self.chat["id"]):
