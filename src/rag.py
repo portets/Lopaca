@@ -686,7 +686,7 @@ def _document_context(connection, row, limit):
     return None
 
 
-def _rank(connection, query, expansion, settings):
+def _rank(connection, query, expansion, settings, excluded_sources=()):
     terms = _terms(query)
     extra = [term for term in _terms(expansion) if term not in terms]
     expanded_terms = set(extra)
@@ -714,6 +714,10 @@ def _rank(connection, query, expansion, settings):
     sources, anchors = _source_scope(paths, terms, query)
     if sources is None:
         return []
+    if excluded_sources:
+        sources = [path for path in (sources or paths) if path not in excluded_sources]
+        if not sources:
+            return []
     phrases = [
         next(part for part in pair if part).strip()[:160]
         for pair in re.findall(r'`([^`\n]+)`|"([^"\n]+)"', query)

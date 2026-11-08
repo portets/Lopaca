@@ -54,6 +54,7 @@ class Settings:
     rag_query_expansion: bool = False
     rag_expansion_timeout: int = 10
     rag_model_indexing: bool = False
+    history_model_indexing: bool = False
     rag_indexing_timeout: int = 600
     rag_indexing_retry_interval: int = 60
     rag_indexing_batch_size: int = 8
@@ -72,5 +73,6 @@ CHAT_SETTING_DEFAULTS = {
     "preserve_reasoning": Settings.preserve_thinking,
     "rag_query_expansion": Settings.rag_query_expansion,
     "rag_model_indexing": Settings.rag_model_indexing,
+    "history_model_indexing": Settings.history_model_indexing,
     "conversation_style": Settings.conversation_style,
 }

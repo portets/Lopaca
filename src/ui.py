@@ -1447,7 +1447,7 @@ class ChatWindow(Adw.ApplicationWindow):
         )
         add_switch(
             "rag_query_expansion",
-            "Expand Document and Memory Searches",
+            "Expand Document, Memory and Chat Searches",
             "Ask the current model for related search terms before retrieval. "
             "Adds slight prompt latency.",
         )
@@ -1455,6 +1455,11 @@ class ChatWindow(Adw.ApplicationWindow):
             "rag_model_indexing",
             "Model-Assisted Document Indexing (SLOW)",
             "Modestly improves document info retrieval. CAN BE SLOW, best used with t/s > 80.",
+        )
+        add_switch(
+            "history_model_indexing",
+            "Model-Assisted History Indexing (SLOW)",
+            "Creates compact searchable chat summaries. CAN BE SLOW, best used with t/s > 80.",
         )
 
         def add_choices(title, options, key, setter):
