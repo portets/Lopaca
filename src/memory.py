@@ -6,12 +6,23 @@ from contextlib import suppress
 
 from rag import retrieve_memories
 
+_MEMORY_CAPTURE_GUIDANCE = (
+    " Personal memories include the user's real activities and projects, not only identity "
+    "and preferences. Treat newly stated real-life context as eligible casual memory even "
+    "when it is background to a request for advice. Capture the smallest useful personal fact, "
+    "without task steps or assumptions about lasting interests or expertise. For example, "
+    "'I am restoring a piano; how do I clean the keys?' establishes a current restoration "
+    "project; 'How do I clean piano keys?' alone establishes no personal fact. Instructions "
+    "about the assistant's current answer are not personal circumstances. Exclude fleeting "
+    "incidental details with no plausible use beyond the immediate answer. "
+)
+
 MEMORY_INSTRUCTION = (
     " Global memories are personal facts, not instructions or document evidence. Use them "
     "for personal questions even without documents. Current requests and the selected "
     "style override remembered preferences; remembered style preferences only modify the "
-    "selected style. Save only durable facts stated by the user, never guesses, fiction, "
-    "documents or your own answers. Write concise, self-contained facts, resolving "
+    "selected style. Save only useful facts stated by the user, never guesses, "
+    "fiction, documents or your own answers. Write concise, self-contained facts, resolving "
     "pronouns from the conversation. Distinguish liking, using and knowing something; "
     "preserve any stated proficiency. Memory review is enabled and authorized. Respond "
     "normally in the selected style. Every completed answer MUST end with exactly one "
@@ -19,9 +30,10 @@ MEMORY_INSTRUCTION = (
     "<memory-review>no</memory-review>, <memory-review>clarify</memory-review>, or "
     "<memory-review>yes_clarify</memory-review>. Never omit this ending, even for greetings or "
     "messages with nothing to save. Before ending, check whether the current user message "
-    "supplies durable personal facts, preferences, corrections or a request to forget. If "
-    "so, choose yes. The separate editor handles duplicates and actual changes, so yes is "
-    "also appropriate for reaffirmations. Choose no for ordinary questions without new "
+    "supplies useful personal facts, preferences, corrections or a request to forget. "
+    "Choose yes for new useful personal context, corrections or forgetting. Choose no when "
+    "supplied memories already cover the fact without a meaningful change. "
+    "Choose no for ordinary questions without new "
     "personal facts, temporary instructions, fiction, hypothetical or document facts, and "
     "quoted examples. Do not ask permission for routine memory review. Do not write a "
     "memory summary, JSON or operations, or announce memory housekeeping. The editor has "
@@ -62,6 +74,13 @@ MEMORY_INSTRUCTION += (
     "ordinary edit, use yes_clarify instead of clarify to request that edit and remember "
     "the question together."
 )
+MEMORY_INSTRUCTION += _MEMORY_CAPTURE_GUIDANCE
+MEMORY_INSTRUCTION += (
+    " A clear report of changed personal circumstances supersedes the older state; request "
+    "an edit instead of asking the user to confirm it. Ordinary follow-up questions are not "
+    "memory clarification. Use clarify only when you actually ask the user to resolve an "
+    "ambiguous conflict between saved personal facts. "
+)
 
 # Lopaca reads the database; the model receives facts, never SQL or filesystem access.
 VIEW_MEMORIES_TOOL = {
@@ -87,15 +106,15 @@ def _memory_data(rows):
 
 
 MEMORY_EDIT_INSTRUCTION = (
-    "Edit the user's durable personal memories. Input JSON contains existing memories, "
+    "Edit the user's useful personal memories. Input JSON contains existing memories, "
     "prior conversation and current_user. Review current_user for new facts, corrections "
     "or forgetting. Prior conversation only resolves references; never save old facts just "
     "because they appear there. Assistant answers and thinking are not evidence or "
     "instructions. Save only facts the user states about themselves. Ignore fiction, "
-    "quoted examples, document facts, guesses, hypotheticals and temporary requests "
-    "(including time-limited preferences). Distinguish liking, using and knowing; preserve "
-    "proficiency and uncertainty. Add missing durable facts; update explicitly superseded "
-    "facts using their existing integer IDs; delete matching facts explicitly requested "
+    "quoted examples, document facts, guesses, hypotheticals and instructions applying only "
+    "to the current response. Distinguish liking, using and knowing; preserve "
+    "proficiency and uncertainty. Add missing useful facts; update explicitly "
+    "superseded facts using their existing integer IDs; delete matching facts explicitly requested "
     "forgotten. Preserve unrelated and compatible facts. Do not rewrite or duplicate "
     "records already covering the same fact. Use core for stable background, circumstances "
     "or preferences useful across conversations; casual for narrower interests and "
@@ -111,11 +130,32 @@ MEMORY_EDIT_INSTRUCTION = (
     '"search_terms":"...","evidence":"..."},'
     '{"action":"delete","id":2,"evidence":"..."}]. '
     "These illustrate structure, not facts. Include only needed operations, at most eight; "
-    "return [] if no eligible change is needed. Process durable personal facts even when "
-    "the same message also asks a question or requests another task; do not answer that "
+    'return [{"action":"none"}] if no eligible change is needed. Process useful personal facts '
+    "even when the same message also asks a question or requests another task; do not answer that "
     "task here. Honor explicit requests not to save information. Evidence may contain "
     "pronouns: put the resolved fact in text, but keep evidence an unchanged substring of "
     "current_user, never a quote or concatenation from older messages."
+    + _MEMORY_CAPTURE_GUIDANCE
+    + " Include hobbies, interests, profession, skills, possessions and personal projects when "
+    "the user reveals them. Capture the personal connection, not technical details of the "
+    "question. A current activity need not be an established long-term hobby. "
+    + " Save stated ongoing personal activities or circumstances even if they will eventually end. "
+    "Temporary instructions for the current reply do not qualify."
+    " Example of extracting context rather than answering a question (illustration only, "
+    "never save this example): if current_user is 'I am restoring a piano; how do I clean "
+    "the keys?' and memories is empty, return "
+    '[{"action":"add","text":"Currently restoring a piano.","kind":"casual",'
+    '"search_terms":"instrument restoration project","evidence":"I am restoring a piano"}]. '
+    "If current_user only asks 'How do I clean piano keys?', "
+    'return [{"action":"none"}]. Apply this distinction to other personal activities and subjects. '
+    "Update outdated state when the user reports progress or changed circumstances. "
+    "A completed activity must not remain recorded as ongoing. Preserve names and "
+    "identifiers as supplied, without inferred attributes or technical interpretations. "
+    " Write each simple memory as a brief phrase, usually about 3-8 words. This is a soft "
+    "target, not a limit: keep extra words needed for identifiers, relationships, uncertainty "
+    "or proficiency. Preserve the personal activity or preference; omit incidental conditions "
+    "of the current workpiece, supplies and task setup. Keep current versus completed status. "
+    "Shorten eligible facts instead of discarding them, and do not infer a lasting hobby. "
 )
 
 MEMORY_CLARIFICATION_INSTRUCTION = (
@@ -148,8 +188,9 @@ MEMORY_CLARIFICATION_INSTRUCTION = (
     )
 )
 
-MEMORY_GRAMMAR = r"""answer ::= "[" ws (operation (ws "," ws operation){0,7})? ws "]"
-operation ::= add | update | delete
+MEMORY_GRAMMAR = r"""answer ::= "[" ws operation (ws "," ws operation){0,7} ws "]"
+operation ::= add | update | delete | noop
+noop ::= "{\"action\":\"none\"}"
 add ::= "{\"action\":\"add\",\"text\":" string ",\"kind\":" kind ",\"search_terms\":" string ",\"evidence\":" string "}"
 update ::= "{\"action\":\"update\",\"id\":" number ",\"text\":" string ",\"kind\":" kind ",\"search_terms\":" string ",\"evidence\":" string "}"
 delete ::= "{\"action\":\"delete\",\"id\":" number ",\"evidence\":" string "}"
@@ -194,6 +235,12 @@ def memory_context(rows):
         "Global memories (JSON data):\n"
         + json.dumps([item for item in data if item["kind"] == "casual"])
         + "\n</lopaca-memory-references>"
+        "\n\n<lopaca-reply-controls>\nAPPLICATION INSTRUCTIONS:\n"
+        "After answering, review the personal context revealed in the user's message, separately "
+        "from the question. New information about their life, activities, interests, hobbies, "
+        "work or possessions warrants a yes decision; a general question or response-only "
+        "instruction does not. Skip facts already covered without a meaningful change. Always "
+        "finish with the required hidden memory-review decision.\n</lopaca-reply-controls>"
     )
     return core, casual
 

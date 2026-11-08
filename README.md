@@ -45,4 +45,5 @@ Retrieval uses SQLite FTS5/BM25, phrase and identifier matching, and filename/se
 - Make llama-server launchable within Lopaca with parameters
 - Add support for other llm servers
 - Add Image and Code tabs, image can connect to stable-diffusion.cpp
+- Add cross-chat history RAG?
 
