@@ -584,8 +584,7 @@ def _scan_command(command, cwd, settings):
     risks = _scan_text(text)
     file_write = parse_file_heredoc(text)
     if file_write:
-        target = Path(file_write[0])
-        target = target if target.is_absolute() else Path(cwd) / target
+        target = _write_target(file_write[0], cwd)
         header_end = len(command.split("\n", 1)[0])
         if _PROTECTED_PATH.search(str(target.resolve())):
             risks.append(CommandRisk(0, header_end, "danger", "Writes a system or security file"))
@@ -788,9 +787,20 @@ def run_command(args, cwd):
     return (result.stdout + result.stderr).strip(), result.returncode, None
 
 
+def _write_target(path, cwd):
+    target = Path(path).expanduser()
+    # Commands may use the same projects/ prefix accepted by the read-only tools.
+    if (
+        not target.is_absolute()
+        and Path(cwd).name == "projects"
+        and target.parts[:1] == ("projects",)
+    ):
+        target = Path(*target.parts[1:])
+    return target if target.is_absolute() else Path(cwd) / target
+
+
 def write_file(path, contents, cwd):
-    target = Path(path)
-    if not target.is_absolute():
-        target = Path(cwd) / target
+    target = _write_target(path, cwd)
+    target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(contents, encoding="utf-8")
     return target

@@ -36,6 +36,7 @@ Retrieval uses SQLite FTS5/BM25, phrase and identifier matching, and filename/se
 
 # TO-DO
 - Add embedding model support?
+- Combine add folder and add documents? gtk doesn't normally allow it
 - Context compression using RAG once a limit is hit
 - Make features list
 - More advanced agentic mode with more tools, web searching, etc

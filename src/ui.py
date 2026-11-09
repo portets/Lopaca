@@ -442,6 +442,8 @@ class ChatWindow(Adw.ApplicationWindow):
         status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
         self.status = Gtk.Label(label=" Not Connected", xalign=0)
         self.status.add_css_class("muted")
+        self.status.set_ellipsize(Pango.EllipsizeMode.END)
+        self.status.set_width_chars(1)
         status_row.append(self.status)
         status_spacer = Gtk.Box()
         status_spacer.set_hexpand(True)
@@ -648,6 +650,7 @@ class ChatWindow(Adw.ApplicationWindow):
             GLib.source_remove(self._status_timer)
             self._status_timer = None
         self.status.set_text(text)
+        self.status.set_tooltip_text(text)
         if text in (
             "Waiting",
             "Thinking",
