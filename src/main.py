@@ -5,6 +5,7 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 from contextlib import suppress
 from pathlib import Path
 
@@ -329,8 +330,8 @@ class ChatController:
             self.refresh()
         self._drafts.pop(chat_id, None)
 
-    def add_documents(self, paths):
-        chat_id = self.chat["id"]
+    def add_documents(self, paths, chat_id=None):
+        chat_id = chat_id or self.chat["id"]
         ready = threading.Event()
         self._document_imports[chat_id] = (*self._document_imports.get(chat_id, ()), ready)
         threading.Thread(
@@ -356,11 +357,29 @@ class ChatController:
 
     def _add_documents(self, paths, chat_id):
         supported, skipped = [], []
+        destination = self.store.documents(chat_id)
+        reserved = set()
         for path in map(Path, paths):
-            if read_document(path) is None:
+            if path.is_symlink():
                 skipped.append(path)
+                continue
+            if path.is_dir():
+                name = path.name
+                if (destination / name).exists() or name in reserved:
+                    name = f"{name}-{uuid.uuid4().hex[:6]}"
+                reserved.add(name)
+                candidates = (
+                    (item, Path(name) / item.relative_to(path)) for item in path.rglob("*")
+                )
             else:
-                supported.append(path)
+                candidates = ((path, Path(path.name)),)
+            for item, relative in candidates:
+                if item.is_dir() or item.is_symlink():
+                    continue
+                if read_document(item) is None:
+                    skipped.append(item)
+                else:
+                    supported.append((item, relative))
         if supported:
             try:
                 self.store.add_documents(chat_id, supported)

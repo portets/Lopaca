@@ -202,10 +202,12 @@ class ChatStore:
     def add_documents(self, chat_id, paths):
         folder = self.documents(chat_id)
         folder.mkdir(exist_ok=True)
-        for path in map(Path, paths):
-            if not path.is_file():
+        for path, relative in paths:
+            path = Path(path)
+            if not path.is_file() or path.is_symlink():
                 continue
-            target = folder / path.name
+            target = folder / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
             if target.exists():
                 target = folder / f"{path.stem}-{uuid.uuid4().hex[:6]}{path.suffix}"
             shutil.copyfile(path, target)

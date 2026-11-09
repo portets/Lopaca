@@ -313,9 +313,12 @@ def _unchanged(path, stamp):
 
 
 def _keywords(source, section, body):
-    """Include split camelCase/snake_case terms alongside the original source text."""
-    words = re.sub(r"([a-z\d])([A-Z])", r"\1 \2", f"{source} {section} {body}")
-    return " ".join(re.findall(r"[^\W_]+", words))
+    """Index only additional identifier terms; FTS already indexes the original text."""
+    # Copying all prose here duplicated both stored text and token postings. unicode61
+    # already splits snake_case; only camelCase needs extra terms for lexical matching.
+    identifiers = re.findall(r"\b\w*[a-z\d][A-Z]\w*\b", f"{source} {section} {body}")
+    words = re.sub(r"([a-z\d])([A-Z])", r"\1 \2", " ".join(identifiers))
+    return " ".join(dict.fromkeys(re.findall(r"[^\W_]+", words)))
 
 
 def read_document(path):
@@ -544,6 +547,9 @@ def _chunks(text, filename, size, overlap):
 def _connect_index(path, timeout=5):
     """Keep compressed bodies behind FTS external content; ranking sees the original text."""
     connection = sqlite3.connect(path, timeout=timeout)
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in (0, 1):
+        connection.close()
+        raise ValueError(f"Unsupported search index format: {path}")
     tables = {
         row[0]
         for row in connection.execute(
@@ -567,6 +573,7 @@ def _create_chunks(connection):
             start_line INTEGER, end_line INTEGER
         );
         CREATE INDEX IF NOT EXISTS passage_source ON passages(source, section, start_line);
+        CREATE INDEX IF NOT EXISTS passage_lines ON passages(source, start_line, id);
         CREATE VIEW IF NOT EXISTS chunk_content AS
             SELECT id AS rowid, source, section, unpack_text(body) AS body,
                    unpack_text(keywords) AS keywords,
@@ -601,6 +608,9 @@ def _create_chunks(connection):
                         NEW.start_line,NEW.end_line);
         END;
     """)
+    # Repeating the PRAGMA assignment writes the header even when no documents changed.
+    if connection.execute("PRAGMA user_version").fetchone()[0] != 1:
+        connection.execute("PRAGMA user_version = 1")
 
 
 def _index(connection, folder, settings, stopped):
@@ -613,7 +623,7 @@ def _index(connection, folder, settings, stopped):
 
     """)
     _create_chunks(connection)
-    signature = f"4:{settings.chunk_chars}:{settings.chunk_overlap}"
+    signature = f"5:{settings.chunk_chars}:{settings.chunk_overlap}"
     state = connection.execute("SELECT value FROM index_state WHERE key = 'chunking'").fetchone()
     changed = state != (signature,)
     if changed:
@@ -685,14 +695,10 @@ def _search(connection, expression, limit, sources=()):
         if sources
         else ""
     )
-    # Rank before reading compressed content; only selected candidates need decompression.
     return connection.execute(
-        "WITH matches AS MATERIALIZED (SELECT rowid, "
-        "bm25(chunks, 4.0, 2.0, 1.0, 0.5) AS score FROM chunks WHERE chunks MATCH ?"
+        "SELECT rowid FROM chunks WHERE chunks MATCH ?"
         + scope
-        + " ORDER BY score LIMIT ?) "
-        "SELECT p.rowid,p.source,p.section,p.body,p.start_line,p.end_line "
-        "FROM matches m JOIN chunk_content p ON p.rowid=m.rowid ORDER BY m.score",
+        + " ORDER BY bm25(chunks, 4.0, 2.0, 1.0, 0.5) LIMIT ?",
         (expression, *sources, limit),
     ).fetchall()
 
@@ -812,15 +818,23 @@ def _rank(connection, query, expansion, settings, excluded_sources=()):
         (0.4, " OR ".join(_quote(phrase) for phrase in phrases)),
         (0.35, " OR ".join(_quote(term) for term in extra)),
     ]
-    candidates, ranks = {}, defaultdict(float)
+    ranks = defaultdict(float)
     for weight, expression in expressions:
-        for rank, row in enumerate(
+        for rank, (rowid,) in enumerate(
             _search(connection, expression, max(1, settings.rag_candidates), sources), 1
         ):
-            candidates[row[0]] = row
-            ranks[row[0]] += weight / (60 + rank)
-    if not candidates:
+            ranks[rowid] += weight / (60 + rank)
+    if not ranks:
         return []
+    # Complementary searches often find the same passages. Decode each candidate once.
+    candidates = {
+        row[0]: row
+        for row in connection.execute(
+            "SELECT rowid,source,section,body,start_line,end_line FROM chunk_content "
+            "WHERE rowid IN (" + ",".join("?" for _ in ranks) + ")",
+            tuple(ranks),
+        )
+    }
     matches, file_matches, body_matches = defaultdict(set), defaultdict(set), defaultdict(set)
     rowids = ",".join("?" for _ in candidates)
     for term in weights:

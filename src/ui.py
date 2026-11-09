@@ -832,6 +832,10 @@ class ChatWindow(Adw.ApplicationWindow):
                 ),
                 ("Open Folder", lambda chat_id=chat["id"]: self.controller.open_folder(chat_id)),
                 ("Add Documents", lambda chat_id=chat["id"]: self._choose_documents(chat_id)),
+                (
+                    "Add Folder",
+                    lambda chat_id=chat["id"]: self._choose_documents(chat_id, folder=True),
+                ),
                 ("Chat Settings", lambda chat_id=chat["id"]: self._show_settings(chat_id)),
                 ("Delete Chat", lambda chat_id=chat["id"]: self._confirm_delete_chat(chat_id)),
             )
@@ -1634,20 +1638,33 @@ class ChatWindow(Adw.ApplicationWindow):
 
         alert.choose(self, None, confirmed)
 
-    def _choose_documents(self, chat_id):
+    def _choose_documents(self, chat_id, *, folder=False):
         if self.chat and self.chat["id"] != chat_id:
             self.controller.open_chat(chat_id)
         chooser = Gtk.FileDialog.new()
-        chooser.set_title("Add documents to this chat")
-        chooser.open_multiple(self, None, self._documents_chosen)
+        chooser.set_accept_label("Add")
+        if folder:
+            chooser.set_title("Add a document folder")
+            chooser.select_folder(self, None, self._folder_chosen, chat_id)
+        else:
+            chooser.set_title("Add documents to this chat")
+            chooser.open_multiple(self, None, self._documents_chosen, chat_id)
 
-    def _documents_chosen(self, chooser, result):
+    def _documents_chosen(self, chooser, result, chat_id):
         try:
             files = chooser.open_multiple_finish(result)
         except GLib.Error:
             return
         paths = (files.get_item(i).get_path() for i in range(files.get_n_items()))
-        self.controller.add_documents([path for path in paths if path])
+        self.controller.add_documents([path for path in paths if path], chat_id)
+
+    def _folder_chosen(self, chooser, result, chat_id):
+        try:
+            folder = chooser.select_folder_finish(result)
+        except GLib.Error:
+            return
+        if path := folder.get_path():
+            self.controller.add_documents([path], chat_id)
 
     def show_document_warning(self, paths):
         detail = (

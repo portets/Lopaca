@@ -119,7 +119,11 @@ class HistoryIndex:
             if not text:
                 continue
             source = f"{chat_id}-{start}.md"
-            stamp = hashlib.sha256((chat["title"] + text).encode()).hexdigest()
+            # Raw records use the shared keyword recipe; summaries deliberately keep raw
+            # lexical terms to retain topics omitted by model summarization.
+            stamp = hashlib.sha256(
+                (("" if assisted else "keywords-5:") + chat["title"] + text).encode()
+            ).hexdigest()
             windows.append(source)
             with closing(self._connect()) as db:
                 prior = db.execute(

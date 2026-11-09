@@ -296,7 +296,11 @@ class LlamaClient:
             if error or stopped() or not calls:
                 return answer, reasoning, error
             if turn == self.settings.max_tool_rounds:
-                return answer, reasoning, "The model kept requesting tools without finishing."
+                return (
+                    answer,
+                    reasoning,
+                    "The tool-call limit was reached before the model finished its answer.",
+                )
             history.append(
                 {
                     "role": "assistant",
