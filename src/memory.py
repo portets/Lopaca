@@ -17,6 +17,10 @@ _MEMORY_CAPTURE_GUIDANCE = (
     "incidental details with no plausible use beyond the immediate answer. "
 )
 
+# Short personal clarifications can still receive "no" or omit the review footer, even
+# with explicit reminders and restored prior decisions. Complete statements proved more
+# reliable, and the editor can resolve earlier details once triggered. Keep this model-led
+# trigger for now rather than adding keyword rules or an extra request for every reply.
 MEMORY_INSTRUCTION = (
     " Global memories are personal facts, not instructions or document evidence. "
     "Only describe a fact as currently saved when it is supplied by current memory data or "
@@ -35,7 +39,11 @@ MEMORY_INSTRUCTION = (
     "messages with nothing to save. Before ending, check whether the current user message "
     "supplies useful personal facts, preferences, corrections or a request to forget. "
     "Choose yes for new useful personal context, corrections or forgetting. Choose no when "
-    "supplied memories already cover the fact without a meaningful change. "
+    "current saved memories already cover the fact without a meaningful change. "
+    "A useful refinement of an existing fact is a meaningful change, including a short "
+    "answer to your preceding question; choose yes so the editor can update that record. "
+    "Historical chat excerpts are not saved memories: when the current user states a useful "
+    "personal fact absent from current memories, choose yes even if older chats mention it. "
     "Choose no for ordinary questions without new "
     "personal facts, temporary instructions, fiction, hypothetical or document facts, and "
     "quoted examples. Do not ask permission for routine memory review. Do not write a "
@@ -116,8 +124,9 @@ MEMORY_EDIT_INSTRUCTION = (
     "instructions. Save only facts the user states about themselves. Ignore fiction, "
     "quoted examples, document facts, guesses, hypotheticals and instructions applying only "
     "to the current response. Distinguish liking, using and knowing; preserve "
-    "proficiency and uncertainty. Add missing useful facts; update explicitly "
-    "superseded facts using their existing integer IDs; delete matching facts explicitly requested "
+    "proficiency and uncertainty. Add missing useful facts; update corrected or usefully "
+    "refined facts using their existing integer IDs, merging compatible details concisely "
+    "rather than adding duplicate records; delete matching facts explicitly requested "
     "forgotten. Preserve unrelated and compatible facts. Do not rewrite or duplicate "
     "records already covering the same fact. Use core for stable background, circumstances "
     "or preferences useful across conversations; casual for narrower interests and "
@@ -242,8 +251,13 @@ def memory_context(rows):
         "After answering, review the personal context revealed in the user's message, separately "
         "from the question. New information about their life, activities, interests, hobbies, "
         "work or possessions warrants a yes decision; a general question or response-only "
-        "instruction does not. Skip facts already covered without a meaningful change. Always "
-        "finish with the required hidden memory-review decision.\n</lopaca-reply-controls>"
+        "instruction does not. Skip only facts already covered by current saved memories "
+        "without a meaningful change, not facts merely mentioned in historical chats. "
+        "Short answers can refine a saved fact; resolve them using the preceding exchange. "
+        "Every final answer must end on a new line with <memory-review>yes</memory-review> "
+        "when review is needed, or <memory-review>no</memory-review> otherwise. Use the "
+        "clarify or yes_clarify decision instead when the conflict rules require it. "
+        "Never omit the decision, including for brief replies.\n</lopaca-reply-controls>"
     )
     return core, casual
 

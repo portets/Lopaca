@@ -12,6 +12,7 @@ import re
 import sqlite3
 import threading
 import time
+import zlib
 from collections import defaultdict
 from contextlib import closing, suppress
 from pathlib import Path
@@ -150,9 +151,7 @@ class DocumentIndexer:
                 self._active = folder, ready
             try:
                 if folder.is_dir():
-                    with closing(
-                        sqlite3.connect(folder.parent / "documents.sqlite", timeout=5)
-                    ) as connection:
+                    with closing(_connect_index(folder.parent / "documents.sqlite")) as connection:
                         changed = _index(connection, folder, self.settings, lambda: False)
                         version = self._hint_version if self.enabled else "off"
                         state = connection.execute(
@@ -204,7 +203,8 @@ class DocumentIndexer:
                     jobs.append((rowid, source, section, body, key, search_text))
                 if search_text != keywords:
                     connection.execute(
-                        "UPDATE chunks SET keywords = ? WHERE rowid = ?", (search_text, rowid)
+                        "UPDATE chunk_content SET keywords = ? WHERE rowid = ?",
+                        (search_text, rowid),
                     )
             for key in cached.keys() - keys:
                 connection.execute("DELETE FROM document_hints WHERE key = ?", (key,))
@@ -228,8 +228,9 @@ class DocumentIndexer:
                     with connection:
                         # Row IDs can be reused if another process reindexes this chat.
                         result = connection.execute(
-                            "UPDATE chunks SET keywords = ? "
-                            "WHERE rowid = ? AND source = ? AND section = ? AND body = ?",
+                            "UPDATE chunk_content SET keywords = ? "
+                            "WHERE rowid = ? AND source = ? AND section = ? AND body = ? "
+                            "RETURNING rowid",
                             (
                                 search_text + (" " + questions if self.enabled else ""),
                                 rowid,
@@ -238,7 +239,7 @@ class DocumentIndexer:
                                 body,
                             ),
                         )
-                        if result.rowcount:
+                        if result.fetchone() is not None:
                             connection.execute(
                                 "INSERT OR REPLACE INTO document_hints VALUES (?, ?)",
                                 (key, questions),
@@ -420,8 +421,19 @@ def retrieve_memories(store, query, expansion="", previous_queries=()):
             ).fetchall()
             for rank, (memory_id,) in enumerate(rows, 1):
                 scores[memory_id] += weight / (60 + rank)
-        records = {row[0]: row for row in connection.execute("SELECT id,text,core FROM memories")}
-    return [records[key] for key in sorted(scores, key=scores.get, reverse=True)[:6]]
+        selected = sorted(scores, key=scores.get, reverse=True)[:6]
+        if not selected:
+            return []
+        records = {
+            row[0]: row
+            for row in connection.execute(
+                "SELECT id,text,core FROM memories WHERE id IN ("
+                + ",".join("?" for _ in selected)
+                + ")",
+                selected,
+            )
+        }
+    return [records[key] for key in selected if key in records]
 
 
 def _sections(text, filename):
@@ -529,6 +541,68 @@ def _chunks(text, filename, size, overlap):
             start = next_start
 
 
+def _connect_index(path, timeout=5):
+    """Keep compressed bodies behind FTS external content; ranking sees the original text."""
+    connection = sqlite3.connect(path, timeout=timeout)
+    tables = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE name IN ('chunks', 'passages')"
+        )
+    }
+    if tables == {"chunks"}:
+        connection.close()
+        raise ValueError(f"Rebuild required: delete the old search index {path}")
+    connection.create_function("pack_text", 1, lambda text: zlib.compress(text.encode(), 1))
+    connection.create_function("unpack_text", 1, lambda body: zlib.decompress(body).decode())
+    return connection
+
+
+def _create_chunks(connection):
+    # Store source metadata in an indexed table so context lookups never scan the FTS corpus.
+    # The writable view keeps compression and FTS maintenance shared by documents/history.
+    connection.executescript("""
+        CREATE TABLE IF NOT EXISTS passages (
+            id INTEGER PRIMARY KEY, source TEXT, section TEXT, body BLOB, keywords BLOB,
+            start_line INTEGER, end_line INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS passage_source ON passages(source, section, start_line);
+        CREATE VIEW IF NOT EXISTS chunk_content AS
+            SELECT id AS rowid, source, section, unpack_text(body) AS body,
+                   unpack_text(keywords) AS keywords,
+                   start_line, end_line FROM passages;
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
+            source, section, body, keywords, start_line UNINDEXED, end_line UNINDEXED,
+            content='chunk_content', tokenize='porter unicode61'
+        );
+        CREATE TRIGGER IF NOT EXISTS passage_insert INSTEAD OF INSERT ON chunk_content BEGIN
+            INSERT INTO passages VALUES (NEW.rowid, NEW.source, NEW.section,
+                pack_text(NEW.body), pack_text(NEW.keywords), NEW.start_line, NEW.end_line);
+            INSERT INTO chunks(rowid,source,section,body,keywords,start_line,end_line)
+                VALUES (last_insert_rowid(),NEW.source,NEW.section,NEW.body,NEW.keywords,
+                        NEW.start_line,NEW.end_line);
+        END;
+        CREATE TRIGGER IF NOT EXISTS passage_delete INSTEAD OF DELETE ON chunk_content BEGIN
+            INSERT INTO chunks(chunks,rowid,source,section,body,keywords,start_line,end_line)
+                VALUES ('delete',OLD.rowid,OLD.source,OLD.section,OLD.body,OLD.keywords,
+                        OLD.start_line,OLD.end_line);
+            DELETE FROM passages WHERE id=OLD.rowid;
+        END;
+        CREATE TRIGGER IF NOT EXISTS passage_update INSTEAD OF UPDATE ON chunk_content BEGIN
+            INSERT INTO chunks(chunks,rowid,source,section,body,keywords,start_line,end_line)
+                VALUES ('delete',OLD.rowid,OLD.source,OLD.section,OLD.body,OLD.keywords,
+                        OLD.start_line,OLD.end_line);
+            UPDATE passages SET source=NEW.source,section=NEW.section,
+                body=CASE WHEN OLD.body=NEW.body THEN body ELSE pack_text(NEW.body) END,
+                keywords=pack_text(NEW.keywords),start_line=NEW.start_line,end_line=NEW.end_line
+                WHERE id=OLD.rowid;
+            INSERT INTO chunks(rowid,source,section,body,keywords,start_line,end_line)
+                VALUES (OLD.rowid,NEW.source,NEW.section,NEW.body,NEW.keywords,
+                        NEW.start_line,NEW.end_line);
+        END;
+    """)
+
+
 def _index(connection, folder, settings, stopped):
     connection.executescript("""
         CREATE TABLE IF NOT EXISTS files (
@@ -536,17 +610,15 @@ def _index(connection, folder, settings, stopped):
         );
         CREATE TABLE IF NOT EXISTS index_state (key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE IF NOT EXISTS document_hints (key TEXT PRIMARY KEY, questions TEXT);
-        CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
-            source, section, body, keywords, start_line UNINDEXED, end_line UNINDEXED,
-            tokenize='porter unicode61'
-        );
+
     """)
+    _create_chunks(connection)
     signature = f"4:{settings.chunk_chars}:{settings.chunk_overlap}"
     state = connection.execute("SELECT value FROM index_state WHERE key = 'chunking'").fetchone()
     changed = state != (signature,)
     if changed:
         with connection:
-            connection.execute("DELETE FROM chunks")
+            connection.execute("DELETE FROM chunk_content")
             connection.execute("DELETE FROM files")
             connection.execute("DELETE FROM index_state WHERE key = 'model_indexing'")
             connection.execute(
@@ -580,7 +652,7 @@ def _index(connection, folder, settings, stopped):
         with connection:
             changed = True
             connection.execute("DELETE FROM index_state WHERE key = 'model_indexing'")
-            connection.execute("DELETE FROM chunks WHERE source = ?", (name,))
+            connection.execute("DELETE FROM chunk_content WHERE source = ?", (name,))
             if text:
                 for section, first, last, body in _chunks(
                     text, name, settings.chunk_chars, settings.chunk_overlap
@@ -588,7 +660,7 @@ def _index(connection, folder, settings, stopped):
                     if stopped():
                         raise InterruptedError("Document indexing stopped")
                     connection.execute(
-                        "INSERT INTO chunks "
+                        "INSERT INTO chunk_content "
                         "(source, section, body, keywords, start_line, end_line) "
                         "VALUES (?, ?, ?, ?, ?, ?)",
                         (name, section, body, _keywords(name, section, body), first, last),
@@ -598,7 +670,7 @@ def _index(connection, folder, settings, stopped):
         for name in cached.keys() - seen:
             changed = True
             connection.execute("DELETE FROM index_state WHERE key = 'model_indexing'")
-            connection.execute("DELETE FROM chunks WHERE source = ?", (name,))
+            connection.execute("DELETE FROM chunk_content WHERE source = ?", (name,))
             connection.execute("DELETE FROM files WHERE path = ?", (name,))
     return changed
 
@@ -606,10 +678,21 @@ def _index(connection, folder, settings, stopped):
 def _search(connection, expression, limit, sources=()):
     if not expression:
         return []
-    scope = " AND source IN (" + ",".join("?" for _ in sources) + ")" if sources else ""
+    scope = (
+        " AND rowid IN (SELECT id FROM passages WHERE source IN ("
+        + ",".join("?" for _ in sources)
+        + "))"
+        if sources
+        else ""
+    )
+    # Rank before reading compressed content; only selected candidates need decompression.
     return connection.execute(
-        "SELECT rowid, source, section, body, start_line, end_line FROM chunks "
-        "WHERE chunks MATCH ?" + scope + " ORDER BY bm25(chunks, 4.0, 2.0, 1.0, 0.5) LIMIT ?",
+        "WITH matches AS MATERIALIZED (SELECT rowid, "
+        "bm25(chunks, 4.0, 2.0, 1.0, 0.5) AS score FROM chunks WHERE chunks MATCH ?"
+        + scope
+        + " ORDER BY score LIMIT ?) "
+        "SELECT p.rowid,p.source,p.section,p.body,p.start_line,p.end_line "
+        "FROM matches m JOIN chunk_content p ON p.rowid=m.rowid ORDER BY m.score",
         (expression, *sources, limit),
     ).fetchall()
 
@@ -641,14 +724,14 @@ def _document_context(connection, row, limit):
     """Keep small source documents together instead of losing facts across tiny sections."""
     source = row[1]
     parts = connection.execute(
-        "SELECT rowid,source,section,body,start_line,end_line FROM chunks "
+        "SELECT rowid,source,section,body,start_line,end_line FROM chunk_content "
         "WHERE source=? ORDER BY start_line,rowid LIMIT 17",
         (source,),
     ).fetchall()
     if not (1 < len(parts) < 17 and sum(len(part[3]) + 2 for part in parts) <= limit):
         parts = (
             connection.execute(
-                "SELECT rowid,source,section,body,start_line,end_line FROM chunks "
+                "SELECT rowid,source,section,body,start_line,end_line FROM chunk_content "
                 "WHERE source=? AND section=? ORDER BY start_line,rowid LIMIT 17",
                 (source, row[2]),
             ).fetchall()
@@ -659,7 +742,7 @@ def _document_context(connection, row, limit):
         1 < len(parts) < 17 and sum(len(part[3]) + 2 for part in parts) <= limit
     ):
         parts = connection.execute(
-            "SELECT rowid,source,section,body,start_line,end_line FROM chunks "
+            "SELECT rowid,source,section,body,start_line,end_line FROM chunk_content "
             "WHERE source=? AND section=? ORDER BY abs(start_line-?),abs(rowid-?) LIMIT 3",
             (source, row[2], row[4], row[0]),
         ).fetchall()
@@ -692,7 +775,7 @@ def _rank(connection, query, expansion, settings, excluded_sources=()):
     expanded_terms = set(extra)
     if not terms:
         return []
-    total = connection.execute("SELECT count(*) FROM chunks").fetchone()[0]
+    total = connection.execute("SELECT count(*) FROM passages").fetchone()[0]
     if not total:
         return []
     hint_state = connection.execute(
@@ -846,10 +929,7 @@ def _rank(connection, query, expansion, settings, excluded_sources=()):
             for start, end in spans[source]
         ):
             continue
-        reference = f"documents/{source}, lines {first}-{last}"
-        if section:
-            reference += f", section: {section}"
-        selected.append((reference, body))
+        selected.append(row)
         used.update(
             file_matches[source] & content_terms if contexts[context_key] else covered_terms[rowid]
         )
@@ -899,7 +979,7 @@ def retrieve(
         or settings.max_context_chars <= 0
     ):
         return []
-    with closing(sqlite3.connect(folder.parent / "documents.sqlite", timeout=5)) as connection:
+    with closing(_connect_index(folder.parent / "documents.sqlite")) as connection:
         connection.set_progress_handler(lambda: int(stopped()), 1000)
         if refresh:
             _index(connection, folder, settings, stopped)
@@ -919,7 +999,13 @@ def retrieve(
         # Keep term counts, candidate rows, and excerpts in the same read snapshot.
         # Begin after expansion so its model request cannot hold up indexing commits.
         connection.execute("BEGIN")
-        return _rank(connection, query, expansion, settings)
+        retrieved = []
+        for _, source, section, body, first, last in _rank(connection, query, expansion, settings):
+            reference = f"documents/{source}, lines {first}-{last}"
+            if section:
+                reference += f", section: {section}"
+            retrieved.append((reference, body))
+        return retrieved
 
 
 def format_context(retrieved, max_chars):

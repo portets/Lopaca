@@ -26,6 +26,7 @@ def recent_messages(history, limit=3):
         if role not in counts or counts[role] >= limit:
             continue
         content = message.get("content", "").split("<lopaca-document-references>", 1)[0]
+        content = memory_review(content)[0]
         content = re.sub(r"<think>.*?(?:</think>|$)", "", content, flags=re.DOTALL).strip()
         if not content:
             continue

@@ -5,12 +5,11 @@ import json
 import logging
 import queue
 import re
-import sqlite3
 import threading
 from contextlib import closing
 from dataclasses import replace
 
-from rag import _chunks, _keywords, _rank, _terms
+from rag import _chunks, _connect_index, _create_chunks, _keywords, _rank, _terms
 
 # Conversation-navigation words describe the lookup, rather than its subject.
 _HISTORY_STOP_WORDS = {
@@ -46,7 +45,7 @@ class HistoryIndex:
         threading.Thread(target=self._run, daemon=True).start()
 
     def _connect(self):
-        db = sqlite3.connect(self.path, timeout=10)
+        db = _connect_index(self.path, timeout=10)
         db.executescript("""
             CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS index_state (key TEXT PRIMARY KEY, value TEXT);
@@ -54,11 +53,8 @@ class HistoryIndex:
                 source TEXT PRIMARY KEY, chat TEXT, title TEXT, first INTEGER, last INTEGER,
                 stamp TEXT, assisted INTEGER, timestamp REAL
             );
-            CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
-                source, section, body, keywords, start_line UNINDEXED, end_line UNINDEXED,
-                tokenize='porter unicode61'
-            );
         """)
+        _create_chunks(db)
         return db
 
     def schedule(self, chat_id):
@@ -83,7 +79,7 @@ class HistoryIndex:
                 r[0] for r in db.execute("SELECT source FROM records WHERE chat=?", (chat_id,))
             ]
             for source in sources:
-                db.execute("DELETE FROM chunks WHERE source=?", (source,))
+                db.execute("DELETE FROM chunk_content WHERE source=?", (source,))
                 db.execute("DELETE FROM files WHERE path=?", (source,))
             db.execute("DELETE FROM records WHERE chat=?", (chat_id,))
 
@@ -169,7 +165,7 @@ class HistoryIndex:
                 # A chat deleted during a slow model request must never reappear in the index.
                 if not self.store.folder(chat_id).exists():
                     return
-                db.execute("DELETE FROM chunks WHERE source=?", (source,))
+                db.execute("DELETE FROM chunk_content WHERE source=?", (source,))
                 for section, first, last, content in _chunks(
                     f"# {chat['title']}\n\n{body}",
                     source,
@@ -177,7 +173,9 @@ class HistoryIndex:
                     self.settings.chunk_overlap,
                 ):
                     db.execute(
-                        "INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO chunk_content "
+                        "(source,section,body,keywords,start_line,end_line) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
                         (
                             source,
                             chat["title"],
@@ -208,7 +206,7 @@ class HistoryIndex:
                 "SELECT source FROM records WHERE chat=?", (chat_id,)
             ).fetchall():
                 if source not in windows:
-                    db.execute("DELETE FROM chunks WHERE source=?", (source,))
+                    db.execute("DELETE FROM chunk_content WHERE source=?", (source,))
                     db.execute("DELETE FROM files WHERE path=?", (source,))
                     db.execute("DELETE FROM records WHERE source=?", (source,))
 
@@ -240,8 +238,7 @@ class HistoryIndex:
                 excluded,
             )
             excerpts = []
-            for reference, text in hits:
-                source = reference.removeprefix("documents/").split(", lines ", 1)[0]
+            for _, source, _section, text, _first, _last in hits:
                 row = db.execute(
                     "SELECT chat,title,first,last,assisted FROM records WHERE source=?", (source,)
                 ).fetchone()

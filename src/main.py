@@ -489,6 +489,14 @@ class ChatController:
             content = message.get("content", "")
             if message["role"] == "assistant":
                 content = self.visible_answer(content)
+                review = message.get("memory_review")
+                if settings["global_memories"] is True and review in (
+                    "yes",
+                    "no",
+                    "clarify",
+                    "yes_clarify",
+                ):
+                    content += f"\n<memory-review>{review}</memory-review>"
             item = {"role": message["role"], "content": content}
             if preserve_thinking and message.get("reasoning_content"):
                 item["reasoning_content"] = message["reasoning_content"]
@@ -501,7 +509,9 @@ class ChatController:
             )
         self._generation_chat_id = chat_id
         self._generation_context_used = None
+        self._generation_memory_review = None
         self._generation_thinking = self.thinking_parameters(chat_id)
+        self._generation_memory_review = None
         self._generation_thinking_options = auto_thinking_options(tuple(self._thinking_levels))
         self.busy = True
         self.stop_requested = False
@@ -675,6 +685,7 @@ class ChatController:
         clarification = False
         if memory_enabled:
             answer, review = memory_review(answer)
+            self._generation_memory_review = review
             clarification = (
                 review in ("clarify", "yes_clarify") and not error and memories_enabled()
             )
@@ -774,6 +785,8 @@ class ChatController:
         )
         if clarification and answer.strip():
             chat["messages"][-1]["memory_clarification"] = True
+        if self._generation_memory_review is not None:
+            chat["messages"][-1]["memory_review"] = self._generation_memory_review
         if self._generation_context_used is not None:
             chat.setdefault("inference_stats", {})["context_used"] = self._generation_context_used
         chat["updated"] = finished_at
