@@ -547,9 +547,9 @@ def _chunks(text, filename, size, overlap):
 def _connect_index(path, timeout=5):
     """Keep compressed bodies behind FTS external content; ranking sees the original text."""
     connection = sqlite3.connect(path, timeout=timeout)
-    if connection.execute("PRAGMA user_version").fetchone()[0] not in (0, 1):
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in (0, 2):
         connection.close()
-        raise ValueError(f"Unsupported search index format: {path}")
+        raise ValueError(f"Rebuild required: delete the old search index {path}")
     tables = {
         row[0]
         for row in connection.execute(
@@ -561,17 +561,48 @@ def _connect_index(path, timeout=5):
         raise ValueError(f"Rebuild required: delete the old search index {path}")
     connection.create_function("pack_text", 1, lambda text: zlib.compress(text.encode(), 1))
     connection.create_function("unpack_text", 1, lambda body: zlib.decompress(body).decode())
+    connection.create_function("source_key", 1, str.casefold, deterministic=True)
+    connection.create_function(
+        "source_name", 1, lambda path: path.rsplit("/", 1)[-1].casefold(), deterministic=True
+    )
+    connection.create_function(
+        "source_suffix", 1, lambda path: Path(path).suffix.casefold(), deterministic=True
+    )
     return connection
 
 
 def _create_chunks(connection):
     # Store source metadata in an indexed table so context lookups never scan the FTS corpus.
     # The writable view keeps compression and FTS maintenance shared by documents/history.
+    # Transactional metadata avoids corpus scans, including COUNT(*) on a cold index.
     connection.executescript("""
         CREATE TABLE IF NOT EXISTS passages (
             id INTEGER PRIMARY KEY, source TEXT, section TEXT, body BLOB, keywords BLOB,
             start_line INTEGER, end_line INTEGER
         );
+        CREATE TABLE IF NOT EXISTS retrieval_stats (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1), passages INTEGER NOT NULL
+        );
+        INSERT OR IGNORE INTO retrieval_stats VALUES (1, 0);
+        CREATE TRIGGER IF NOT EXISTS count_passage_insert AFTER INSERT ON passages BEGIN
+            UPDATE retrieval_stats SET passages=passages+1 WHERE singleton=1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS count_passage_delete AFTER DELETE ON passages BEGIN
+            UPDATE retrieval_stats SET passages=passages-1 WHERE singleton=1;
+        END;
+        CREATE TABLE IF NOT EXISTS source_names (
+            source TEXT PRIMARY KEY, path_key TEXT, name_key TEXT, suffix TEXT
+        );
+        CREATE INDEX IF NOT EXISTS source_path_key ON source_names(path_key);
+        CREATE INDEX IF NOT EXISTS source_name_key ON source_names(name_key);
+        CREATE INDEX IF NOT EXISTS source_suffix_key ON source_names(suffix);
+        CREATE TRIGGER IF NOT EXISTS source_insert AFTER INSERT ON files BEGIN
+            INSERT OR REPLACE INTO source_names VALUES
+                (NEW.path, source_key(NEW.path), source_name(NEW.path), source_suffix(NEW.path));
+        END;
+        CREATE TRIGGER IF NOT EXISTS source_delete AFTER DELETE ON files BEGIN
+            DELETE FROM source_names WHERE source=OLD.path;
+        END;
         CREATE INDEX IF NOT EXISTS passage_source ON passages(source, section, start_line);
         CREATE INDEX IF NOT EXISTS passage_lines ON passages(source, start_line, id);
         CREATE VIEW IF NOT EXISTS chunk_content AS
@@ -609,8 +640,8 @@ def _create_chunks(connection):
         END;
     """)
     # Repeating the PRAGMA assignment writes the header even when no documents changed.
-    if connection.execute("PRAGMA user_version").fetchone()[0] != 1:
-        connection.execute("PRAGMA user_version = 1")
+    if connection.execute("PRAGMA user_version").fetchone()[0] != 2:
+        connection.execute("PRAGMA user_version = 2")
 
 
 def _index(connection, folder, settings, stopped):
@@ -706,23 +737,33 @@ def _search(connection, expression, limit, sources=()):
 def _source_scope(paths, terms, query):
     """Restrict sources only when the query names an actual filename."""
     explicit = {
-        path for path in paths if path.casefold() in terms or Path(path).name.casefold() in terms
+        path
+        for path in paths
+        if path.casefold() in terms or path.rsplit("/", 1)[-1].casefold() in terms
     }
     if explicit:
         return (
             tuple(sorted(explicit)) if len(explicit) <= 64 else (),
             set(terms)
-            & {name for path in explicit for name in (path.casefold(), Path(path).name.casefold())},
+            & {
+                name
+                for path in explicit
+                for name in (path.casefold(), path.rsplit("/", 1)[-1].casefold())
+            },
         )
-    suffixes = {Path(path).suffix.casefold() for path in paths} - {""}
-    if any(
-        Path(term).suffix in suffixes
+    # Most queries name no file; avoid parsing every source suffix on that hot path.
+    requested = [
+        term
+        for term in terms
+        if Path(term).suffix
         and re.search(
             r"\b(?:in|from|according to)\s+[`\"]?" + re.escape(term), query, re.IGNORECASE
         )
-        for term in terms
-    ):
-        return None, set()  # A specifically requested local filename does not exist.
+    ]
+    if requested:
+        suffixes = {Path(path).suffix.casefold() for path in paths} - {""}
+        if any(Path(term).suffix in suffixes for term in requested):
+            return None, set()  # A specifically requested local filename does not exist.
     return (), set()
 
 
@@ -781,7 +822,9 @@ def _rank(connection, query, expansion, settings, excluded_sources=()):
     expanded_terms = set(extra)
     if not terms:
         return []
-    total = connection.execute("SELECT count(*) FROM passages").fetchone()[0]
+    total = connection.execute("SELECT passages FROM retrieval_stats WHERE singleton=1").fetchone()[
+        0
+    ]
     if not total:
         return []
     hint_state = connection.execute(
@@ -799,8 +842,32 @@ def _rank(connection, query, expansion, settings, excluded_sources=()):
         term: math.log1p((total + 0.5) / (frequencies[term] + 0.5)) if frequencies[term] else 1.0
         for term in frequencies
     }
-    paths = [row[0] for row in connection.execute("SELECT path FROM files")]
+    keys = tuple(dict.fromkeys((*terms, *extra)))
+    placeholders = ",".join("?" for _ in keys)
+    paths = [
+        row[0]
+        for row in connection.execute(
+            f"SELECT source FROM source_names WHERE path_key IN ({placeholders}) "
+            f"UNION SELECT source FROM source_names WHERE name_key IN ({placeholders})",
+            (*keys, *keys),
+        )
+    ]
     sources, anchors = _source_scope(paths, terms, query)
+    if not anchors:
+        for term in terms:
+            suffix = Path(term).suffix
+            if (
+                suffix
+                and re.search(
+                    r"\b(?:in|from|according to)\s+[`\"]?" + re.escape(term), query, re.IGNORECASE
+                )
+                and connection.execute(
+                    "SELECT 1 FROM source_names WHERE suffix=? LIMIT 1", (suffix,)
+                ).fetchone()
+            ):
+                return []
+    if excluded_sources and not sources:
+        paths = [row[0] for row in connection.execute("SELECT path FROM files")]
     if sources is None:
         return []
     if excluded_sources:
@@ -859,9 +926,11 @@ def _rank(connection, query, expansion, settings, excluded_sources=()):
         if re.search(r"[_./:+#\d-]|[a-z][A-Z]", term)
     }
     # A resolved, existing filename is evidence even when a follow-up has no search terms.
-    technical.update(
-        expanded_terms & {name.casefold() for path in paths for name in (path, Path(path).name)}
-    )
+    if expanded_terms:
+        technical.update(
+            expanded_terms
+            & {name.casefold() for path in paths for name in (path, path.rsplit("/", 1)[-1])}
+        )
     expansion_weight = sum(weights[term] for term in extra)
     best_rank = max(ranks.values())
     scores, covered_terms = {}, {}
