@@ -119,7 +119,8 @@ def get_datetime():
 FILE_TOOLS = [
     _tool(
         "read_file",
-        "Read source lines only in the current chat's documents/ and projects/ folders. "
+        "Read source lines in the current chat's documents/ and projects/ folders, or "
+        "a knowledge/... article path supplied by knowledge-pack references. "
         "Use documents/py65/memory.py or projects/example.py. Unprefixed paths use projects/. "
         "Returns numbered lines and truncation/continuation information. No writes.",
         {
@@ -289,6 +290,10 @@ class ChatFiles:
     def read_file(self, path, start_line=1, line_count=100):
         if not isinstance(path, str):
             raise ValueError("Use a projects/... or documents/... path.")
+        if path.startswith("knowledge/"):
+            from knowledge import KnowledgeStore
+
+            return KnowledgeStore().read_file(path, start_line, line_count)
         root, separator, relative = path.partition("/")
         if root not in self.roots or not separator:
             root, relative = "projects", path

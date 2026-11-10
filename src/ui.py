@@ -1,6 +1,7 @@
 """GTK/libadwaita presentation layer. Application behavior lives in main.py."""
 
 import re
+import threading
 from datetime import datetime
 
 import gi
@@ -1447,6 +1448,10 @@ class ChatWindow(Adw.ApplicationWindow):
             memories_row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
             memories_row.connect("activated", lambda *_: self._show_memories(dialog))
             group.add(memories_row)
+            packs_row = Adw.ActionRow(title="Knowledge Packs", activatable=True)
+            packs_row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+            packs_row.connect("activated", lambda *_: self._show_knowledge_packs())
+            group.add(packs_row)
             add_switch(
                 "global_chat_histories",
                 "Global Chat Histories",
@@ -1640,6 +1645,86 @@ class ChatWindow(Adw.ApplicationWindow):
                 self.controller.delete_chat(chat_id)
 
         alert.choose(self, None, confirmed)
+
+    def _show_knowledge_packs(self):
+        dialog = Adw.PreferencesDialog(
+            title="Knowledge Packs", content_width=660, content_height=540
+        )
+        page = Adw.PreferencesPage()
+        group = Adw.PreferencesGroup(description="Import local .lopaca-pack.sqlite files.")
+        page.add(group)
+        dialog.add(page)
+        rows = []
+        busy = False
+        add = Gtk.Button(label="Import Pack", halign=Gtk.Align.CENTER)
+        group.set_header_suffix(add)
+
+        def refresh():
+            for row in rows:
+                group.remove(row)
+            rows.clear()
+            for key, manifest, enabled in self.controller.knowledge.list_packs():
+                row = Adw.ActionRow(title=manifest["title"], subtitle=manifest["snapshot_id"])
+                switch = Gtk.Switch(active=enabled, valign=Gtk.Align.CENTER)
+                remove = Gtk.Button(
+                    icon_name="user-trash-symbolic",
+                    valign=Gtk.Align.CENTER,
+                    tooltip_text="Remove Pack",
+                )
+
+                def toggled(button, _, k=key):
+                    active = button.get_active()
+                    work(lambda: self.controller.knowledge.change(k, active))
+
+                switch.connect("notify::active", toggled)
+                remove.connect(
+                    "clicked", lambda _, k=key: work(lambda: self.controller.knowledge.change(k))
+                )
+                row.add_suffix(switch)
+                row.add_suffix(remove)
+                group.add(row)
+                rows.append(row)
+
+        def work(action):
+            nonlocal busy
+            if busy:
+                return
+            busy = True
+            group.set_sensitive(False)
+
+            def finish(error):
+                nonlocal busy
+                busy = False
+                group.set_sensitive(True)
+                refresh()
+                if error:
+                    self._show_alert("Knowledge pack operation failed", error)
+
+            def run():
+                error = None
+                try:
+                    action()
+                except Exception as exc:
+                    error = str(exc)
+                self.dispatch(finish, error)
+
+            threading.Thread(target=run, daemon=True).start()
+
+        def chosen(chooser, result):
+            try:
+                file = chooser.open_finish(result)
+            except GLib.Error:
+                return
+            if file.get_path():
+                work(lambda: self.controller.knowledge.import_pack(file.get_path()))
+
+        def choose(*_):
+            chooser = Gtk.FileDialog(title="Import Knowledge Pack")
+            chooser.open(self, None, chosen)
+
+        add.connect("clicked", choose)
+        refresh()
+        dialog.present(self)
 
     def _choose_documents(self, chat_id, *, folder=False):
         if self.chat and self.chat["id"] != chat_id:

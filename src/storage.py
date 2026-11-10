@@ -160,8 +160,8 @@ class ChatStore:
             self.save_settings(chat_id, settings)
         documents_db = self.folder(chat_id) / "documents.sqlite"
         if not documents_db.exists():
-            with closing(sqlite3.connect(documents_db)) as connection:
-                connection.execute("PRAGMA user_version = 1")
+            # The RAG indexer creates the schema and sets its own version.
+            sqlite3.connect(documents_db).close()
 
     def create(self):
         chat = {"id": uuid.uuid4().hex, "title": "New chat", "messages": [], "created": time.time()}

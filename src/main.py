@@ -19,6 +19,7 @@ from agentic import (
     write_file,
 )
 from history import HistoryIndex
+from knowledge import KnowledgeStore
 from llama_client import LlamaClient, auto_thinking_options, recent_messages, thinking_parameters
 from memory import edit_memories, memory_context, memory_review, recall_memories, view_memories
 from rag import DocumentIndexer, format_document_context, read_document, retrieve
@@ -95,6 +96,7 @@ class ChatController:
     def __init__(self, settings):
         self.settings, self.store, self.client = settings, ChatStore(), LlamaClient(settings)
         self.memories = MemoryStore(self.store.root.parent / "memories.sqlite", settings)
+        self.knowledge = KnowledgeStore()
         self._model_lock = threading.Lock()
         indexing_client = LlamaClient(settings)
         self.document_indexer = DocumentIndexer(
@@ -679,6 +681,15 @@ class ChatController:
         messages[-1]["content"] += format_document_context(
             retrieved, self.settings.max_context_chars
         )
+        try:
+            messages[-1]["content"] += self.knowledge.context(
+                query,
+                self.settings,
+                expand=expand if query_expansion else None,
+                previous_queries=[item["content"] for item in history if item["role"] == "user"],
+            )
+        except Exception as exc:
+            self.view.dispatch(self.view.notify, f"Knowledge retrieval unavailable: {exc}")
         messages[-1]["content"] += history_context
         if memory_enabled:
             # Query-specific recall must not invalidate the cached system/core profile.
