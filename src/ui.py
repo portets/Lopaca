@@ -2,7 +2,9 @@
 
 import re
 import threading
+import time
 from datetime import datetime
+from pathlib import Path
 
 import gi
 
@@ -1670,55 +1672,137 @@ class ChatWindow(Adw.ApplicationWindow):
             "closed", lambda *_: None if dialog.return_to_settings else settings_dialog.close()
         )
         rows = []
-        busy = False
         add = Gtk.Button(label="Import Pack", halign=Gtk.Align.CENTER)
         group.set_header_suffix(add)
+        if not hasattr(self, "_knowledge_jobs"):
+            self._knowledge_jobs = []
+        self._knowledge_refresh = None
+        is_open = True
+
+        def closed(*_):
+            nonlocal is_open
+            is_open = False
+            if self._knowledge_refresh == refresh:
+                self._knowledge_refresh = None
+
+        dialog.connect("closed", closed)
 
         def refresh():
+            if not is_open:
+                return
             for row in rows:
                 group.remove(row)
             rows.clear()
+            jobs = self._knowledge_jobs
             for key, manifest, enabled in self.controller.knowledge.list_packs():
                 row = Adw.ActionRow(title=manifest["title"], subtitle=manifest["snapshot_id"])
+                pending = next((job for job in jobs if job.get("key") == key), None)
                 switch = Gtk.Switch(active=enabled, valign=Gtk.Align.CENTER)
                 remove = Gtk.Button(
                     icon_name="user-trash-symbolic",
                     valign=Gtk.Align.CENTER,
                     tooltip_text="Remove Pack",
                 )
+                if pending:
+                    add_status(row, pending)
+                    switch.set_sensitive(False)
+                    remove.set_sensitive(False)
 
-                def toggled(button, _, k=key):
-                    active = button.get_active()
-                    work(lambda: self.controller.knowledge.change(k, active))
+                def toggled(button, _, k=key, title=manifest["title"]):
+                    enqueue(
+                        {
+                            "kind": "enable" if button.get_active() else "disable",
+                            "key": k,
+                            "title": title,
+                            "enabled": button.get_active(),
+                        }
+                    )
 
                 switch.connect("notify::active", toggled)
                 remove.connect(
-                    "clicked", lambda _, k=key: work(lambda: self.controller.knowledge.change(k))
+                    "clicked",
+                    lambda _, k=key, title=manifest["title"]: enqueue(
+                        {"kind": "delete", "key": k, "title": title}
+                    ),
                 )
                 row.add_suffix(switch)
                 row.add_suffix(remove)
                 group.add(row)
                 rows.append(row)
+            for job in jobs:
+                if job["kind"] != "import":
+                    continue
+                row = Adw.ActionRow(title=job["title"])
+                add_status(row, job)
+                group.add(row)
+                rows.append(row)
 
-        def work(action):
-            nonlocal busy
-            if busy:
+        def add_status(row, job):
+            label = Gtk.Label(label=job["status"], valign=Gtk.Align.CENTER)
+            spinner = Gtk.Spinner(spinning=job.get("active", False), valign=Gtk.Align.CENTER)
+            row.add_suffix(label)
+            row.add_suffix(spinner)
+
+        def notify():
+            if self._knowledge_refresh:
+                self._knowledge_refresh()
+
+        def enqueue(job):
+            job["status"] = "Waiting…"
+            self._knowledge_jobs.append(job)
+            notify()
+            if len(self._knowledge_jobs) == 1:
+                start_next()
+
+        def start_next():
+            if not self._knowledge_jobs:
                 return
-            busy = True
-            group.set_sensitive(False)
+            job = self._knowledge_jobs[0]
+            job["active"] = True
+            job["status"] = {
+                "import": "Validating…",
+                "delete": "Deleting…",
+                "enable": "Enabling…",
+                "disable": "Disabling…",
+            }[job["kind"]]
+            notify()
+
+            last_update = 0.0
+
+            def progress(stage, current, total, title):
+                nonlocal last_update
+                now = time.monotonic()
+                if current is not None and current != total and now - last_update < 0.2:
+                    return
+                last_update = now
+
+                def update():
+                    if title:
+                        job["title"] = title
+                    job["status"] = (
+                        f"{stage}: {current * 100 // total}%"
+                        if current is not None and total
+                        else f"{stage}…"
+                    )
+                    notify()
+
+                self.dispatch(update)
 
             def finish(error):
-                nonlocal busy
-                busy = False
-                group.set_sensitive(True)
-                refresh()
+                self._knowledge_jobs.remove(job)
+                notify()
                 if error:
                     self._show_alert("Knowledge pack operation failed", error)
+                start_next()
 
             def run():
                 error = None
                 try:
-                    action()
+                    if job["kind"] == "import":
+                        self.controller.knowledge.import_pack(job["path"], progress)
+                    else:
+                        enabled = None if job["kind"] == "delete" else job["enabled"]
+                        self.controller.knowledge.change(job["key"], enabled)
                 except Exception as exc:
                     error = str(exc)
                 self.dispatch(finish, error)
@@ -1731,13 +1815,14 @@ class ChatWindow(Adw.ApplicationWindow):
             except GLib.Error:
                 return
             if file.get_path():
-                work(lambda: self.controller.knowledge.import_pack(file.get_path()))
+                path = file.get_path()
+                enqueue({"kind": "import", "path": path, "title": Path(path).name})
 
         def choose(*_):
-            chooser = Gtk.FileDialog(title="Import Knowledge Pack")
-            chooser.open(self, None, chosen)
+            Gtk.FileDialog(title="Import Knowledge Pack").open(self, None, chosen)
 
         add.connect("clicked", choose)
+        self._knowledge_refresh = refresh
         refresh()
         dialog.present(self)
 

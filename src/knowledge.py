@@ -43,6 +43,10 @@ class KnowledgeStore:
         if not self.path.exists():
             return []
         with closing(_connect_index(self.path, timeout=30)) as db:
+            if not db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='packs'"
+            ).fetchone():
+                return []
             return [
                 (key, json.loads(manifest), bool(enabled))
                 for key, manifest, enabled in db.execute(
@@ -58,23 +62,48 @@ class KnowledgeStore:
                     JOIN packs ON pack=packs.id WHERE enabled=1""")
         }
         indexed = {r[0] for r in db.execute("SELECT path FROM files")}
-        for source in indexed - active:
-            db.execute("DELETE FROM chunk_content WHERE source=?", (source,))
+        removed = indexed - active
+        # For large removals, rebuilding the small retained corpus is cheaper than
+        # tokenizing every removed passage to produce FTS deletion postings.
+        rebuild = bool(removed) and len(removed) > len(indexed) // 2
+        if rebuild:
+            db.execute("INSERT INTO chunks(chunks) VALUES ('delete-all')")
+        for source in sorted(removed):
+            if rebuild:
+                db.execute("DELETE FROM passages WHERE source=?", (source,))
+            else:
+                db.execute("DELETE FROM chunk_content WHERE source=?", (source,))
             db.execute("DELETE FROM files WHERE path=?", (source,))
-        for source in active - indexed:
+        first_new = db.execute("SELECT coalesce(max(id),0) FROM passages").fetchone()[0]
+        for source in sorted(active - indexed):
             db.execute("INSERT INTO files VALUES (?)", (source,))
+            # Prepared blobs already use our codec: preserve them without recompression.
             db.execute(
-                """INSERT INTO chunk_content(source,section,body,keywords,start_line,end_line)
-                SELECT source,section,unpack_text(body),unpack_text(keywords),first,last
+                """INSERT INTO passages(source,section,body,keywords,start_line,end_line)
+                SELECT source,section,body,keywords,first,last
                 FROM prepared WHERE source=? ORDER BY ordinal""",
                 (source,),
+            )
+        if rebuild:
+            db.execute("INSERT INTO chunks(chunks) VALUES ('rebuild')")
+        elif active - indexed:
+            db.execute(
+                """INSERT INTO chunks(rowid,source,section,body,keywords,start_line,end_line)
+                SELECT id,source,section,unpack_text(body),unpack_text(keywords),
+                    start_line,end_line FROM passages WHERE id>? ORDER BY id""",
+                (first_new,),
             )
         for (source,) in db.execute("""SELECT source FROM articles WHERE NOT EXISTS
                 (SELECT 1 FROM memberships m WHERE m.source=articles.source)""").fetchall():
             for table in ("archive", "prepared", "articles"):
                 db.execute(f"DELETE FROM {table} WHERE source=?", (source,))
 
-    def import_pack(self, path):
+    def import_pack(self, path, progress=None):
+        def report(stage, current=None, total=None, title=None):
+            if progress:
+                progress(stage, current, total, title)
+
+        report("Validating")
         with (
             self.lock,
             closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)) as src,
@@ -87,6 +116,7 @@ class KnowledgeStore:
                 or manifest.get("codec") != "zlib"
             ):
                 raise ValueError("Unsupported knowledge pack format or compression.")
+            report("Validating", title=manifest.get("title"))
             if (
                 src.execute("PRAGMA quick_check").fetchone()[0] != "ok"
                 or src.execute("PRAGMA foreign_key_check").fetchone()
@@ -104,6 +134,7 @@ class KnowledgeStore:
                 )
                 db.execute("DELETE FROM memberships WHERE pack=?", (key,))
                 count = 0
+                report("Installing", 0, manifest["article_count"])
                 for row in src.execute("SELECT * FROM articles"):
                     (
                         wiki,
@@ -187,9 +218,13 @@ class KnowledgeStore:
                             )
                     db.execute("INSERT INTO memberships VALUES (?,?)", (key, source))
                     count += 1
+                    if count % 256 == 0 or count == manifest["article_count"]:
+                        report("Installing", count, manifest["article_count"])
                 if count != manifest["article_count"]:
                     raise ValueError("Article count does not match manifest.")
+                report("Building search index")
                 self._sync(db)
+                report("Finishing")
         return manifest["title"]
 
     def change(self, key, enabled=None):
