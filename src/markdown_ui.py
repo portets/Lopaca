@@ -203,6 +203,40 @@ def set_markdown_text(label, text):
     label.set_markup(inline_markdown(text))
 
 
+def model_references(text):
+    """Render numbered model reference blocks as ordinary clickable Markdown."""
+    blocks = list(re.finditer(r"<reference>\s*(.*?)\s*</reference>", text, re.DOTALL))
+    targets = {
+        number: url
+        for block in blocks
+        for number, url in re.findall(r"(?m)^\s*\[(\d+)\]\s+(https?://\S+)\s*$", block[1])
+    }
+
+    def render(match):
+        lines = []
+        for line in match[1].splitlines():
+            entry = re.match(r"\s*\[(\d+)\]\s+(.+)", line)
+            if entry and entry[1] in targets:
+                # A separate URL entry is redundant once the source label links to it.
+                if entry[2].strip() == targets[entry[1]]:
+                    continue
+                url = targets[entry[1]]
+                label = entry[2]
+                if re.match(r"https?://(?:[a-z-]+\.)?wikipedia\.org/", url):
+                    label = re.sub(
+                        r"(?i)\blines? (\d+\s*[-\u2013]\s*\d+)",
+                        r"knowledge-pack lines \1",
+                        label,
+                    )
+                    line = f"{label} · [Wikipedia revision]({url})"
+                else:
+                    line = f"[{label}]({url})"
+            lines.append(line)
+        return "\n\n" + "\n\n".join(lines) + "\n\n"
+
+    return re.sub(r"<reference>\s*(.*?)\s*</reference>", render, text, flags=re.DOTALL)
+
+
 def reference_links(text):
     """Resolve reference-style links while leaving inline code untouched."""
     references = {}
@@ -279,7 +313,8 @@ def prose_blocks(text):
             ):
                 index += 1
                 content.append(following[1])
-            kind, value = "quote", "\n".join(content)
+            kind = "note" if content[0] == "[!NOTE]" else "quote"
+            value = "\n".join(content[1:] if kind == "note" else content)
         elif item:
             indent, marker, content = item.groups()
             task = re.match(r"\[([ xX])\]\s*(.*)", content)
@@ -597,6 +632,20 @@ class MarkdownText(Gtk.Box):
 
     def set_text(self, text):
         self.anchors = {}
+        text = model_references(text)
+        # Treat the model's nonstandard note wrapper as a Markdown blockquote.
+        text = re.sub(
+            r"<note>\s*(.*?)(?:\s*</note>|$)",
+            lambda match: (
+                "\n\n> [!NOTE]\n"
+                + "\n".join("> " + line for line in match[1].strip().splitlines())
+                + "\n\n"
+            ),
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        # Hide an unfinished wrapper while its contents are streaming.
+        text = re.sub(r"(?im)^\s*</?reference>\s*$", "", text)
         text, notes = markdown_footnotes(text)
         text = reference_links(text)
         blocks = [
@@ -687,12 +736,17 @@ def render_markdown_block(kind, value, widget=None):
             widget = append_code_block(None, value)[0]
         else:
             widget.scroll.get_child().get_child().set_text(value)
-    elif kind == "quote":
+    elif kind in ("quote", "note"):
         if widget is None:
-            widget = HorizontalScrollFrame(MarkdownText(boxed=True))
+            widget = Gtk.Frame()
+            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            title = Gtk.Label(label="Note:" if kind == "note" else "Quote:", xalign=0)
+            title.add_css_class("dim-label")
+            content.append(title)
+            content.append(MarkdownText())
+            widget.set_child(content)
             widget.add_css_class("markdown-quote")
-        widget.scroll.get_child().get_child().set_text(value)
-        widget.update_content_width()
+        widget.get_child().get_last_child().set_text(value)
     else:
         if widget is None:
             widget = markdown_label()

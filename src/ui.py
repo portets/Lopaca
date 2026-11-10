@@ -1450,7 +1450,7 @@ class ChatWindow(Adw.ApplicationWindow):
             group.add(memories_row)
             packs_row = Adw.ActionRow(title="Knowledge Packs", activatable=True)
             packs_row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
-            packs_row.connect("activated", lambda *_: self._show_knowledge_packs())
+            packs_row.connect("activated", lambda *_: self._show_knowledge_packs(dialog))
             group.add(packs_row)
             add_switch(
                 "global_chat_histories",
@@ -1646,14 +1646,29 @@ class ChatWindow(Adw.ApplicationWindow):
 
         alert.choose(self, None, confirmed)
 
-    def _show_knowledge_packs(self):
-        dialog = Adw.PreferencesDialog(
-            title="Knowledge Packs", content_width=660, content_height=540
-        )
+    def _show_knowledge_packs(self, settings_dialog):
+        dialog = Adw.Dialog(title="Knowledge Packs", content_width=660, content_height=540)
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        back = Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="Back to App Settings")
+        back.add_css_class("flat")
+        header.pack_start(back)
+        toolbar.add_top_bar(header)
         page = Adw.PreferencesPage()
         group = Adw.PreferencesGroup(description="Import local .lopaca-pack.sqlite files.")
         page.add(group)
-        dialog.add(page)
+        toolbar.set_content(page)
+        dialog.set_child(toolbar)
+        dialog.return_to_settings = False
+
+        def go_back(*_):
+            dialog.return_to_settings = True
+            dialog.close()
+
+        back.connect("clicked", go_back)
+        dialog.connect(
+            "closed", lambda *_: None if dialog.return_to_settings else settings_dialog.close()
+        )
         rows = []
         busy = False
         add = Gtk.Button(label="Import Pack", halign=Gtk.Align.CENTER)
