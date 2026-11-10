@@ -969,8 +969,9 @@ def _rank(connection, query, expansion, settings, excluded_sources=()):
             continue
         tokens = _TERM.findall(body.casefold())
         diversity = len(set(tokens)) / max(1, len(tokens))
+        # Guessed expansion terms should not outweigh well-matched original terms.
         score = (
-            max(coverage, expansion_coverage)
+            max(coverage, 0.35 * expansion_coverage)
             + 0.15 * ranks[rowid] / best_rank
             + 0.25 * bool(identifiers)
         )
