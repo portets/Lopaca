@@ -275,30 +275,35 @@ def _fence_after(line, fence):
 
 def _without_memory_references(text):
     """Remove reserved internal blocks and their partial streams, preserving Markdown code."""
-    opening = "<lopaca-memory-references>"
-    closing = "</lopaca-memory-references>"
+    openings = tuple(
+        f"<lopaca-{name}>"
+        for name in (
+            "memory-references", "document-references", "knowledge-references",
+            "reply-controls", "history-references",
+        )
+    )
     tail = text.rsplit("\n", 1)[-1].lstrip()
-    if opening not in text and not (tail and opening.startswith(tail)):
+    if not any(opening in text or (tail and opening.startswith(tail)) for opening in openings):
         return text
-    parts, fence, hidden = [], None, False
+    parts, fence, closing = [], None, None
     for line in text.splitlines(keepends=True):
-        if hidden:
+        if closing:
             end = line.find(closing)
             if end < 0:
                 continue
-            hidden = False
             line = line[end + len(closing) :]
+            closing = None
             if not line.strip():
                 continue
         stripped = line.lstrip(" ")
         if fence is None and len(line) - len(stripped) <= 3:
             candidate = stripped.rstrip()
-            if candidate == opening:
+            if candidate in openings:
                 while parts and not parts[-1].strip():
                     parts.pop()
-                hidden = True
+                closing = candidate.replace("<", "</", 1)
                 continue
-            if candidate and opening.startswith(candidate):
+            if candidate and any(opening.startswith(candidate) for opening in openings):
                 continue
         fence = _fence_after(line, fence)
         parts.append(line)

@@ -223,12 +223,9 @@ def model_references(text):
                 url = targets[entry[1]]
                 label = entry[2]
                 if re.match(r"https?://(?:[a-z-]+\.)?wikipedia\.org/", url):
-                    label = re.sub(
-                        r"(?i)\blines? (\d+\s*[-\u2013]\s*\d+)",
-                        r"knowledge-pack lines \1",
-                        label,
-                    )
-                    line = f"{label} · [Wikipedia revision]({url})"
+                    title = re.split(r',\s*["“]', label, maxsplit=1)[0]
+                    title = re.sub(r"\s*\(lines?\s+[^)]*\)\s*$", "", title, flags=re.IGNORECASE)
+                    line = f"Source: [Wikipedia/{title}]({url})"
                 else:
                     line = f"[{label}]({url})"
             lines.append(line)

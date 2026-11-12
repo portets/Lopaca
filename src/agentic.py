@@ -132,8 +132,11 @@ FILE_TOOLS = [
     ),
     _tool(
         "search_files",
-        "Find files or literal text only within the current chat's documents/ and projects/. "
-        "Searches both unless pattern starts with documents/ or projects/. Returned paths "
+        "Search the current chat's documents/ and projects/, and installed knowledge packs. "
+        "Knowledge search uses lexical ranking and requires a nonempty query; "
+        "use pattern knowledge/** to search only packs. "
+        "Knowledge results are article paths and excerpts usable with read_file. "
+        "Search all sources unless a known path identifies one. Returned paths "
         "include that prefix and can be passed directly to read_file. "
         "Search both folders unless the request or a known file path identifies the relevant "
         "folder; do not narrow the search based on a guess. "
@@ -304,6 +307,12 @@ class ChatFiles:
     def search_files(self, query="", pattern="**/*", case_sensitive=False):
         if not isinstance(pattern, str) or len(pattern) > 256:
             raise ValueError("Use a relative pattern of at most 256 characters.")
+        if not isinstance(query, str) or len(query) > 128:
+            raise ValueError("Use a query of at most 128 characters.")
+        if pattern.startswith("knowledge/"):
+            from knowledge import KnowledgeStore
+
+            return KnowledgeStore().search_files(query, pattern, case_sensitive)
         root, separator, relative = pattern.partition("/")
         scoped = root in self.roots and bool(separator)
         roots = [root] if scoped else self.roots
@@ -326,11 +335,18 @@ class ChatFiles:
             if len(matches) >= 20 or time.monotonic() > deadline:
                 truncated = True
                 break
+        if not scoped and pattern == "**/*" and query and len(matches) < 20:
+            from knowledge import KnowledgeStore
+
+            result = KnowledgeStore().search_files(query, "knowledge/**", case_sensitive)
+            matches.extend(result["matches"])
+            truncated |= result["truncated"]
         result = {"matches": matches[:20], "truncated": truncated, "files_scanned": scanned}
         if not matches:
             result["hint"] = (
                 "Use **/* to discover files in documents/ and projects/, or restrict the "
-                "pattern to documents/** or projects/**. Patterns match files, not directories."
+                "pattern to documents/**, projects/** or knowledge/**. "
+                "Patterns match files, not directories."
             )
         return result
 
