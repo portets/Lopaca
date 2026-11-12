@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import time
 import zlib
+from bisect import bisect_right
 from contextlib import closing, contextmanager
 from functools import wraps
 from pathlib import Path
@@ -58,11 +59,18 @@ class KnowledgeStore:
                 PRIMARY KEY(pack,source,title));
             CREATE INDEX IF NOT EXISTS alias_lookup ON pack_aliases(normalized);
             CREATE TABLE IF NOT EXISTS archive(
-                source TEXT, ordinal INT, body BLOB, PRIMARY KEY(source,ordinal));
+                source TEXT, ordinal INT, body BLOB, start_char INT, end_char INT,
+                PRIMARY KEY(source,ordinal));
             CREATE TABLE IF NOT EXISTS prepared(
                 source TEXT, ordinal INT, section TEXT, first INT, last INT,
-                body BLOB, keywords BLOB, PRIMARY KEY(source,ordinal));
+                body BLOB, keywords BLOB, start_char INT, end_char INT,
+                PRIMARY KEY(source,ordinal));
             CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS table_context(
+                pack TEXT, source TEXT, ordinal INT, group_id INT,
+                first INT, last INT, source_hash TEXT, body BLOB,
+                PRIMARY KEY(pack,source,ordinal,group_id));
+            CREATE INDEX IF NOT EXISTS table_context_lines ON table_context(source,first,last);
             CREATE TABLE IF NOT EXISTS index_state(key TEXT PRIMARY KEY,value TEXT);
         """)
         _create_chunks(db)
@@ -156,6 +164,13 @@ class KnowledgeStore:
             for field in ("pack_id", "title", "snapshot_id", "source_revision"):
                 if not isinstance(manifest.get(field), str) or not manifest[field]:
                     raise ValueError(f"Knowledge pack manifest requires {field}.")
+            if manifest.get("table_context_contract") != "source-spans-v1-experimental":
+                raise ValueError("This draft-3 pack lacks the supported table-context contract.")
+            for table in ("table_context_groups", "table_context_items"):
+                if not src.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+                ).fetchone():
+                    raise ValueError(f"Knowledge pack is missing {table}.")
             key = manifest["pack_id"]
             with closing(self._connect()) as db, db:
                 previous = db.execute("SELECT enabled FROM packs WHERE id=?", (key,)).fetchone()
@@ -165,6 +180,7 @@ class KnowledgeStore:
                 )
                 db.execute("DELETE FROM memberships WHERE pack=?", (key,))
                 db.execute("DELETE FROM pack_aliases WHERE pack=?", (key,))
+                db.execute("DELETE FROM table_context WHERE pack=?", (key,))
                 count = 0
                 report("Installing", 0, manifest["article_count"])
                 for row in src.execute("SELECT * FROM articles"):
@@ -197,6 +213,69 @@ class KnowledgeStore:
                     text = "".join(text_parts)
                     if hashlib.sha256(text.encode()).hexdigest() != digest:
                         raise ValueError("Article checksum mismatch.")
+                    line_starts = [0] + [i + 1 for i, char in enumerate(text) if char == "\n"]
+                    for group in src.execute(
+                        "SELECT passage_ordinal,group_id,table_start_char,table_end_char,"
+                        "target_start_char,target_end_char,context_status "
+                        "FROM table_context_groups WHERE wiki=? AND page_id=?",
+                        (wiki, page),
+                    ):
+                        ordinal, group_id, table_start, table_end, start, end, status = group
+                        span = src.execute(
+                            "SELECT start_char,end_char FROM search_passages "
+                            "WHERE wiki=? AND page_id=? AND ordinal=?",
+                            (wiki, page, ordinal),
+                        ).fetchone()
+                        if (
+                            status not in {"provided", "partial", "unavailable"}
+                            or not 0 <= table_start <= start < end <= table_end <= len(text)
+                            or not span
+                            or not span[0] <= start < end <= span[1]
+                        ):
+                            raise ValueError("Invalid table context target.")
+                        items = []
+                        for role, a, b, first, last, blob in src.execute(
+                            "SELECT role,start_char,end_char,start_line,end_line,body "
+                            "FROM table_context_items WHERE wiki=? AND page_id=? "
+                            "AND passage_ordinal=? AND group_id=? ORDER BY item_ordinal",
+                            (wiki, page, ordinal, group_id),
+                        ):
+                            value = zlib.decompress(blob).decode()
+                            if (
+                                role not in {"caption", "column_header", "row_header"}
+                                or not table_start <= a < b <= table_end
+                                or text[a:b] != value
+                                or first != bisect_right(line_starts, a)
+                                or last != bisect_right(line_starts, b - 1)
+                            ):
+                                raise ValueError("Invalid table heading source span.")
+                            items.append(
+                                {"role": role, "start_line": first, "end_line": last, "text": value}
+                            )
+                        body = json.dumps(
+                            {
+                                "status": status,
+                                "items": items,
+                                "target_start_char": start,
+                                "target_end_char": end,
+                                "target_start_line": bisect_right(line_starts, start),
+                                "target_end_line": bisect_right(line_starts, end - 1),
+                            },
+                            ensure_ascii=False,
+                        )
+                        db.execute(
+                            "INSERT INTO table_context VALUES (?,?,?,?,?,?,?,?)",
+                            (
+                                key,
+                                source,
+                                ordinal,
+                                group_id,
+                                bisect_right(line_starts, start),
+                                bisect_right(line_starts, end - 1),
+                                digest,
+                                zlib.compress(body.encode(), 1),
+                            ),
+                        )
                     old = db.execute(
                         "SELECT hash,timestamp,metadata FROM articles WHERE source=?", (source,)
                     ).fetchone()
@@ -230,10 +309,7 @@ class KnowledgeStore:
                             "INSERT OR REPLACE INTO articles VALUES (?,?,?,?)",
                             (source, json.dumps(metadata), digest, timestamp),
                         )
-                        db.executemany(
-                            "INSERT INTO archive VALUES (?,?,?)",
-                            ((source, n, b) for n, _, _, b in slices),
-                        )
+                        spans = []
                         for n, section, first, last, start, end, body, keywords in src.execute(
                             "SELECT ordinal,section,start_line,end_line,start_char,end_char,"
                             "body,keywords "
@@ -244,16 +320,39 @@ class KnowledgeStore:
                             zlib.decompress(keywords).decode()
                             if text[start:end] != value or first < 1 or last < first:
                                 raise ValueError("Invalid search passage source span.")
+                            if not 0 <= start <= end <= len(text):
+                                raise ValueError("Invalid search passage bounds.")
+                            spans.append((start, end))
                             db.execute(
-                                "INSERT INTO prepared VALUES (?,?,?,?,?,?,?)",
-                                (source, n, section, first, last, body, keywords),
+                                "INSERT INTO prepared VALUES (?,?,?,?,?,?,?,?,?)",
+                                (source, n, section, first, last, body, keywords, start, end),
                             )
+                        # Store only source ranges not already present in search passages.
+                        covered = 0
+                        gaps = []
+                        for start, end in sorted(spans):
+                            if start > covered:
+                                gaps.append((covered, start))
+                            covered = max(covered, end)
+                        if covered < len(text):
+                            gaps.append((covered, len(text)))
+                        db.executemany(
+                            "INSERT INTO archive VALUES (?,?,?,?,?)",
+                            (
+                                (source, n, zlib.compress(text[a:b].encode(), 1), a, b)
+                                for n, (a, b) in enumerate(gaps)
+                            ),
+                        )
                     db.execute("INSERT INTO memberships VALUES (?,?)", (key, source))
                     count += 1
                     if count % 256 == 0 or count == manifest["article_count"]:
                         report("Installing", count, manifest["article_count"])
                 if count != manifest["article_count"]:
                     raise ValueError("Article count does not match manifest.")
+                if db.execute("SELECT count(*) FROM table_context WHERE pack=?", (key,)).fetchone()[
+                    0
+                ] != manifest.get("table_context_group_count"):
+                    raise ValueError("Table context count does not match manifest.")
                 if src.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='aliases'"
                 ).fetchone():
@@ -305,6 +404,7 @@ class KnowledgeStore:
                 if enabled is None:
                     db.execute("DELETE FROM memberships WHERE pack=?", (key,))
                     db.execute("DELETE FROM pack_aliases WHERE pack=?", (key,))
+                    db.execute("DELETE FROM table_context WHERE pack=?", (key,))
                     db.execute("DELETE FROM packs WHERE id=?", (key,))
                 else:
                     db.execute("UPDATE packs SET enabled=? WHERE id=?", (int(enabled), key))
@@ -347,6 +447,20 @@ class KnowledgeStore:
             )
         return aliases
 
+    @staticmethod
+    def _table_context(db, source, first, last):
+        """Headings have their own citations; never merge them into the row's source span."""
+        return [
+            json.loads(zlib.decompress(body).decode())
+            for (body,) in db.execute(
+                "SELECT DISTINCT c.body FROM table_context c JOIN packs p ON p.id=c.pack "
+                "JOIN articles a ON a.source=c.source AND a.hash=c.source_hash "
+                "WHERE p.enabled=1 AND c.source=? AND c.first<=? AND c.last>=? "
+                "ORDER BY c.ordinal,c.group_id",
+                (source, last, first),
+            )
+        ]
+
     @_guarded
     def search_files(self, query, pattern="knowledge/**", case_sensitive=False):
         if not isinstance(query, str) or not query.strip() or len(query) > 128:
@@ -381,6 +495,7 @@ class KnowledgeStore:
                                 "end_line": last,
                                 "section": section,
                                 "text": body[:1000],
+                                "table_context": self._table_context(db, source, first, last),
                             }
                         )
                 return {
@@ -418,9 +533,9 @@ class KnowledgeStore:
                     for rank, row in enumerate(results, 1):
                         scores[row[0]] = scores.get(row[0], 0.0) + weight / (60 + rank)
                         candidates[row[0]] = row
-                ranked = sorted(
-                    candidates.values(), key=lambda row: scores[row[0]], reverse=True
-                )[: settings.rag_results]
+                ranked = sorted(candidates.values(), key=lambda row: scores[row[0]], reverse=True)[
+                    : settings.rag_results
+                ]
             matched_aliases = {}
             # Match complete redirect titles in the original question.
             aliases = self._aliases(db, query)
@@ -508,6 +623,17 @@ class KnowledgeStore:
                         f"Pack redirect metadata: {titles} → {metadata['title']}. "
                         "This mapping is not part of the article excerpt.\n\n" + body
                     )
+                for group in self._table_context(db, source, first, last):
+                    body += (
+                        f"\n\nTable context for prepared-text lines "
+                        f"{group['target_start_line']}-{group['target_end_line']} "
+                        f"({group['status']}; relationships may be incomplete):"
+                    )
+                    for item in group["items"]:
+                        body += (
+                            f"\n{item['role']} [Source: {source}, prepared-text lines "
+                            f"{item['start_line']}-{item['end_line']}]:\n{item['text']}"
+                        )
                 rows.append((reference, body))
             context = format_context(rows, settings.max_context_chars)
             return (
@@ -539,12 +665,22 @@ class KnowledgeStore:
             if not db.execute("SELECT 1 FROM files WHERE path=?", (path,)).fetchone():
                 raise ValueError("Article is not in an enabled knowledge pack.")
             db.execute("BEGIN")
-            text = "".join(
-                zlib.decompress(row[0]).decode()
-                for row in db.execute(
-                    "SELECT body FROM archive WHERE source=? ORDER BY ordinal", (path,)
-                )
-            )
+            pieces, position = [], 0
+            for start, end, blob in db.execute(
+                "SELECT start_char,end_char,body FROM prepared WHERE source=? "
+                "UNION ALL SELECT start_char,end_char,body FROM archive WHERE source=? "
+                "ORDER BY 1,2",
+                (path, path),
+            ):
+                if start > position:
+                    raise ValueError("Missing source text.")
+                if end > position:
+                    pieces.append(zlib.decompress(blob).decode()[position - start :])
+                    position = end
+            text = "".join(pieces)
+            expected = db.execute("SELECT hash FROM articles WHERE source=?", (path,)).fetchone()[0]
+            if hashlib.sha256(text.encode()).hexdigest() != expected:
+                raise ValueError("Reconstructed article checksum mismatch.")
             lines = text.splitlines()
             if start_line > len(lines) + 1:
                 raise ValueError(f"Article has {len(lines)} lines.")
@@ -566,4 +702,5 @@ class KnowledgeStore:
                 "content": "\n".join(selected),
                 "truncated": end < len(lines),
                 "next_line": end + 1 if end < len(lines) else None,
+                "table_context": self._table_context(db, path, start_line, end),
             }
