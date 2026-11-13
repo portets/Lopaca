@@ -11,11 +11,31 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from pathlib import Path
 
-from knowledge import KnowledgeStore
+from knowledge import KnowledgeStore, _lock_path
 from rag import _connect_index, _retrieval_query, format_context
 from settings import APP_DIR
 
 _LIBRARY_LOCK = threading.RLock()
+
+
+def _finish_index(path):
+    # Published indexes are read-only; rollback journaling avoids persistent WAL sidecars.
+    with closing(sqlite3.connect(path, timeout=30)) as db:
+        if db.execute("PRAGMA journal_mode=DELETE").fetchone()[0] != "delete":
+            raise RuntimeError("Could not finalize the knowledge index.")
+
+
+def _index_name(manifest):
+    category = re.findall(r"[a-z0-9]+", manifest["title"].casefold())
+    source = manifest.get("source_dataset", "")
+    if (
+        "wikipedia" in (manifest["pack_id"] + " " + source).casefold()
+        or "wikimedia" in source.casefold()
+    ):
+        source = "wiki"
+    else:
+        source = re.sub(r"[^a-z0-9]+", "-", source.casefold()).strip("-") or "knowledge"
+    return f"{category[0] if category else 'pack'}-{source}-indexed.sqlite"
 
 
 def index_manifest(db):
@@ -62,7 +82,7 @@ class KnowledgeLibrary:
     @contextmanager
     def _operation(self, *, exclusive=False):
         self.folder.mkdir(parents=True, exist_ok=True)
-        with (self.folder / ".operations.lock").open("a") as lock:
+        with _lock_path(self.folder / ".operations").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
             try:
                 yield
@@ -173,12 +193,19 @@ class KnowledgeLibrary:
                         "INSERT OR REPLACE INTO index_state VALUES ('pack_manifest',?)",
                         (json.dumps(manifest),),
                     )
+                _finish_index(temporary)
                 key = manifest["pack_id"]
-                destination = self.folder / (
-                    hashlib.sha256(key.encode()).hexdigest()[:24] + ".sqlite"
-                )
                 with self.lock:
-                    old = next((p for p, m, _ in self._entries() if m["pack_id"] == key), None)
+                    entries = self._entries()
+                    old = next((p for p, m, _ in entries if m["pack_id"] == key), None)
+                    destination = self.folder / _index_name(manifest)
+                    if any(p == destination and m["pack_id"] != key for p, m, _ in entries):
+                        stem = destination.stem
+                        destination = destination.with_name(
+                            f"{stem}-{hashlib.sha256(key.encode()).hexdigest()[:8]}.sqlite"
+                        )
+                    if destination.exists() and destination != old:
+                        raise ValueError("Knowledge pack filename is already in use.")
                     if old:
                         with KnowledgeStore(old)._access(exclusive=True):
                             temporary.replace(destination)
@@ -188,8 +215,9 @@ class KnowledgeLibrary:
                         temporary.replace(destination)
                 return manifest["title"]
             finally:
-                for suffix in ("", "-wal", "-shm", ".lock"):
+                for suffix in ("", "-wal", "-shm"):
                     Path(str(temporary) + suffix).unlink(missing_ok=True)
+                _lock_path(temporary).unlink(missing_ok=True)
 
     def change(self, key, enabled=None):
         with self._operation(), self.lock:
@@ -383,9 +411,11 @@ class KnowledgeLibrary:
                     "Merged Knowledge Packs",
                     keys,
                 )
+                _finish_index(target)
                 destination = self.folder / "merged-knowledge.sqlite"
                 with self.lock:
                     target.replace(destination)
             finally:
-                for suffix in ("", "-wal", "-shm", ".lock"):
+                for suffix in ("", "-wal", "-shm"):
                     Path(str(target) + suffix).unlink(missing_ok=True)
+                _lock_path(target).unlink(missing_ok=True)

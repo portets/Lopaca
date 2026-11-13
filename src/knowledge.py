@@ -4,8 +4,10 @@ import fcntl
 import fnmatch
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import tempfile
 import threading
 import time
 import zlib
@@ -16,6 +18,17 @@ from pathlib import Path
 
 from rag import _connect_index, _create_chunks, _rank, _retrieval_query, _terms, format_context
 from settings import Settings
+
+
+def _lock_path(path):
+    runtime = Path(f"/run/user/{os.getuid()}")
+    folder = runtime / "lopaca-locks"
+    try:
+        folder.mkdir(mode=0o700, exist_ok=True)
+    except OSError:
+        folder = Path(tempfile.gettempdir()) / f"lopaca-locks-{os.getuid()}"
+        folder.mkdir(mode=0o700, exist_ok=True)
+    return folder / (hashlib.sha256(str(Path(path).resolve()).encode()).hexdigest() + ".lock")
 
 
 def _guarded(method):
@@ -44,8 +57,7 @@ class KnowledgeStore:
     @contextmanager
     def _access(self, exclusive=False):
         # Separate processes and read_file's separate store instance share this lock.
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.with_suffix(self.path.suffix + ".lock").open("a") as lock:
+        with _lock_path(self.path).open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
             try:
                 yield
