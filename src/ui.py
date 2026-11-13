@@ -1673,7 +1673,11 @@ class ChatWindow(Adw.ApplicationWindow):
         )
         rows = []
         add = Gtk.Button(label="Import Pack", halign=Gtk.Align.CENTER)
-        group.set_header_suffix(add)
+        merge = Gtk.Button(label="Merge All Packs")
+        actions = Gtk.Box(spacing=6)
+        actions.append(merge)
+        actions.append(add)
+        group.set_header_suffix(actions)
         if not hasattr(self, "_knowledge_jobs"):
             self._knowledge_jobs = []
         self._knowledge_refresh = None
@@ -1698,6 +1702,12 @@ class ChatWindow(Adw.ApplicationWindow):
                 row = Adw.ActionRow(title=manifest["title"], subtitle=manifest["snapshot_id"])
                 pending = next((job for job in jobs if job.get("key") == key), None)
                 switch = Gtk.Switch(active=enabled, valign=Gtk.Align.CENTER)
+                if manifest.get("unused_by"):
+                    row.add_css_class("dim-label")
+                    switch.set_sensitive(False)
+                    row.set_tooltip_text(
+                        f"This pack is unused while {manifest['unused_by']} is enabled."
+                    )
                 remove = Gtk.Button(
                     icon_name="user-trash-symbolic",
                     valign=Gtk.Align.CENTER,
@@ -1730,7 +1740,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 group.add(row)
                 rows.append(row)
             for job in jobs:
-                if job["kind"] != "import":
+                if job["kind"] not in ("import", "merge"):
                     continue
                 row = Adw.ActionRow(title=job["title"])
                 add_status(row, job)
@@ -1751,19 +1761,28 @@ class ChatWindow(Adw.ApplicationWindow):
             job["status"] = "Waiting…"
             self._knowledge_jobs.append(job)
             notify()
-            if len(self._knowledge_jobs) == 1:
-                start_next()
+            start_next()
 
         def start_next():
-            if not self._knowledge_jobs:
+            if any(j.get("active") and j["kind"] == "merge" for j in self._knowledge_jobs):
                 return
-            job = self._knowledge_jobs[0]
+            for job in self._knowledge_jobs:
+                if job.get("active"):
+                    continue
+                if job["kind"] == "merge" and any(j.get("active") for j in self._knowledge_jobs):
+                    return
+                start_job(job)
+                if job["kind"] == "merge":
+                    return
+
+        def start_job(job):
             job["active"] = True
             job["status"] = {
                 "import": "Validating…",
                 "delete": "Deleting…",
                 "enable": "Enabling…",
                 "disable": "Disabling…",
+                "merge": "Merging…",
             }[job["kind"]]
             notify()
 
@@ -1800,6 +1819,8 @@ class ChatWindow(Adw.ApplicationWindow):
                 try:
                     if job["kind"] == "import":
                         self.controller.knowledge.import_pack(job["path"], progress)
+                    elif job["kind"] == "merge":
+                        self.controller.knowledge.merge_all(progress)
                     else:
                         enabled = None if job["kind"] == "delete" else job["enabled"]
                         self.controller.knowledge.change(job["key"], enabled)
@@ -1822,6 +1843,9 @@ class ChatWindow(Adw.ApplicationWindow):
             Gtk.FileDialog(title="Import Knowledge Pack").open(self, None, chosen)
 
         add.connect("clicked", choose)
+        merge.connect(
+            "clicked", lambda *_: enqueue({"kind": "merge", "title": "Merged Knowledge Packs"})
+        )
         self._knowledge_refresh = refresh
         refresh()
         dialog.present(self)

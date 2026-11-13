@@ -15,7 +15,7 @@ from functools import wraps
 from pathlib import Path
 
 from rag import _connect_index, _create_chunks, _rank, _retrieval_query, _terms, format_context
-from settings import APP_DIR, Settings
+from settings import Settings
 
 
 def _guarded(method):
@@ -28,8 +28,17 @@ def _guarded(method):
 
 
 class KnowledgeStore:
+    """Default installed library; an explicit path selects the monolithic index builder."""
+
+    def __new__(cls, path=None):
+        if path is None:
+            from knowledge_library import KnowledgeLibrary
+
+            return KnowledgeLibrary()
+        return super().__new__(cls)
+
     def __init__(self, path=None):
-        self.path = Path(path) if path else APP_DIR / "knowledge.sqlite"
+        self.path = Path(path)
         self.lock = threading.RLock()
 
     @contextmanager
@@ -75,22 +84,6 @@ class KnowledgeStore:
         """)
         _create_chunks(db)
         return db
-
-    @_guarded
-    def list_packs(self):
-        if not self.path.exists():
-            return []
-        with closing(_connect_index(self.path, timeout=30)) as db:
-            if not db.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='packs'"
-            ).fetchone():
-                return []
-            return [
-                (key, json.loads(manifest), bool(enabled))
-                for key, manifest, enabled in db.execute(
-                    "SELECT id,manifest,enabled FROM packs ORDER BY id"
-                )
-            ]
 
     def _sync(self, db):
         # Only sources whose active membership changed touch FTS; disabled data has no postings.
@@ -380,36 +373,6 @@ class KnowledgeStore:
                 report("Finishing")
         return manifest["title"]
 
-    def change(self, key, enabled=None):
-        with self.lock:
-            if enabled is None:
-                packs = self.list_packs()
-                if len(packs) == 1 and packs[0][0] == key:
-                    with self._access(exclusive=True):
-                        # Recheck after acquiring the lock: another process may have imported.
-                        with closing(self._connect()) as db:
-                            entries = db.execute("SELECT id FROM packs LIMIT 2").fetchall()
-                            if entries == [(key,)]:
-                                busy, _, _ = db.execute(
-                                    "PRAGMA wal_checkpoint(TRUNCATE)"
-                                ).fetchone()
-                            else:
-                                busy = 1
-                        if entries == [(key,)] and not busy:
-                            # A completed checkpoint makes either interruption order safe.
-                            for suffix in ("-wal", "-shm", ""):
-                                Path(str(self.path) + suffix).unlink(missing_ok=True)
-                            return
-            with self._access(), closing(self._connect()) as db, db:
-                if enabled is None:
-                    db.execute("DELETE FROM memberships WHERE pack=?", (key,))
-                    db.execute("DELETE FROM pack_aliases WHERE pack=?", (key,))
-                    db.execute("DELETE FROM table_context WHERE pack=?", (key,))
-                    db.execute("DELETE FROM packs WHERE id=?", (key,))
-                else:
-                    db.execute("UPDATE packs SET enabled=? WHERE id=?", (int(enabled), key))
-                self._sync(db)
-
     @staticmethod
     def _aliases(db, query):
         if not db.execute("SELECT 1 FROM sqlite_master WHERE name='pack_aliases'").fetchone():
@@ -513,7 +476,9 @@ class KnowledgeStore:
                 }
 
     @_guarded
-    def context(self, query, settings, expand=None, previous_queries=(), memory_rows=()):
+    def context(
+        self, query, settings, expand=None, previous_queries=(), memory_rows=(), _rows=False
+    ):
         if not self.path.exists():
             return ""
         query = _retrieval_query(query, previous_queries)
@@ -635,6 +600,8 @@ class KnowledgeStore:
                             f"{item['start_line']}-{item['end_line']}]:\n{item['text']}"
                         )
                 rows.append((reference, body))
+            if _rows:
+                return rows
             context = format_context(rows, settings.max_context_chars)
             return (
                 (
