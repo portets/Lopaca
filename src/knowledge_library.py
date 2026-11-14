@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from pathlib import Path
 
 from knowledge import KnowledgeStore, _lock_path
@@ -264,7 +264,8 @@ class KnowledgeLibrary:
                 return self.import_pack(staged, progress, _consume=True)
 
     def change(self, key, enabled=None):
-        with self._operation(), self.lock:
+        # Toggles only write preferences, so they need not wait for a long merge.
+        with self._operation() if enabled is None else nullcontext(), self.lock:
             entry = next((p for p, m, _ in self._entries() if m["pack_id"] == key), None)
             if entry is None:
                 raise ValueError("Pack is no longer installed.")
@@ -409,15 +410,47 @@ class KnowledgeLibrary:
                 "hint": "Use read_file for more detail.",
             }
 
-    def merge_all(self, progress=None):
+    def merge_all(self, progress=None, catalog=None):
         with self._operation(exclusive=True):
             entries = [
-                entry
-                for entry in self._entries()
-                if not entry[1].get("contains") and not entry[1].get("compatibility_error")
+                entry for entry in self._entries() if not entry[1].get("compatibility_error")
             ]
-            if not entries:
-                raise ValueError("No installed packs to merge.")
+            if len(entries) < 2:
+                raise ValueError("Install at least two packs to merge.")
+            keys = sorted(
+                {
+                    key
+                    for _, manifest, _ in entries
+                    for key in (manifest.get("contains") or [manifest["pack_id"]])
+                }
+            )
+            if catalog is None:
+                from pack_catalog import load_catalog
+
+                try:
+                    catalog = list(load_catalog().values())
+                except OSError, ValueError:
+                    catalog = []
+            parent = next(
+                (
+                    m
+                    for m in catalog
+                    if set(m.get("contains", [])) == set(keys)
+                    and not compatibility_error(m)
+                    and all(
+                        m.get("snapshot_id") == item.get("snapshot_id")
+                        and m.get("source_revision") == item.get("source_revision")
+                        for _, item, _ in entries
+                    )
+                ),
+                None,
+            )
+            pack_id = (
+                parent["pack_id"]
+                if parent
+                else ("merged-" + hashlib.sha256(str(keys).encode()).hexdigest()[:12])
+            )
+            title = parent["title"] if parent else "Merged Knowledge Packs"
             if any(
                 "wikipedia" not in m["pack_id"].casefold()
                 and "wikimedia" not in m.get("source_dataset", "").casefold()
@@ -433,7 +466,7 @@ class KnowledgeLibrary:
             try:
                 for n, (path, _, _) in enumerate(entries):
                     if progress:
-                        progress("Merging", n, len(entries), "All Wikipedia")
+                        progress("Merging", n, len(entries), title)
                     with closing(index._connect()) as db:
                         db.execute("ATTACH DATABASE ? AS incoming", (str(path),))
                         for source, digest in db.execute(
@@ -462,20 +495,62 @@ class KnowledgeLibrary:
                 with closing(index._connect()) as db, db:
                     db.execute("UPDATE packs SET enabled=1")
                     index._sync(db)
-                keys = sorted(
-                    {m["pack_id"] for _, m, _ in entries}
-                    | {k for _, m, _ in entries for k in m.get("contains", [])}
-                )
-                set_index_metadata(
-                    target,
-                    "wikipedia-en-all",
-                    "All Wikipedia",
-                    keys,
-                )
+                set_index_metadata(target, pack_id, title, keys)
+                with closing(_connect_index(target)) as db, db:
+                    manifest = index_manifest(db)
+                    manifest["constituent_titles"] = {
+                        key: json.loads(raw)["title"]
+                        for key, raw in db.execute("SELECT id,manifest FROM packs")
+                    }
+                    for _, item, _ in entries:
+                        manifest["constituent_titles"].update(item.get("constituent_titles", {}))
+                        if not item.get("contains"):
+                            manifest["constituent_titles"][item["pack_id"]] = item["title"]
+                    manifest["constituent_titles"] = {
+                        k: manifest["constituent_titles"].get(k, k) for k in keys
+                    }
+                    if parent:
+                        # Local output has its own checksum; only copy publishing identity.
+                        for field in ("release_sequence", "description"):
+                            if field in parent:
+                                manifest[field] = parent[field]
+                    db.execute(
+                        "UPDATE index_state SET value=? WHERE key='pack_manifest'",
+                        (json.dumps(manifest),),
+                    )
                 _finish_index(target)
-                destination = self.folder / "all-wiki-indexed.sqlite"
+                with closing(_connect_index(target)) as db:
+                    check_index(db)
+                    if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                        raise ValueError(
+                            "Merged index failed validation; original packs were kept."
+                        )
+                destination = self.folder / (
+                    _index_name(manifest) if parent else f"{pack_id}-indexed.sqlite"
+                )
                 with self.lock:
+                    # Publish before removing anything: interruption can leave duplicates,
+                    # but never removes the only validated copy of an article.
+                    existing = next(
+                        (p for p, m, _ in self._entries() if m["pack_id"] == pack_id), None
+                    )
+                    if destination.exists() and destination != existing:
+                        raise ValueError("Merged pack filename is already in use.")
                     target.replace(destination)
+                    state_path = self.folder / "packs.json"
+                    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+                    state[pack_id] = True
+                    for _, item, _ in entries:
+                        if item["pack_id"] != pack_id:
+                            state.pop(item["pack_id"], None)
+                    temporary = state_path.with_suffix(".tmp")
+                    temporary.write_text(json.dumps(state))
+                    temporary.replace(state_path)
+                    for path, _, _ in entries:
+                        if path != destination:
+                            with KnowledgeStore(path)._access(exclusive=True):
+                                path.unlink()
+                return title
             finally:
                 for suffix in ("", "-wal", "-shm"):
                     Path(str(target) + suffix).unlink(missing_ok=True)

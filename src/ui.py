@@ -1690,7 +1690,10 @@ class ChatWindow(Adw.ApplicationWindow):
         except OSError, ValueError:
             catalog = {}
         rows = []
-        merge = Gtk.Button(label="Merge Installed Packs")
+        merge = Gtk.Button(
+            label="Merge Installed Packs",
+            tooltip_text="Reduces disk usage, REQUIRES LONG PROCESSING TIME",
+        )
         actions = Gtk.Box(spacing=6)
         actions.append(merge)
         group.set_header_suffix(actions)
@@ -1715,6 +1718,14 @@ class ChatWindow(Adw.ApplicationWindow):
             rows.clear()
             jobs = self._knowledge_jobs
             installed = self.controller.knowledge.list_packs()
+            merge.set_sensitive(
+                len(installed) >= 2 and not any(job["kind"] == "merge" for job in jobs)
+            )
+            covered = {
+                key: manifest["title"]
+                for _, manifest, _ in installed
+                for key in manifest.get("contains", [])
+            }
             for key, manifest, enabled in installed:
                 subtitle = format_size(manifest["size_bytes"])
                 release = catalog.get(key)
@@ -1728,6 +1739,16 @@ class ChatWindow(Adw.ApplicationWindow):
                 row = Adw.ActionRow(
                     title=manifest["title"], subtitle=error or subtitle, use_markup=False
                 )
+                if manifest.get("contains"):
+                    info = Gtk.Label(label="Hover for pack information", valign=Gtk.Align.CENTER)
+                    titles = manifest.get("constituent_titles", {})
+                    info.set_tooltip_text(
+                        "\n".join(
+                            titles.get(k, catalog.get(k, {}).get("title", k))
+                            for k in manifest["contains"]
+                        )
+                    )
+                    row.add_suffix(info)
                 pending = next((job for job in jobs if job.get("key") == key), None)
                 switch = Gtk.Switch(active=enabled, valign=Gtk.Align.CENTER)
                 if error:
@@ -1748,15 +1769,25 @@ class ChatWindow(Adw.ApplicationWindow):
                     switch.set_sensitive(False)
                     remove.set_sensitive(False)
 
-                def toggled(button, _, k=key, title=manifest["title"]):
-                    enqueue(
-                        {
-                            "kind": "enable" if button.get_active() else "disable",
-                            "key": k,
-                            "title": title,
-                            "enabled": button.get_active(),
-                        }
-                    )
+                def toggled(button, _, k=key):
+                    enabled = button.get_active()
+                    button.set_sensitive(False)
+
+                    def run():
+                        error = None
+                        try:
+                            self.controller.knowledge.change(k, enabled)
+                        except Exception as exc:
+                            error = str(exc)
+
+                        def finish():
+                            notify()
+                            if error:
+                                self._show_alert("Could not change knowledge pack", error)
+
+                        self.dispatch(finish)
+
+                    threading.Thread(target=run, daemon=True).start()
 
                 switch.connect("notify::active", toggled)
                 remove.connect(
@@ -1790,7 +1821,11 @@ class ChatWindow(Adw.ApplicationWindow):
                 pending = next((job for job in jobs if job.get("key") == key), None)
                 if pending:
                     add_status(row, pending)
-                row.add_suffix(download_button(release, pending))
+                download = download_button(release, pending)
+                if key in covered:
+                    download.set_sensitive(False)
+                    row.set_tooltip_text(f"Included in {covered[key]}.")
+                row.add_suffix(download)
                 group.add(row)
                 rows.append(row)
             for job in jobs:
@@ -1857,13 +1892,10 @@ class ChatWindow(Adw.ApplicationWindow):
                     return
 
         def start_job(job):
-            started = time.monotonic()
             job["active"] = True
             job["status"] = {
                 "download": "Downloading…",
                 "delete": "Deleting…",
-                "enable": "Enabling…",
-                "disable": "Disabling…",
                 "merge": "Merging…",
             }[job["kind"]]
             notify()
@@ -1890,11 +1922,6 @@ class ChatWindow(Adw.ApplicationWindow):
                 self.dispatch(update)
 
             def finish(error):
-                if job["kind"] in ("enable", "disable"):
-                    remaining = 0.5 - (time.monotonic() - started)
-                    if remaining > 0:
-                        GLib.timeout_add(max(1, int(remaining * 1000) + 1), finish, error)
-                        return
                 self._knowledge_jobs.remove(job)
                 notify()
                 if error:
@@ -1907,17 +1934,36 @@ class ChatWindow(Adw.ApplicationWindow):
                     if job["kind"] == "download":
                         self.controller.knowledge.download_pack(job["release"], progress)
                     elif job["kind"] == "merge":
-                        self.controller.knowledge.merge_all(progress)
+                        self.controller.knowledge.merge_all(progress, list(catalog.values()))
                     else:
-                        enabled = None if job["kind"] == "delete" else job["enabled"]
-                        self.controller.knowledge.change(job["key"], enabled)
+                        self.controller.knowledge.change(job["key"])
                 except Exception as exc:
                     error = str(exc)
                 self.dispatch(finish, error)
 
             threading.Thread(target=run, daemon=True).start()
 
-        merge.connect("clicked", lambda *_: enqueue({"kind": "merge", "title": "All Wikipedia"}))
+        def confirm_merge(*_):
+            alert = Adw.AlertDialog(
+                heading="Merge Installed Packs?",
+                body=(
+                    "Merging packs reduces disk usage. CAN TAKE HOURS TO COMPLETE. "
+                    "Merged packs cannot be unmerged once completed. "
+                    "Lopaca and your existing packs will remain usable during merging."
+                ),
+            )
+            alert.add_response("cancel", "Cancel")
+            alert.add_response("proceed", "Proceed")
+            alert.set_default_response("cancel")
+            alert.set_close_response("cancel")
+
+            def chosen(alert, result):
+                if alert.choose_finish(result) == "proceed":
+                    enqueue({"kind": "merge", "title": "Merging Installed Packs"})
+
+            alert.choose(self, None, chosen)
+
+        merge.connect("clicked", confirm_merge)
         self._knowledge_refresh = refresh
         refresh()
         dialog.present(self)
