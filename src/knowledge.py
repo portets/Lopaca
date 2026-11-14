@@ -25,6 +25,8 @@ def _lock_path(path):
     folder = runtime / "lopaca-locks"
     try:
         folder.mkdir(mode=0o700, exist_ok=True)
+        if not os.access(folder, os.W_OK):
+            raise PermissionError("Runtime directory is not writable.")
     except OSError:
         folder = Path(tempfile.gettempdir()) / f"lopaca-locks-{os.getuid()}"
         folder.mkdir(mode=0o700, exist_ok=True)
@@ -255,11 +257,20 @@ class KnowledgeStore:
                             ):
                                 raise ValueError("Invalid table heading source span.")
                             items.append(
-                                {"role": role, "start_line": first, "end_line": last, "text": value}
+                                {
+                                    "role": role,
+                                    "start_char": a,
+                                    "end_char": b,
+                                    "start_line": first,
+                                    "end_line": last,
+                                    "text": value,
+                                }
                             )
                         body = json.dumps(
                             {
                                 "status": status,
+                                "table_start_char": table_start,
+                                "table_end_char": table_end,
                                 "items": items,
                                 "target_start_char": start,
                                 "target_end_char": end,

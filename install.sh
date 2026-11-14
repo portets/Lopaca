@@ -7,6 +7,10 @@ DATA_DIR="$HOME/.local/share/lopaca"
 INSTALL_DIR="$DATA_DIR/app"
 APPLICATIONS_DIR="$HOME/.local/share/applications"
 
+CHECK_PLAN=$(mktemp)
+trap 'rm -f -- "$CHECK_PLAN"' EXIT
+python3 "$SCRIPT_DIR/tools/install_check.py" --data-dir "$DATA_DIR" --plan "$CHECK_PLAN"
+
 mkdir -p -- "$INSTALL_DIR" "$APPLICATIONS_DIR"
 if [[ ! "$SOURCE_DIR" -ef "$INSTALL_DIR" ]]; then
     cp -- "$SOURCE_DIR"/*.py "$INSTALL_DIR/"
@@ -31,6 +35,8 @@ Icon=$ICON_PATH
 Terminal=false
 Categories=Utility;
 EOF
+
+python3 "$SCRIPT_DIR/tools/install_check.py" --data-dir "$DATA_DIR" --plan "$CHECK_PLAN" --apply
 
 printf -v MESSAGE 'Installed Lopaca to %s.\n\nLaunch it from your Applications menu.' "$INSTALL_DIR"
 # Detach GUI notifications so the launching terminal can close without closing the dialog.

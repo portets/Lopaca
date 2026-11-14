@@ -4,7 +4,6 @@ import re
 import threading
 import time
 from datetime import datetime
-from pathlib import Path
 
 import gi
 
@@ -433,10 +432,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._scroll_guard = False
         adjustment.connect("value-changed", self._adjustment_value_changed)
         adjustment.connect("changed", self._adjustment_changed)
-        wheel = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
-        wheel.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        wheel.connect("scroll", self._prepare_native_scroll)
-        self.transcript_scroll.add_controller(wheel)
+        self._sync_native_scroll(self.transcript_scroll)
         compose = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
         compose.set_margin_start(14)
         compose.set_margin_end(14)
@@ -742,11 +738,23 @@ class ChatWindow(Adw.ApplicationWindow):
     def _is_near_bottom(self, adjustment):
         return adjustment.get_upper() - adjustment.get_page_size() - adjustment.get_value() <= 1
 
-    def _prepare_native_scroll(self, _controller, _dx, _dy):
+    def _sync_native_scroll(self, widget):
+        if isinstance(widget, Gtk.ScrolledWindow) and not getattr(widget, "_scroll_sync", False):
+            widget._scroll_sync = True
+            wheel = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+            wheel.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            wheel.connect("scroll", self._prepare_native_scroll)
+            widget.add_controller(wheel)
+        child = widget.get_first_child()
+        while child:
+            self._sync_native_scroll(child)
+            child = child.get_next_sibling()
+
+    def _prepare_native_scroll(self, controller, _dx, _dy):
         # GTK ignores adjustment changes during overshoot deceleration. Cancel
         # that animation, then resync its unclamped position with the scrollbar.
         # Propagate the event so GTK supplies the native scrolling and edge glow.
-        scroll = self.transcript_scroll
+        scroll = controller.get_widget()
         kinetic = scroll.get_kinetic_scrolling()
         if kinetic:
             scroll.set_kinetic_scrolling(False)
@@ -1368,6 +1376,7 @@ class ChatWindow(Adw.ApplicationWindow):
         )
         dialog.set_search_enabled(False)
         page = Adw.PreferencesPage()
+        page.connect("map", self._sync_native_scroll)
         dialog.add(page)
         group = Adw.PreferencesGroup()
         page.add(group)
@@ -1541,6 +1550,7 @@ class ChatWindow(Adw.ApplicationWindow):
         header.pack_start(back)
         toolbar.add_top_bar(header)
         page = Adw.PreferencesPage()
+        page.connect("map", self._sync_native_scroll)
         group = Adw.PreferencesGroup()
         page.add(group)
         toolbar.set_content(page)
@@ -1657,7 +1667,8 @@ class ChatWindow(Adw.ApplicationWindow):
         header.pack_start(back)
         toolbar.add_top_bar(header)
         page = Adw.PreferencesPage()
-        group = Adw.PreferencesGroup(description="Import local .lopaca-pack.sqlite files.")
+        page.connect("map", self._sync_native_scroll)
+        group = Adw.PreferencesGroup(description="Download and manage knowledge packs.")
         page.add(group)
         toolbar.set_content(page)
         dialog.set_child(toolbar)
@@ -1671,12 +1682,17 @@ class ChatWindow(Adw.ApplicationWindow):
         dialog.connect(
             "closed", lambda *_: None if dialog.return_to_settings else settings_dialog.close()
         )
+        from pack_catalog import load_catalog
+        from pack_format import compatibility_error
+
+        try:
+            catalog = load_catalog()
+        except OSError, ValueError:
+            catalog = {}
         rows = []
-        add = Gtk.Button(label="Import Pack", halign=Gtk.Align.CENTER)
-        merge = Gtk.Button(label="Merge All Packs")
+        merge = Gtk.Button(label="Merge Installed Packs")
         actions = Gtk.Box(spacing=6)
         actions.append(merge)
-        actions.append(add)
         group.set_header_suffix(actions)
         if not hasattr(self, "_knowledge_jobs"):
             self._knowledge_jobs = []
@@ -1698,10 +1714,24 @@ class ChatWindow(Adw.ApplicationWindow):
                 group.remove(row)
             rows.clear()
             jobs = self._knowledge_jobs
-            for key, manifest, enabled in self.controller.knowledge.list_packs():
-                row = Adw.ActionRow(title=manifest["title"], subtitle=manifest["snapshot_id"])
+            installed = self.controller.knowledge.list_packs()
+            for key, manifest, enabled in installed:
+                subtitle = format_size(manifest["size_bytes"])
+                release = catalog.get(key)
+                if (
+                    release
+                    and not compatibility_error(release)
+                    and release["release_sequence"] > manifest.get("release_sequence", 0)
+                ):
+                    subtitle += " · Update available"
+                error = manifest.get("compatibility_error")
+                row = Adw.ActionRow(
+                    title=manifest["title"], subtitle=error or subtitle, use_markup=False
+                )
                 pending = next((job for job in jobs if job.get("key") == key), None)
                 switch = Gtk.Switch(active=enabled, valign=Gtk.Align.CENTER)
+                if error:
+                    switch.set_sensitive(False)
                 if manifest.get("unused_by"):
                     row.add_css_class("dim-label")
                     switch.set_sensitive(False)
@@ -1735,17 +1765,68 @@ class ChatWindow(Adw.ApplicationWindow):
                         {"kind": "delete", "key": k, "title": title}
                     ),
                 )
+                if (
+                    release
+                    and not compatibility_error(release)
+                    and (error or release["release_sequence"] > manifest.get("release_sequence", 0))
+                ):
+                    update = download_button(release, pending, update=True)
+                    row.add_suffix(update)
                 row.add_suffix(switch)
                 row.add_suffix(remove)
                 group.add(row)
                 rows.append(row)
-            for job in jobs:
-                if job["kind"] not in ("import", "merge"):
+            installed_ids = {key for key, _, _ in installed}
+            for key, release in catalog.items():
+                if key in installed_ids:
                     continue
-                row = Adw.ActionRow(title=job["title"])
+                error = compatibility_error(release)
+                row = Adw.ActionRow(
+                    title=release["title"],
+                    subtitle=error or format_size(release["size_bytes"]),
+                    use_markup=False,
+                )
+                row.add_css_class("dim-label")
+                pending = next((job for job in jobs if job.get("key") == key), None)
+                if pending:
+                    add_status(row, pending)
+                row.add_suffix(download_button(release, pending))
+                group.add(row)
+                rows.append(row)
+            for job in jobs:
+                if job["kind"] != "merge":
+                    continue
+                row = Adw.ActionRow(title=job["title"], use_markup=False)
                 add_status(row, job)
                 group.add(row)
                 rows.append(row)
+
+        def format_size(size):
+            for unit in ("B", "KB", "MB", "GB", "TB"):
+                if size < 1024 or unit == "TB":
+                    return f"{size:.1f} {unit}" if unit != "B" else f"{size} B"
+                size /= 1024
+            return "Unknown size"
+
+        def download_button(release, pending, *, update=False):
+            button = Gtk.Button(
+                icon_name="software-update-available-symbolic" if update else "list-add-symbolic",
+                tooltip_text="Update Pack" if update else "Download Pack",
+                valign=Gtk.Align.CENTER,
+                sensitive=not pending and not compatibility_error(release),
+            )
+            button.connect(
+                "clicked",
+                lambda *_: enqueue(
+                    {
+                        "kind": "download",
+                        "key": release["pack_id"],
+                        "title": release["title"],
+                        "release": release,
+                    }
+                ),
+            )
+            return button
 
         def add_status(row, job):
             label = Gtk.Label(label=job["status"], valign=Gtk.Align.CENTER)
@@ -1776,9 +1857,10 @@ class ChatWindow(Adw.ApplicationWindow):
                     return
 
         def start_job(job):
+            started = time.monotonic()
             job["active"] = True
             job["status"] = {
-                "import": "Validating…",
+                "download": "Downloading…",
                 "delete": "Deleting…",
                 "enable": "Enabling…",
                 "disable": "Disabling…",
@@ -1808,6 +1890,11 @@ class ChatWindow(Adw.ApplicationWindow):
                 self.dispatch(update)
 
             def finish(error):
+                if job["kind"] in ("enable", "disable"):
+                    remaining = 0.5 - (time.monotonic() - started)
+                    if remaining > 0:
+                        GLib.timeout_add(max(1, int(remaining * 1000) + 1), finish, error)
+                        return
                 self._knowledge_jobs.remove(job)
                 notify()
                 if error:
@@ -1817,8 +1904,8 @@ class ChatWindow(Adw.ApplicationWindow):
             def run():
                 error = None
                 try:
-                    if job["kind"] == "import":
-                        self.controller.knowledge.import_pack(job["path"], progress)
+                    if job["kind"] == "download":
+                        self.controller.knowledge.download_pack(job["release"], progress)
                     elif job["kind"] == "merge":
                         self.controller.knowledge.merge_all(progress)
                     else:
@@ -1830,25 +1917,33 @@ class ChatWindow(Adw.ApplicationWindow):
 
             threading.Thread(target=run, daemon=True).start()
 
-        def chosen(chooser, result):
-            try:
-                file = chooser.open_finish(result)
-            except GLib.Error:
-                return
-            if file.get_path():
-                path = file.get_path()
-                enqueue({"kind": "import", "path": path, "title": Path(path).name})
-
-        def choose(*_):
-            Gtk.FileDialog(title="Import Knowledge Pack").open(self, None, chosen)
-
-        add.connect("clicked", choose)
-        merge.connect(
-            "clicked", lambda *_: enqueue({"kind": "merge", "title": "Merged Knowledge Packs"})
-        )
+        merge.connect("clicked", lambda *_: enqueue({"kind": "merge", "title": "All Wikipedia"}))
         self._knowledge_refresh = refresh
         refresh()
         dialog.present(self)
+
+        def fetch_catalog():
+            try:
+                updated = load_catalog(refresh=True)
+            except (OSError, ValueError) as exc:
+
+                def failed(error=str(exc)):
+                    if is_open:
+                        group.set_description(f"Could not refresh catalog: {error}")
+
+                self.dispatch(failed)
+                return
+
+            def apply_catalog():
+                nonlocal catalog
+                catalog = updated
+                if is_open:
+                    group.set_description("Download and manage knowledge packs.")
+                refresh()
+
+            self.dispatch(apply_catalog)
+
+        threading.Thread(target=fetch_catalog, daemon=True).start()
 
     def _choose_documents(self, chat_id, *, folder=False):
         if self.chat and self.chat["id"] != chat_id:

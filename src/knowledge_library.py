@@ -12,6 +12,7 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 
 from knowledge import KnowledgeStore, _lock_path
+from pack_format import check_index, compatibility_error, publishing_metadata
 from rag import _connect_index, _retrieval_query, format_context
 from settings import APP_DIR
 
@@ -66,7 +67,21 @@ def set_index_metadata(path, pack_id, title, contains=()):
         raise ValueError("Use nonempty metadata and constituent IDs different from the parent.")
     with closing(_connect_index(path)) as db, db:
         rows = db.execute("SELECT id,manifest FROM packs").fetchall()
-        manifest = json.loads(rows[0][1])
+        manifests = [json.loads(row[1]) for row in rows]
+        manifest = manifests[0]
+        if len(manifests) > 1:
+            # Full constituent manifests remain in packs; don't mislabel the aggregate
+            # with one category's counts, description or publishing identity.
+            manifest = {
+                k: v
+                for k, v in manifest.items()
+                if all(other.get(k) == v for other in manifests[1:])
+                and not k.endswith("_count")
+                and k not in {"pack_id", "title", "description", "contains", "compatibility_error"}
+            }
+            manifest["description"] = "Combined installed Wikipedia packs."
+            manifest["release_sequence"] = max(m.get("release_sequence", 1) for m in manifests)
+        manifest = publishing_metadata(manifest)
         manifest.update(pack_id=pack_id, title=title, contains=list(contains))
         manifest["article_count"] = db.execute("SELECT count(*) FROM articles").fetchone()[0]
         db.execute(
@@ -97,6 +112,7 @@ class KnowledgeLibrary:
             try:
                 with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
                     manifest = index_manifest(db)
+                    manifest["compatibility_error"] = compatibility_error(manifest)
             except sqlite3.OperationalError:
                 if not path.exists():
                     continue
@@ -112,7 +128,7 @@ class KnowledgeLibrary:
         manifests = {m["pack_id"]: m for _, m, _ in entries}
         suppressed = {}
         for _, parent, enabled in entries:
-            if not enabled:
+            if not enabled or parent.get("compatibility_error"):
                 continue
             pending = list(parent.get("contains", []))
             seen = {parent["pack_id"]}
@@ -129,20 +145,28 @@ class KnowledgeLibrary:
         entries = self._entries()
         suppressed = self._suppressed(entries)
         result = []
-        for _, manifest, enabled in entries:
+        for path, manifest, enabled in entries:
             parent = suppressed.get(manifest["pack_id"])
-            manifest = dict(manifest, unused_by=parent)
-            result.append((manifest["pack_id"], manifest, enabled and not parent))
+            manifest = dict(manifest, unused_by=parent, size_bytes=path.stat().st_size)
+            result.append(
+                (
+                    manifest["pack_id"],
+                    manifest,
+                    enabled and not parent and not manifest.get("compatibility_error"),
+                )
+            )
         return result
 
     def _active(self):
         entries = self._entries()
         contained = self._suppressed(entries)
         return [
-            KnowledgeStore(path) for path, m, on in entries if on and m["pack_id"] not in contained
+            KnowledgeStore(path)
+            for path, m, on in entries
+            if on and not m.get("compatibility_error") and m["pack_id"] not in contained
         ]
 
-    def import_pack(self, path, progress=None):
+    def import_pack(self, path, progress=None, *, _consume=False):
         def report(stage):
             if progress:
                 progress(stage, None, None, None)
@@ -161,6 +185,9 @@ class KnowledgeLibrary:
                     report("Validating")
                     with closing(_connect_index(source)) as db:
                         manifest = index_manifest(db)
+                        check_index(db)
+                        if error := compatibility_error(manifest):
+                            raise ValueError(error)
                         if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                             raise ValueError("Invalid indexed pack.")
                         columns = {r[1] for r in db.execute("PRAGMA table_info(prepared)")}
@@ -177,22 +204,30 @@ class KnowledgeLibrary:
                                 "Re-enable all constituents before exporting an index."
                             )
                     report("Installing")
-                    with (
-                        closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as db,
-                        closing(sqlite3.connect(temporary)) as dest,
-                    ):
-                        db.backup(dest)
+                    if _consume:
+                        if source.parent != self.folder.resolve():
+                            raise ValueError(
+                                "Downloaded index must be staged in the knowledge folder."
+                            )
+                        source.replace(temporary)
+                    else:
+                        with (
+                            closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as db,
+                            closing(sqlite3.connect(temporary)) as dest,
+                        ):
+                            db.backup(dest)
                 else:
                     index = KnowledgeStore(temporary)
                     index.import_pack(source, progress)
                     with closing(_connect_index(temporary)) as db:
                         manifest = index_manifest(db)
-                # Every installed index carries its identity; merges add constituent IDs.
-                with closing(_connect_index(temporary)) as db, db:
-                    db.execute(
-                        "INSERT OR REPLACE INTO index_state VALUES ('pack_manifest',?)",
-                        (json.dumps(manifest),),
-                    )
+                if not indexed:
+                    manifest = publishing_metadata(manifest)
+                    with closing(_connect_index(temporary)) as db, db:
+                        db.execute(
+                            "INSERT OR REPLACE INTO index_state VALUES ('pack_manifest',?)",
+                            (json.dumps(manifest),),
+                        )
                 _finish_index(temporary)
                 key = manifest["pack_id"]
                 with self.lock:
@@ -219,11 +254,24 @@ class KnowledgeLibrary:
                     Path(str(temporary) + suffix).unlink(missing_ok=True)
                 _lock_path(temporary).unlink(missing_ok=True)
 
+    def download_pack(self, release, progress=None):
+        from pack_catalog import download_pack
+
+        with self._operation():
+            staged = self.folder.resolve() / (release["sha256"] + ".download")
+            with KnowledgeStore(staged)._access(exclusive=True):
+                download_pack(release, staged, progress)
+                return self.import_pack(staged, progress, _consume=True)
+
     def change(self, key, enabled=None):
         with self._operation(), self.lock:
             entry = next((p for p, m, _ in self._entries() if m["pack_id"] == key), None)
             if entry is None:
                 raise ValueError("Pack is no longer installed.")
+            if enabled:
+                with closing(sqlite3.connect(entry.as_uri() + "?mode=ro", uri=True)) as db:
+                    if error := compatibility_error(index_manifest(db)):
+                        raise ValueError(error)
             if enabled is None:
                 with KnowledgeStore(entry)._access(exclusive=True):
                     entry.unlink()
@@ -363,16 +411,29 @@ class KnowledgeLibrary:
 
     def merge_all(self, progress=None):
         with self._operation(exclusive=True):
-            entries = [entry for entry in self._entries() if not entry[1].get("contains")]
+            entries = [
+                entry
+                for entry in self._entries()
+                if not entry[1].get("contains") and not entry[1].get("compatibility_error")
+            ]
             if not entries:
                 raise ValueError("No installed packs to merge.")
+            if any(
+                "wikipedia" not in m["pack_id"].casefold()
+                and "wikimedia" not in m.get("source_dataset", "").casefold()
+                for _, m, _ in entries
+            ):
+                raise ValueError("All Wikipedia merges require Wikipedia packs only.")
+            snapshots = {(m.get("snapshot_id"), m.get("source_revision")) for _, m, _ in entries}
+            if len(snapshots) != 1:
+                raise ValueError("Align Wikipedia snapshots before merging.")
             target = self.folder / "merge.building"
             target.unlink(missing_ok=True)
             index = KnowledgeStore(target)
             try:
                 for n, (path, _, _) in enumerate(entries):
                     if progress:
-                        progress("Merging", n, len(entries), "Merged Knowledge Packs")
+                        progress("Merging", n, len(entries), "All Wikipedia")
                     with closing(index._connect()) as db:
                         db.execute("ATTACH DATABASE ? AS incoming", (str(path),))
                         for source, digest in db.execute(
@@ -407,12 +468,12 @@ class KnowledgeLibrary:
                 )
                 set_index_metadata(
                     target,
-                    "merged-" + hashlib.sha256(str(keys).encode()).hexdigest()[:12],
-                    "Merged Knowledge Packs",
+                    "wikipedia-en-all",
+                    "All Wikipedia",
                     keys,
                 )
                 _finish_index(target)
-                destination = self.folder / "merged-knowledge.sqlite"
+                destination = self.folder / "all-wiki-indexed.sqlite"
                 with self.lock:
                     target.replace(destination)
             finally:
