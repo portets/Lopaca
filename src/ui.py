@@ -1541,8 +1541,8 @@ class ChatWindow(Adw.ApplicationWindow):
             )
         dialog.present(self)
 
-    def _show_memories(self, settings_dialog):
-        dialog = Adw.Dialog(title="Global Memories", content_width=660, content_height=540)
+    def _settings_subpage(self, title, settings_dialog):
+        dialog = Adw.Dialog(title=title, content_width=660, content_height=540)
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
         back = Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="Back to App Settings")
@@ -1565,6 +1565,10 @@ class ChatWindow(Adw.ApplicationWindow):
         dialog.connect(
             "closed", lambda *_: None if dialog.return_to_settings else settings_dialog.close()
         )
+        return dialog, group
+
+    def _show_memories(self, settings_dialog):
+        dialog, group = self._settings_subpage("Global Memories", settings_dialog)
         group.set_description(
             "Edit facts, select Core for always-present memories, or delete them. "
             "Click the pencil to edit, then the checkmark to save."
@@ -1659,31 +1663,9 @@ class ChatWindow(Adw.ApplicationWindow):
         alert.choose(self, None, confirmed)
 
     def _show_knowledge_packs(self, settings_dialog):
-        dialog = Adw.Dialog(title="Knowledge Packs", content_width=660, content_height=540)
-        toolbar = Adw.ToolbarView()
-        header = Adw.HeaderBar()
-        back = Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="Back to App Settings")
-        back.add_css_class("flat")
-        header.pack_start(back)
-        toolbar.add_top_bar(header)
-        page = Adw.PreferencesPage()
-        page.connect("map", self._sync_native_scroll)
-        group = Adw.PreferencesGroup(description="Download and manage knowledge packs.")
-        page.add(group)
-        toolbar.set_content(page)
-        dialog.set_child(toolbar)
-        dialog.return_to_settings = False
-
-        def go_back(*_):
-            dialog.return_to_settings = True
-            dialog.close()
-
-        back.connect("clicked", go_back)
-        dialog.connect(
-            "closed", lambda *_: None if dialog.return_to_settings else settings_dialog.close()
-        )
-        from pack_catalog import load_catalog
-        from pack_format import compatibility_error
+        dialog, group = self._settings_subpage("Knowledge Packs", settings_dialog)
+        group.set_description("Download and manage knowledge packs.")
+        from packs import compatibility_error, load_catalog
 
         try:
             catalog = load_catalog()
