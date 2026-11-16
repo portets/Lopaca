@@ -708,6 +708,15 @@ class ChatController:
         if memory_enabled:
             # Query-specific recall must not invalidate the cached system/core profile.
             messages[-1]["content"] += casual_context
+        request_seeds = []
+
+        def record_seed(seed):
+            request_seeds.append(seed)
+            print(
+                f"Chat {self._generation_chat_id}: request {len(request_seeds)} seed {seed}",
+                flush=True,
+            )
+
         answer, reasoning, error = self.client.stream(
             messages,
             preserve_thinking,
@@ -723,6 +732,7 @@ class ChatController:
             memory_view=(lambda: view_memories(self.memories, enabled=memories_enabled))
             if memory_enabled
             else None,
+            on_seed=record_seed,
         )
         finished_at = time.time()
 
@@ -759,7 +769,13 @@ class ChatController:
 
         clarification = clarification and memories_enabled()
         self.view.dispatch(
-            self.finish_response, answer, reasoning, error, finished_at, clarification
+            self.finish_response,
+            answer,
+            reasoning,
+            error,
+            finished_at,
+            clarification,
+            request_seeds,
         )
 
     def _update_inference_stats(self, context_used, tokens_per_second):
@@ -788,7 +804,9 @@ class ChatController:
         reasoning, closing, after = rest.partition("</think>")
         return (before + after, reasoning, bool(closing)) if opening else (text, None, False)
 
-    def finish_response(self, answer, reasoning, error, finished_at=None, clarification=False):
+    def finish_response(
+        self, answer, reasoning, error, finished_at=None, clarification=False, request_seeds=None
+    ):
         answer = self.visible_answer(answer)
         steering = self._pending_steering
         self._pending_steering = None
@@ -828,6 +846,8 @@ class ChatController:
                 "timestamp": finished_at,
             }
         )
+        if request_seeds:
+            chat["messages"][-1]["request_seeds"] = request_seeds
         if clarification and answer.strip():
             chat["messages"][-1]["memory_clarification"] = True
         if self._generation_memory_review is not None:

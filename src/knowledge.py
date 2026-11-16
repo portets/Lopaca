@@ -16,7 +16,16 @@ from contextlib import closing, contextmanager
 from functools import wraps
 from pathlib import Path
 
-from rag import _connect_index, _create_chunks, _rank, _retrieval_query, _terms, format_context
+from rag import (
+    _coherent_results,
+    _connect_index,
+    _create_chunks,
+    _literal_terms,
+    _rank,
+    _retrieval_query,
+    _terms,
+    format_context,
+)
 from settings import Settings
 
 
@@ -434,6 +443,98 @@ class KnowledgeStore:
         return aliases
 
     @staticmethod
+    def _title_matches(db, query, candidates=()):
+        # Search the existing FTS heading index, then verify the complete article title.
+        # Unlike general query terms, a single-letter word can be significant inside a title.
+        words = re.findall(r"\w+", query.casefold())[:48]
+        found = {}
+        for length in range(min(8, len(words)), 1, -1):
+            for start in range(len(words) - length + 1):
+                phrase = words[start : start + length]
+                if not _terms(phrase[0]) or not _terms(phrase[-1]):
+                    continue
+                normalized = " ".join(phrase)
+                if any(" " + normalized + " " in " " + row[2] + " " for row in found.values()):
+                    continue
+                rows = db.execute(
+                    "SELECT source,section FROM chunks WHERE chunks MATCH ? LIMIT 64",
+                    ('section:"' + normalized + '"',),
+                )
+                matches = {}
+                for source, section in rows:
+                    heading = section.split(" > ", 1)[0]
+                    if " ".join(re.findall(r"\w+", heading.casefold())) != normalized:
+                        continue
+                    record = db.execute(
+                        "SELECT metadata FROM articles WHERE source=?", (source,)
+                    ).fetchone()
+                    if record:
+                        title = json.loads(record[0])["title"]
+                        if " ".join(re.findall(r"\w+", title.casefold())) == normalized:
+                            matches[source] = (source, title, normalized)
+                found.update(matches)
+        if not found:
+            for source in dict.fromkeys(row[1] for row in candidates):
+                row = db.execute(
+                    "SELECT metadata FROM articles WHERE source=?", (source,)
+                ).fetchone()
+                title = json.loads(row[0])["title"]
+                parts = re.findall(r"\w+", title.casefold())
+                compact = "".join(parts)
+                if len(parts) >= 2 and compact in words:
+                    found[source] = (source, title, compact)
+        if not found:
+            # A shortened name may omit a manufacturer's prefix and lack a redirect.
+            # Use the rarest substantive word, require a short title ending in it,
+            # and keep ambiguous candidates rather than guessing an identity.
+            terms = [term for term in _terms(query) if term.isalpha() and len(term) >= 4]
+            frequencies = {
+                term: db.execute(
+                    "SELECT count(*) FROM chunks WHERE chunks MATCH ?", ('"' + term + '"',)
+                ).fetchone()[0]
+                for term in terms
+            }
+            for term in sorted(terms, key=frequencies.get)[:3]:
+                sources = db.execute(
+                    "SELECT DISTINCT source FROM chunks WHERE chunks MATCH ? LIMIT 12",
+                    ('section:"' + term + '"',),
+                ).fetchall()
+                for (source,) in sources:
+                    row = db.execute(
+                        "SELECT metadata FROM articles WHERE source=?", (source,)
+                    ).fetchone()
+                    title = json.loads(row[0])["title"]
+                    parts = re.findall(r"\w+", title.casefold())
+                    if 2 <= len(parts) <= 4 and parts[-1] == term:
+                        other_terms = [word for word in _terms(query) if word != term]
+                        if other_terms:
+                            expression = (
+                                "body:("
+                                + " OR ".join('"' + word + '"' for word in other_terms)
+                                + ")"
+                            )
+                            evidence = db.execute(
+                                "SELECT body FROM chunks WHERE chunks MATCH ? AND rowid IN "
+                                "(SELECT id FROM passages WHERE source=?) LIMIT 12",
+                                (expression, source),
+                            ).fetchall()
+                            if not any(
+                                set(other_terms) & _literal_terms(body) for (body,) in evidence
+                            ):
+                                continue
+                        found[source] = (source, title, term)
+                if found:
+                    break
+            if found:
+                shortest = min(len(re.findall(r"\w+", row[1])) for row in found.values())
+                found = {
+                    source: row
+                    for source, row in found.items()
+                    if len(re.findall(r"\w+", row[1])) == shortest
+                }
+        return list(found.values())
+
+    @staticmethod
     def _table_context(db, source, first, last):
         """Headings have their own citations; never merge them into the row's source span."""
         return [
@@ -463,7 +564,11 @@ class KnowledgeStore:
             try:
                 db.execute("BEGIN")
                 aliases = self._aliases(db, query)
-                rows = _rank(db, query, "", Settings())
+                rows = _coherent_results(
+                    query,
+                    _rank(db, query, "", Settings(), split_compounds=True),
+                    lambda row: row[2] + "\n" + row[3],
+                )
                 matches = []
                 for source, title, _ in aliases:
                     if fnmatch.fnmatchcase(source, pattern) and (
@@ -510,12 +615,16 @@ class KnowledgeStore:
                 return ""
             expansion = expand(query) if expand else ""
             db.execute("BEGIN")
-            ranked = _rank(db, query, expansion, settings)
+            ranked = _rank(
+                db, query, expansion, settings, require_identifiers=True, split_compounds=True
+            )
             # Only query-specific casual memories become search clues; always-present core
             # memories would otherwise pull personal-topic articles into unrelated answers.
             memory_query = "\n".join(text for _, text, core in memory_rows if not core)
             if memory_query:
-                memory_ranked = _rank(db, memory_query, "", settings)
+                memory_ranked = _rank(
+                    db, memory_query, "", settings, require_identifiers=True, split_compounds=True
+                )
                 scores, candidates = {}, {}
                 for weight, results in ((1.0, ranked), (1.0, memory_ranked)):
                     for rank, row in enumerate(results, 1):
@@ -527,20 +636,51 @@ class KnowledgeStore:
             matched_aliases = {}
             # Match complete redirect titles in the original question.
             aliases = self._aliases(db, query)
-            if aliases:
-                longest = max(len(row[2].split()) for row in aliases)
-                aliases = [row for row in aliases if len(row[2].split()) == longest]
+            # A short redirect naming only one part of a compound query is not a
+            # reliable subject anchor (e.g. a company inside a specific product query).
+            query_terms = set(_terms(query))
+            aliases = [
+                row
+                for row in aliases
+                if len(row[2].split()) >= 2
+                or len(set(_terms(row[1])) & query_terms) >= 0.6 * len(query_terms)
+            ]
+            redirect_keys = {(source, title) for source, title, _ in aliases}
+            title_matches = self._title_matches(db, query, ranked)
+            matched_titles = {}
+            matches = aliases + title_matches
+            if matches:
+                # Prefer specific names over contained aliases, while keeping independently
+                # named subjects (a longer title must not hide a second, shorter title).
+                aliases = [
+                    row
+                    for row in matches
+                    if not any(
+                        row[2] != other[2] and " " + row[2] + " " in " " + other[2] + " "
+                        for other in matches
+                    )
+                ]
                 alias_rows = []
                 extra_alias_rows = []
+                supplements = []
                 for source, title, _ in aliases:
-                    matched_aliases.setdefault(source, set()).add(title)
+                    if (source, title) in redirect_keys:
+                        matched_aliases.setdefault(source, set()).add(title)
+                    for item in title_matches:
+                        if item[0] == source and item[2] != " ".join(
+                            re.findall(r"\w+", title.casefold())
+                        ):
+                            matched_titles.setdefault(source, set()).add(item[2])
                     metadata = json.loads(
                         db.execute(
                             "SELECT metadata FROM articles WHERE source=?", (source,)
                         ).fetchone()[0]
                     )
                     candidates = _rank(
-                        db, query + " " + title + " " + metadata["title"], expansion, settings
+                        db,
+                        query + " " + title + " " + metadata["title"],
+                        expansion,
+                        settings,
                     )
                     matching = [r for r in candidates if r[1] == source]
                     row = matching[0] if matching else None
@@ -553,8 +693,23 @@ class KnowledgeStore:
                         ).fetchone()
                     if row and row[0] not in {r[0] for r in alias_rows}:
                         alias_rows.append(row)
+                    if row and " > " in row[2]:
+                        parent = row[2].rsplit(" > ", 1)[0]
+                        overview = db.execute(
+                            "SELECT rowid,source,section,body,start_line,end_line "
+                            "FROM chunk_content "
+                            "WHERE source=? AND section=? ORDER BY start_line,rowid LIMIT 2",
+                            (source, parent),
+                        ).fetchall()
+                        for context_row in overview:
+                            if (
+                                context_row[0] not in {r[0] for r in alias_rows}
+                                and re.sub(r"(?m)^\s*#{1,6}\s+[^\n]*", "", context_row[3]).strip()
+                            ):
+                                alias_rows.append(context_row)
                     # A redirect may name a section with several useful subsections.
                     # Include distinct child sections before repeating similar excerpts.
+                    # The article root alone must not pull in every unrelated subsection.
                     section_names = db.execute(
                         "SELECT DISTINCT section FROM passages WHERE source=? "
                         "AND section!='' ORDER BY start_line",
@@ -564,7 +719,7 @@ class KnowledgeStore:
                     for (section_name,) in section_names:
                         parts = section_name.split(" > ")
                         if len(parts) < 2 or not any(
-                            re.sub(r"\W+", "", part.casefold()) == alias_key for part in parts[:-1]
+                            re.sub(r"\W+", "", part.casefold()) == alias_key for part in parts[1:-1]
                         ):
                             continue
                         child = db.execute(
@@ -575,20 +730,48 @@ class KnowledgeStore:
                         ).fetchone()
                         if child:
                             extra_alias_rows.append(child)
-                    extra_alias_rows.extend(matching[1:])
+                    supplements.extend(matching[1:])
                 # Give ambiguous targets one result each before additional passages.
                 seen = {r[0] for r in alias_rows}
                 # Keep memory-informed results visible when a generic redirect matches.
                 remaining = (
-                    memory_ranked + ranked + extra_alias_rows
+                    memory_ranked + extra_alias_rows + supplements + ranked
                     if memory_query
-                    else extra_alias_rows + ranked
+                    else extra_alias_rows + supplements + ranked
                 )
+                original = {re.sub(r"\W+", "", term) for term in query_terms}
+                identifiers = {
+                    re.sub(r"\W+", "", term)
+                    for term in query_terms
+                    if any(c.isalpha() for c in term) and any(c.isdigit() for c in term)
+                }
+                covered = set().union(
+                    *(_literal_terms(row[2] + "\n" + row[3]) for row in alias_rows)
+                )
+                child_ids = {row[0] for row in extra_alias_rows}
+                named_sources = {row[1] for row in alias_rows}
                 for row in remaining:
-                    if row[0] not in seen:
-                        alias_rows.append(row)
-                        seen.add(row[0])
+                    if row[0] in seen:
+                        continue
+                    literals = _literal_terms(row[2] + "\n" + row[3])
+                    novel = (original & literals) - covered
+                    if row[0] not in child_ids and not (
+                        novel
+                        and (row[1] in named_sources or novel & identifiers or len(novel) >= 2)
+                    ):
+                        continue
+                    alias_rows.append(row)
+                    seen.add(row[0])
+                    covered.update(literals)
                 ranked = alias_rows[: settings.rag_results]
+            if not matches:
+                ranked = _coherent_results(query, ranked, lambda row: row[2] + "\n" + row[3])
+            requested_ids = [
+                term
+                for term in _terms(query)
+                if (any(c.isalpha() for c in term) and any(c.isdigit() for c in term))
+                or "_" in term
+            ]
             rows = []
             for _, source, section, body, first, last in ranked:
                 metadata = json.loads(
@@ -604,6 +787,23 @@ class KnowledgeStore:
                 )
                 if section:
                     reference += f", section: {section}"
+                literals = _literal_terms(section + "\n" + body) if requested_ids else set()
+                unmatched = [
+                    term for term in requested_ids if re.sub(r"\W+", "", term) not in literals
+                ]
+                if unmatched:
+                    body = (
+                        "Retrieval scope, not source text: this excerpt does not identify "
+                        + ", ".join(unmatched)
+                        + ". It may cover another part of the request; do not infer a "
+                        "relationship to those identifiers.\n\n" + body
+                    )
+                if source in matched_titles:
+                    names = json.dumps(sorted(matched_titles[source]), ensure_ascii=False)
+                    body = (
+                        f"Pack title metadata: {names} → {metadata['title']}. "
+                        "This is a title-word match, not an independent redirect.\n\n" + body
+                    )
                 if source in matched_aliases:
                     # Aliases are pack metadata, not words from the cited source lines.
                     titles = json.dumps(sorted(matched_aliases[source]), ensure_ascii=False)

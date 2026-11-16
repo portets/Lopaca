@@ -802,13 +802,18 @@ def _document_context(connection, row, limit):
             # Wrapped/minified lines cannot be reconstructed by line number.
             if len(part[3].splitlines()) != part[5] - part[4] + 1:
                 return None
-            lines.update(enumerate(part[3].splitlines(), part[4]))
+            for number, line in enumerate(part[3].splitlines(), part[4]):
+                # Prepared passages can split one physical line at different offsets.
+                # Replacing one partial line with another can erase the matching fact.
+                if number in lines and lines[number] != line:
+                    return None
+                lines[number] = line
         first, last = min(lines), max(lines)
         body = "\n".join(lines.get(number, "") for number in range(first, last + 1))
         return (
             row[0],
             source,
-            "",
+            row[2] if all(part[2] == row[2] for part in parts) else "",
             body,
             first,
             last,
@@ -816,7 +821,37 @@ def _document_context(connection, row, limit):
     return None
 
 
-def _rank(connection, query, expansion, settings, excluded_sources=()):
+def _literal_terms(value):
+    value = value.casefold()
+    words = re.findall(r"\w+", value)
+    tokens = {re.sub(r"\W+", "", term) for term in _TERM.findall(value)} | set(words)
+    tokens.update(a + b for a, b in itertools.pairwise(words))
+    return tokens
+
+
+def _coherent_results(query, rows, text):
+    """Prefer corroborated matches over single-word tangents for short queries."""
+    terms = {re.sub(r"\W+", "", term) for term in _terms(query)}
+    if not 2 <= len(terms) <= 3:
+        return rows
+    counts = [len(terms & _literal_terms(text(row))) for row in rows]
+    return (
+        [row for row, count in zip(rows, counts, strict=True) if count == max(counts)]
+        if max(counts, default=0) >= 2
+        else rows
+    )
+
+
+def _rank(
+    connection,
+    query,
+    expansion,
+    settings,
+    excluded_sources=(),
+    *,
+    require_identifiers=False,
+    split_compounds=False,
+):
     terms = _terms(query)
     extra = [term for term in _terms(expansion) if term not in terms]
     expanded_terms = set(extra)
@@ -838,6 +873,58 @@ def _rank(connection, query, expansion, settings, excluded_sources=()):
         ).fetchone()[0]
         for term in (*terms, *extra)
     }
+    term_search = {term: _quote(term) for term in frequencies}
+    compound_hits = []
+    compound_components = set()
+    if split_compounds and len(terms) > 1:
+        # Only try a bounded number of uncommon alphabetic words. A split must occur
+        # beside another original clue in indexed text; it is not a guessed synonym.
+        for term in sorted(terms, key=frequencies.get)[:3]:
+            if (
+                not term.isalpha()
+                or not 6 <= len(term) <= 16
+                or frequencies[term] > max(10, total // 5000)
+            ):
+                continue
+            others = [word for word in terms if word != term and frequencies[word]]
+            if not others:
+                continue
+            clues = sorted(others, key=frequencies.get)[:3]
+            clue = "(" + " OR ".join(_quote(word) for word in clues) + ")"
+            splits = [term[:i] + " " + term[i:] for i in range(2, len(term) - 1)]
+            alternative = "(" + " OR ".join(_quote(part) for part in splits) + ")"
+            hits = _search(connection, alternative + " AND " + clue, 8)
+            if not hits:
+                continue
+            hit_bodies = {
+                rowid: connection.execute("SELECT body FROM chunk_content WHERE rowid=?", (rowid,))
+                .fetchone()[0]
+                .casefold()
+                for (rowid,) in hits
+            }
+            bodies = "\n".join(hit_bodies.values())
+            found = [
+                part
+                for part in splits
+                if re.search(
+                    r"(?<!\w)" + re.escape(part).replace(r"\ ", r"\s+") + r"(?!\w)", bodies
+                )
+            ]
+            if found:
+                for rowid, body in hit_bodies.items():
+                    literals = _literal_terms(body)
+                    if any(
+                        re.search(
+                            r"(?<!\w)" + re.escape(part).replace(r"\ ", r"\s+") + r"(?!\w)", body
+                        )
+                        for part in found
+                    ) and any(word.isalpha() and word in literals for word in clues):
+                        compound_components.add(rowid)
+                compound_hits.append(hits)
+                term_search[term] = "(" + " OR ".join(_quote(part) for part in [term, *found]) + ")"
+                frequencies[term] = connection.execute(
+                    "SELECT count(*) FROM chunks WHERE chunks MATCH ?", (term_search[term],)
+                ).fetchone()[0]
     weights = {
         term: math.log1p((total + 0.5) / (frequencies[term] + 0.5)) if frequencies[term] else 1.0
         for term in frequencies
@@ -879,13 +966,48 @@ def _rank(connection, query, expansion, settings, excluded_sources=()):
         for pair in re.findall(r'`([^`\n]+)`|"([^"\n]+)"', query)
     ]
     phrases = list(dict.fromkeys(phrase for phrase in phrases if _terms(phrase)))[:8]
+    identifiers_requested = [
+        term
+        for term in terms
+        if (any(c.isalpha() for c in term) and any(c.isdigit() for c in term)) or "_" in term
+    ]
+    component_hits = set(compound_components) if identifiers_requested else set()
+    if require_identifiers and identifiers_requested:
+        # A rare, tight group of original words can describe another component of a
+        # request. Admit only corroborated groups, not arbitrary partial ID matches.
+        groups = [
+            terms[i : i + 3]
+            for i in range(len(terms) - 2)
+            if not set(terms[i : i + 3]) & set(identifiers_requested)
+        ]
+        groups.sort(key=lambda group: sum(weights[term] for term in group), reverse=True)
+        for group in groups[:6]:
+            expression = "NEAR(" + " ".join(_quote(term) for term in group) + ", 4)"
+            hits = connection.execute(
+                "SELECT rowid FROM chunks WHERE chunks MATCH ? LIMIT 9", (expression,)
+            ).fetchall()
+            if not 0 < len(hits) <= 8:
+                continue
+            for (rowid,) in hits:
+                body = connection.execute(
+                    "SELECT body FROM chunk_content WHERE rowid=?", (rowid,)
+                ).fetchone()[0]
+                literals = _literal_terms(body)
+                if all(re.sub(r"\W+", "", term) in literals for term in group):
+                    component_hits.add(rowid)
     # Fuse the original query, explicit phrases, and optional new vocabulary.
     expressions = [
-        (1.0, " OR ".join(_quote(term) for term in terms)),
+        (1.0, " OR ".join(term_search[term] for term in terms)),
+        (0.7, " OR ".join(_quote(term) for term in identifiers_requested)),
         (0.4, " OR ".join(_quote(phrase) for phrase in phrases)),
         (0.35, " OR ".join(_quote(term) for term in extra)),
     ]
     ranks = defaultdict(float)
+    for rowid in component_hits:
+        ranks[rowid] += 0.7 / 61
+    for hits in compound_hits:
+        for rank, (rowid,) in enumerate(hits, 1):
+            ranks[rowid] = max(ranks[rowid], 0.7 / (60 + rank))
     for weight, expression in expressions:
         for rank, (rowid,) in enumerate(
             _search(connection, expression, max(1, settings.rag_candidates), sources), 1
@@ -907,14 +1029,14 @@ def _rank(connection, query, expansion, settings, excluded_sources=()):
     for term in weights:
         for (rowid,) in connection.execute(
             f"SELECT rowid FROM chunks WHERE chunks MATCH ? AND rowid IN ({rowids})",
-            (_quote(term), *candidates),
+            (term_search[term], *candidates),
         ):
             matches[rowid].add(term)
             file_matches[candidates[rowid][1]].add(term)
         if term in terms and frequencies[term]:
             for (rowid,) in connection.execute(
                 f"SELECT rowid FROM chunks WHERE chunks MATCH ? AND rowid IN ({rowids})",
-                (evidence_field + _quote(term), *candidates),
+                (evidence_field + term_search[term], *candidates),
             ):
                 body_matches[rowid].add(term)
     original = set(terms)
@@ -935,6 +1057,8 @@ def _rank(connection, query, expansion, settings, excluded_sources=()):
     best_rank = max(ranks.values())
     scores, covered_terms = {}, {}
     for rowid, source, section, body, _first, _last in candidates.values():
+        if not re.sub(r"(?m)^\s*#{1,6}\s+[^\n]*", "", body).strip():
+            continue  # A heading is navigation context, not a factual excerpt on its own.
         found = matches[rowid] & content_terms
         coverage = sum(weights[term] for term in found) / denominator
         source_coverage = (
@@ -945,6 +1069,16 @@ def _rank(connection, query, expansion, settings, excluded_sources=()):
             bool(re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", haystack))
             for term in technical
         )
+        if (
+            require_identifiers
+            and rowid not in component_hits
+            and identifiers_requested
+            and not any(
+                re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", haystack)
+                for term in identifiers_requested
+            )
+        ):
+            continue
         expanded_found = matches[rowid] & expanded_terms
         expansion_coverage = sum(weights[term] for term in expanded_found) / max(
             1, expansion_weight
@@ -1014,9 +1148,21 @@ def _rank(connection, query, expansion, settings, excluded_sources=()):
         ):
             continue
         selected.append(row)
-        used.update(
-            file_matches[source] & content_terms if contexts[context_key] else covered_terms[rowid]
-        )
+        if require_identifiers:
+            # Seeing one section is not evidence for every query term elsewhere in
+            # that article. Preserve uncovered identifiers for another component.
+            literals = _literal_terms(source + "\n" + section + "\n" + body)
+            used.update(
+                term
+                for term in content_terms | expanded_terms
+                if re.sub(r"\W+", "", term) in literals
+            )
+        else:
+            used.update(
+                file_matches[source] & content_terms
+                if contexts[context_key]
+                else covered_terms[rowid]
+            )
         spans[source].append((first, last))
     return selected
 

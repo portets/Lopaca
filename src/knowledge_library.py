@@ -13,7 +13,7 @@ from pathlib import Path
 
 from knowledge import KnowledgeStore, _lock_path
 from pack_format import check_index, compatibility_error, publishing_metadata
-from rag import _connect_index, _retrieval_query, format_context
+from rag import _coherent_results, _connect_index, _retrieval_query, format_context
 from settings import APP_DIR
 
 _LIBRARY_LOCK = threading.RLock()
@@ -317,7 +317,7 @@ class KnowledgeLibrary:
                     title = re.search(r"Knowledge pack: \S+, (.*?), prepared-text lines", reference)
                     if title:
                         names.append(title[1])
-                    aliases = re.search(r"Pack redirect metadata: (\[.*?\]) →", body)
+                    aliases = re.search(r"Pack (?:redirect|title) metadata: (\[.*?\]) →", body)
                     if aliases:
                         names.extend(json.loads(aliases[1]))
                 return max(
@@ -353,6 +353,8 @@ class KnowledgeLibrary:
                 for key in rows
                 if len(key) != 4 or not key[3].isdecimal() or int(key[3]) == newest[key[0]]
             ]
+            if not strongest:
+                eligible = _coherent_results(query, eligible, lambda key: "\n".join(rows[key]))
             chosen = sorted(eligible, key=scores.get, reverse=True)[: settings.rag_results]
             text = format_context([rows[k] for k in chosen], settings.max_context_chars)
             return (

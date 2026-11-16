@@ -2,6 +2,7 @@
 
 import json
 import re
+import secrets
 import threading
 import urllib.request
 from contextlib import suppress
@@ -267,6 +268,7 @@ class LlamaClient:
         thinking=None,
         documents=None,
         memory_view=None,
+        on_seed=None,
     ):
         """Keep read-only tool exchanges local to this request, with bounded follow-ups."""
         history = list(messages)
@@ -279,6 +281,9 @@ class LlamaClient:
             if stopped():
                 return answer, reasoning, None
             prefix = answer
+            seed = secrets.randbelow(2**32 - 1)
+            if on_seed:
+                on_seed(seed)
             part, thought, error, calls = self._stream_turn(
                 history,
                 preserve_thinking,
@@ -290,6 +295,7 @@ class LlamaClient:
                 thinking,
                 turn == self.settings.max_tool_rounds,
                 tools,
+                seed,
             )
             answer += part
             reasoning += ("\n\n" if reasoning and thought else "") + thought
@@ -345,6 +351,7 @@ class LlamaClient:
         thinking,
         final_turn,
         tools=None,
+        seed=None,
     ):
         url = self.settings.server_url.rstrip("/") + "/chat/completions"
         thinking = thinking or {}
@@ -393,6 +400,8 @@ class LlamaClient:
         body.update(
             {key: value for key, value in thinking.items() if key != "chat_template_kwargs"}
         )
+        if seed is not None:
+            body["seed"] = seed
         if self.settings.max_tokens is not None:
             body["max_tokens"] = self.settings.max_tokens
         request = self._post_request(url, body)
