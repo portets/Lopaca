@@ -104,14 +104,27 @@ class KnowledgeLibrary:
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
+    def _catalog(self):
+        from pack_catalog import load_catalog
+
+        try:
+            return load_catalog(folder=self.folder)
+        except OSError, ValueError:
+            return {}
+
     def _entries(self):
         entries = []
+        catalog = self._catalog()
         state_path = self.folder / "packs.json"
         state = json.loads(state_path.read_text()) if state_path.exists() else {}
         for path in sorted(self.folder.glob("*.sqlite")):
             try:
                 with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
                     manifest = index_manifest(db)
+                    policy = catalog.get(manifest["pack_id"], {})
+                    manifest.update(
+                        hidden=policy.get("hidden", False), requires=policy.get("requires", [])
+                    )
                     manifest["compatibility_error"] = compatibility_error(manifest)
             except sqlite3.OperationalError:
                 if not path.exists():
@@ -121,7 +134,15 @@ class KnowledgeLibrary:
         ids = [m["pack_id"] for _, m, _ in entries]
         if len(ids) != len(set(ids)):
             raise ValueError("Multiple installed files have the same pack ID.")
-        return entries
+        suppressed = self._suppressed(entries)
+        needed = {
+            key
+            for _, m, on in entries
+            if on and m["pack_id"] not in suppressed and not m.get("compatibility_error")
+            for key in m.get("requires", [])
+        }
+        # Hidden dependencies follow their consumers rather than a separate user switch.
+        return [(p, m, m["pack_id"] in needed if m.get("hidden") else on) for p, m, on in entries]
 
     @staticmethod
     def _suppressed(entries):
@@ -254,14 +275,65 @@ class KnowledgeLibrary:
                     Path(str(temporary) + suffix).unlink(missing_ok=True)
                 _lock_path(temporary).unlink(missing_ok=True)
 
-    def download_pack(self, release, progress=None):
+    def download_pack(self, release, progress=None, *, _dependency=False):
         from pack_catalog import download_pack
 
         with self._operation():
             staged = self.folder.resolve() / (release["sha256"] + ".download")
             with KnowledgeStore(staged)._access(exclusive=True):
+                if _dependency and any(
+                    m["pack_id"] == release["pack_id"]
+                    and m.get("release_sequence", 0) >= release["release_sequence"]
+                    for _, m, _ in self._entries()
+                ):
+                    return release["title"]
                 download_pack(release, staged, progress)
-                return self.import_pack(staged, progress, _consume=True)
+                title = self.import_pack(staged, progress, _consume=True)
+        if not _dependency:
+            self.ensure_dependencies(progress)
+        return title
+
+    def missing_dependencies(self):
+        catalog = self._catalog()
+        installed = {m["pack_id"]: m for _, m, _ in self._entries()}
+        return [
+            key
+            for key in {k for m in installed.values() for k in m.get("requires", [])}
+            if key in catalog
+            and (
+                key not in installed
+                or installed[key].get("release_sequence", 0) < catalog[key]["release_sequence"]
+            )
+        ]
+
+    def ensure_dependencies(self, progress=None):
+        catalog = self._catalog()
+        entries = self._entries()
+        installed = {m["pack_id"]: m for _, m, _ in entries}
+        needed = {key for m in installed.values() for key in m.get("requires", [])}
+        for key in sorted(needed):
+            release = catalog.get(key)
+            if release is None:
+                raise ValueError(f"Shared knowledge data {key} is missing from the catalog.")
+            if (
+                key in installed
+                and installed[key].get("release_sequence", 0) >= release["release_sequence"]
+            ):
+                continue
+            if progress:
+                progress("Downloading shared Wikipedia data", None, None, None)
+            try:
+
+                def shared_progress(stage, current, total, title):
+                    if progress:
+                        progress(f"Shared data — {stage}", current, total, None)
+
+                self.download_pack(release, shared_progress, _dependency=True)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Your requested pack is installed, but shared data could not be installed: "
+                    f"{exc}"
+                ) from exc
 
     def change(self, key, enabled=None):
         # Toggles only write preferences, so they need not wait for a long merge.
@@ -285,6 +357,13 @@ class KnowledgeLibrary:
             temporary = state_path.with_suffix(".tmp")
             temporary.write_text(json.dumps(state))
             temporary.replace(state_path)
+            if enabled is None:
+                remaining = self._entries()
+                needed = {k for _, m, _ in remaining for k in m.get("requires", [])}
+                for path, manifest, _ in remaining:
+                    if manifest.get("hidden") and manifest["pack_id"] not in needed:
+                        with KnowledgeStore(path)._access(exclusive=True):
+                            path.unlink()
 
     def context(self, query, settings, expand=None, previous_queries=(), memory_rows=()):
         with self.lock:

@@ -1727,6 +1727,8 @@ class ChatWindow(Adw.ApplicationWindow):
                 for key in manifest.get("contains", [])
             }
             for key, manifest, enabled in installed:
+                if manifest.get("hidden"):
+                    continue
                 subtitle = format_size(manifest["size_bytes"])
                 release = catalog.get(key)
                 if (
@@ -1809,7 +1811,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 rows.append(row)
             installed_ids = {key for key, _, _ in installed}
             for key, release in catalog.items():
-                if key in installed_ids:
+                if key in installed_ids or release.get("hidden"):
                     continue
                 error = compatibility_error(release)
                 row = Adw.ActionRow(
@@ -1895,6 +1897,7 @@ class ChatWindow(Adw.ApplicationWindow):
             job["active"] = True
             job["status"] = {
                 "download": "Downloading…",
+                "dependencies": "Downloading shared Wikipedia data…",
                 "delete": "Deleting…",
                 "merge": "Merging…",
             }[job["kind"]]
@@ -1933,6 +1936,8 @@ class ChatWindow(Adw.ApplicationWindow):
                 try:
                     if job["kind"] == "download":
                         self.controller.knowledge.download_pack(job["release"], progress)
+                    elif job["kind"] == "dependencies":
+                        self.controller.knowledge.ensure_dependencies(progress)
                     elif job["kind"] == "merge":
                         self.controller.knowledge.merge_all(progress, list(catalog.values()))
                     else:
@@ -1983,6 +1988,17 @@ class ChatWindow(Adw.ApplicationWindow):
             def apply_catalog():
                 nonlocal catalog
                 catalog = updated
+                if self.controller.knowledge.missing_dependencies():
+                    installed = self.controller.knowledge.list_packs()
+                    consumer = next((k for k, m, _ in installed if m.get("requires")), None)
+                    if consumer and not any(j.get("key") == consumer for j in self._knowledge_jobs):
+                        enqueue(
+                            {
+                                "kind": "dependencies",
+                                "key": consumer,
+                                "title": "Shared Wikipedia data",
+                            }
+                        )
                 if is_open:
                     group.set_description("Download and manage knowledge packs.")
                 refresh()

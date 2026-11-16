@@ -42,14 +42,21 @@ def validate_catalog(data):
             raise ValueError("Invalid catalog file size.")
         if not row["url"].startswith("https://huggingface.co/datasets/"):
             raise ValueError("Unsupported catalog download URL.")
+        if not isinstance(row.get("hidden", False), bool):
+            raise ValueError("Invalid hidden-pack flag.")
+        dependencies = row.get("requires", [])
+        if not isinstance(dependencies, list) or any(
+            not isinstance(key, str) or not key or key == row["pack_id"] for key in dependencies
+        ):
+            raise ValueError("Invalid pack dependencies.")
         version_tuple(row.get("min_lopaca_version"))
         if row.get("max_lopaca_version"):
             version_tuple(row["max_lopaca_version"])
     return releases
 
 
-def load_catalog(*, refresh=False):
-    path = APP_DIR / "knowledge" / "catalog.json"
+def load_catalog(*, refresh=False, folder=None):
+    path = (folder or APP_DIR / "knowledge") / "catalog.json"
     if refresh:
         # Bound metadata size and network wait; the caller runs this off the GTK thread.
         with urlopen(CATALOG_URL, timeout=10) as response:
