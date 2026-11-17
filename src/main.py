@@ -192,13 +192,14 @@ class ChatController:
                 connected = self.client.connected()
             except Exception:
                 connected = False
-            self.view.dispatch(self._connection_changed, connected)
             if connected:
                 try:
                     props = self.client.server_properties()
                     self.view.dispatch(self._server_properties_changed, props)
                 except Exception:
                     pass
+            # Refresh capacity before reconnecting can release queued prompts.
+            self.view.dispatch(self._connection_changed, connected)
             sizes, total = self.store.disk_usage()
             self.view.dispatch(self._update_disk_usage, sizes, total)
             time.sleep(self.settings.connection_check_interval)
@@ -541,9 +542,18 @@ class ChatController:
         if chat_id == self.chat["id"]:
             self.view.set_chat_title(chat["title"])
             self.view.append_message("user", text, timestamp=timestamp)
-        start = self.store.load_settings(chat_id).get("context_start", 0)
+        saved_window = self.store.load_settings(chat_id)
+        start = saved_window.get("context_start", 0)
         if type(start) is not int or not 0 <= start < len(chat["messages"]):
             start = 0
+        capacity = self.client.context_capacity
+        self._generation_context_capacity = capacity
+        previous_capacity = saved_window.get("context_capacity", 0)
+        if type(previous_capacity) is not int:
+            previous_capacity = 0
+        self._generation_expanding = bool(start and capacity and capacity > previous_capacity)
+        if self._generation_expanding:
+            start = 0  # Reconsider older exchanges against the new capacity on the worker.
         self._generation_context_start = start
         messages = []
         for message in chat["messages"][start:]:
@@ -719,6 +729,7 @@ class ChatController:
                     query,
                     self._generation_chat_id,
                     expand=expand if query_expansion else None,
+                    previous_queries=[m["content"] for m in history if m["role"] == "user"],
                 )
             except Exception as exc:
                 self.view.dispatch(self.view.notify, f"Chat history retrieval unavailable: {exc}")
@@ -729,7 +740,11 @@ class ChatController:
         if not self.stop_requested:
             try:
                 archive_context = self.history_index.local_context(
-                    query, self._generation_chat_id, expand=expand if query_expansion else None
+                    query,
+                    self._generation_chat_id,
+                    expand=expand if query_expansion else None,
+                    boundary=self._generation_context_start,
+                    previous_queries=[m["content"] for m in history if m["role"] == "user"],
                 )
             except Exception as exc:
                 self.view.dispatch(self.view.notify, f"Chat archive retrieval unavailable: {exc}")
@@ -802,6 +817,7 @@ class ChatController:
             on_context_trim=context_trimmed,
             context_user_content=context_user_content,
             on_waiting=lambda: setattr(self, "_generation_streaming", False),
+            expand_context=self._generation_expanding,
         )
         finished_at = time.time()
         self._generation_answer_complete = not error and not self.stop_requested
@@ -880,7 +896,9 @@ class ChatController:
                 if not self.stop_requested:
                     self.view.dispatch(self.view.notify, f"Could not condense context: {exc}")
 
-        if self._generation_context_start != initial_start and not self._post_response_condensing:
+        if (
+            self._generation_context_start != initial_start or self._generation_expanding
+        ) and not self._post_response_condensing:
             # Reactive mid-response rolls also need their new archive before queued input.
             self._post_response_condensing = True
             self._set_context_processing(True)
@@ -987,6 +1005,11 @@ class ChatController:
         if self._generation_context_used is not None:
             chat.setdefault("inference_stats", {})["context_used"] = self._generation_context_used
         chat["context_start"] = getattr(self, "_generation_context_start", 0)
+        capacity = self.client.context_capacity
+        request_capacity = getattr(self, "_generation_context_capacity", capacity)
+        chat["context_capacity"] = (
+            min(capacity, request_capacity) if capacity and request_capacity else capacity
+        )
         chat["updated"] = finished_at
         self.store.save(chat, message_start=len(chat["messages"]) - 1)
         if self._post_response_condensing:

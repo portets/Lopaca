@@ -9,7 +9,7 @@ import threading
 from contextlib import closing
 from dataclasses import replace
 
-from rag import _chunks, _connect_index, _create_chunks, _keywords, _rank, _terms
+from rag import _chunks, _connect_index, _create_chunks, _keywords, _rank, _retrieval_query, _terms
 
 # Conversation-navigation words describe the lookup, rather than its subject.
 _HISTORY_STOP_WORDS = {
@@ -133,8 +133,10 @@ class HistoryIndex:
                     "INSERT OR REPLACE INTO index_state VALUES ('archive_boundary',?)", (stamp,)
                 )
 
-    def local_context(self, query, chat_id, expand=None):
-        return self._local(chat_id).context(query, chat_id, expand)
+    def local_context(self, query, chat_id, expand=None, *, boundary=None, previous_queries=()):
+        local = self._local(chat_id)
+        local.boundary = boundary
+        return local.context(query, chat_id, expand, previous_queries=previous_queries)
 
     def _update(self, chat_id):
         if not self.enabled():
@@ -264,13 +266,15 @@ class HistoryIndex:
                     db.execute("DELETE FROM files WHERE path=?", (source,))
                     db.execute("DELETE FROM records WHERE source=?", (source,))
 
-    def context(self, query, chat_id, expand=None):
+    def context(self, query, chat_id, expand=None, *, previous_queries=()):
         if not self.enabled() or not self.path.exists():
             return ""
         with closing(self._connect()) as db:
             local = getattr(self, "local", False)
             # Exclude still-active records even if a stale archive index has not caught up.
-            boundary = self.store.load_settings(chat_id).get("context_start", 0)
+            boundary = getattr(self, "boundary", None)
+            if boundary is None:
+                boundary = self.store.load_settings(chat_id).get("context_start", 0)
             excluded = [
                 r[0]
                 for r in db.execute(
@@ -292,7 +296,7 @@ class HistoryIndex:
             subject = re.sub(
                 r"(?<![\w./])(?:" + "|".join(sorted(_HISTORY_STOP_WORDS)) + r")(?![\w./])",
                 " ",
-                query,
+                _retrieval_query(query, previous_queries),
                 flags=re.IGNORECASE,
             )
             if not _terms(subject):

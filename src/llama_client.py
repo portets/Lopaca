@@ -101,6 +101,7 @@ class LlamaClient:
         self.context_capacity = None
         self.last_context_used = None
         self._context_exhausted = False
+        self._context_expanding = False
         self._context_rejected = self._context_retry = False
         self._on_context = self._on_context_trim = None
 
@@ -257,6 +258,9 @@ class LlamaClient:
             reserve = min(reserve, self.settings.max_tokens)
         ceiling = capacity - reserve - 64
         target = min(ceiling, int(capacity * 0.6))
+        if self._context_expanding:
+            threshold = min(capacity, max(4096, min(32768, capacity // 4)))
+            ceiling = target = max(128, capacity - threshold)
         messages = body["messages"]
 
         def count():
@@ -469,6 +473,7 @@ class LlamaClient:
         on_context_trim=None,
         context_user_content=None,
         on_waiting=None,
+        expand_context=False,
     ):
         """Keep read-only tool exchanges local to this request, with bounded follow-ups."""
         history = list(messages)
@@ -480,7 +485,7 @@ class LlamaClient:
         self._on_context = on_context
         self._on_context_trim = on_context_trim
         self._context_user_content = context_user_content
-        self._context_retry = False
+        self._context_retry = self._context_expanding = expand_context
         files = ChatFiles(Path(documents).parent) if documents is not None else None
         tools = RUNTIME_TOOLS + FILE_TOOLS if files is not None else RUNTIME_TOOLS
         if memory_view is not None:
@@ -680,6 +685,7 @@ class LlamaClient:
             except Exception as exc:
                 return "", "", None if stopped() else f"Context preparation failed: {exc}", []
             finally:
+                self._context_expanding = False
                 if self._on_context:
                     self._on_context(False)
         request = self._post_request(url, body)
