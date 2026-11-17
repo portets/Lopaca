@@ -324,9 +324,9 @@ class ChatWindow(Adw.ApplicationWindow):
         sidebar.add_css_class("sidebar")
         sidebar.set_size_request(252, -1)
         sidebar.set_hexpand(False)
-        sidebar.set_margin_top(16)
-        sidebar.set_margin_bottom(14)
-        sidebar.set_margin_start(12)
+        sidebar.set_margin_top(12)
+        sidebar.set_margin_bottom(11)
+        sidebar.set_margin_start(11)
         sidebar.set_margin_end(10)
         root.append(sidebar)
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -436,10 +436,10 @@ class ChatWindow(Adw.ApplicationWindow):
         adjustment.connect("changed", self._adjustment_changed)
         self._sync_native_scroll(self.transcript_scroll)
         compose = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
-        compose.set_margin_start(14)
-        compose.set_margin_end(14)
         compose.set_margin_top(14)
-        compose.set_margin_bottom(18)
+        compose.set_margin_bottom(15)
+        compose.set_margin_start(14)
+        compose.set_margin_end(15)
         status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
         self.status = Gtk.Label(label=" Not Connected", xalign=0)
         self.status.add_css_class("muted")
@@ -1672,6 +1672,7 @@ class ChatWindow(Adw.ApplicationWindow):
             left_margin=10,
             right_margin=10,
         )
+        text.add_css_class("prompt-view")
         text.get_buffer().set_text(config.get("extra", ""))
         text.get_buffer().connect(
             "changed", lambda buffer: save("extra", buffer.get_text(*buffer.get_bounds(), False))
@@ -1679,8 +1680,9 @@ class ChatWindow(Adw.ApplicationWindow):
         scroll = Gtk.ScrolledWindow(
             min_content_height=95, max_content_height=200, propagate_natural_height=True, child=text
         )
-        scroll.add_css_class("frame")
-        extra.add(scroll)
+        frame = Gtk.Frame(child=scroll)
+        frame.add_css_class("composer-frame")
+        extra.add(frame)
         actions = Adw.PreferencesGroup()
         page.add(actions)
         self._model_server_status = Gtk.Label(
