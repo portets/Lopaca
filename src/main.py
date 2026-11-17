@@ -23,6 +23,7 @@ from history import HistoryIndex
 from knowledge import KnowledgeStore
 from llama_client import LlamaClient, auto_thinking_options, recent_messages, thinking_parameters
 from memory import edit_memories, memory_context, memory_review, recall_memories, view_memories
+from model_server import ModelServer
 from rag import DocumentIndexer, format_document_context, read_document, retrieve
 from settings import CHAT_SETTING_DEFAULTS, Settings
 from storage import ChatStore, MemoryStore
@@ -148,6 +149,12 @@ class ChatController:
         self._disk_sizes, self._disk_total = {}, None
         self.connected = None
         self.was_connected = False
+        self._connection_wakeup = threading.Event()
+        self.model_server = ModelServer(
+            settings.server_url,
+            self._model_server_changed,
+            lambda error: self.view.dispatch(self.view._show_alert, "Model server error", error),
+        )
 
     def attach(self, view):
         self.view = view
@@ -166,6 +173,23 @@ class ChatController:
                 else self.store.create()["id"]
             )
         self.open_chat(active_chat)
+        self.model_server.connect(app_settings.get("model_server", {}), startup=True)
+
+    def set_model_server_config(self, config):
+        settings = self.store.load_app_settings()
+        settings["model_server"] = config
+        self.store.save_app_settings(settings)
+
+    def connect_model_server(self):
+        if self.busy or self._model_lock.locked():
+            self.view._show_alert("Model is busy", "Wait for the current model request to finish.")
+            return
+        self.model_server.connect(self.store.load_app_settings().get("model_server", {}))
+
+    def _model_server_changed(self, text, busy):
+        self.view.dispatch(self.view.update_model_server, text, busy)
+        if not busy:
+            self._connection_wakeup.set()
 
     def idle_status(self):
         if self.connected:
@@ -202,7 +226,8 @@ class ChatController:
             self.view.dispatch(self._connection_changed, connected)
             sizes, total = self.store.disk_usage()
             self.view.dispatch(self._update_disk_usage, sizes, total)
-            time.sleep(self.settings.connection_check_interval)
+            self._connection_wakeup.wait(self.settings.connection_check_interval)
+            self._connection_wakeup.clear()
 
     def _server_properties_changed(self, props):
         capacity = props.get("default_generation_settings", {}).get("n_ctx")

@@ -14,6 +14,7 @@ from markdown_ui import (
     append_code_block,
     append_markdown,
 )
+from model_server import SERVER_FIELDS
 from settings import CHAT_SORT_OPTIONS, CONVERSATION_STYLE_OPTIONS
 
 gi.require_version("Gtk", "4.0")
@@ -1392,7 +1393,10 @@ class ChatWindow(Adw.ApplicationWindow):
             content_height=540,
         )
         dialog.set_search_enabled(False)
-        page = Adw.PreferencesPage()
+        page = Adw.PreferencesPage(
+            title="General" if chat_id is None else "Chat Settings",
+            icon_name="user-idle-symbolic",
+        )
         page.connect("map", self._sync_native_scroll)
         dialog.add(page)
         group = Adw.PreferencesGroup()
@@ -1556,7 +1560,131 @@ class ChatWindow(Adw.ApplicationWindow):
                 "chat_sort",
                 self.controller.set_chat_sort,
             )
+            dialog.add(self._model_settings_page())
         dialog.present(self)
+
+    def update_model_server(self, text, busy):
+        if hasattr(self, "_model_server_status"):
+            self._model_server_status.set_label(text)
+            self._model_connect_button.set_sensitive(not busy)
+
+    def _model_settings_page(self):
+        page = Adw.PreferencesPage(title="Model", icon_name="network-server-symbolic")
+        page.connect("map", self._sync_native_scroll)
+        config = dict(self.controller.store.load_app_settings().get("model_server", {}))
+
+        def save(key, value):
+            config[key] = value
+            try:
+                self.controller.set_model_server_config(config)
+            except OSError as exc:
+                self._show_alert("Could not save settings", str(exc))
+
+        paths = Adw.PreferencesGroup(
+            title="Local Model Server",
+            description="Leave blank to use a server on port 9931. ",
+        )
+        page.add(paths)
+        for key, title in (("executable", "llama-server executable"), ("model", "Model file")):
+            row = Adw.EntryRow(title=title, text=config.get(key, ""))
+            row.connect("notify::text", lambda entry, _pspec, key=key: save(key, entry.get_text()))
+            browse = Gtk.Button(icon_name="folder-open-symbolic", valign=Gtk.Align.CENTER)
+            browse.add_css_class("flat")
+            browse.set_tooltip_text("Choose " + title)
+
+            def choose(_button, row=row, title=title):
+                chooser = Gtk.FileDialog(title="Choose " + title)
+
+                def selected(dialog, result):
+                    try:
+                        file = dialog.open_finish(result)
+                        if file and file.get_path():
+                            row.set_text(file.get_path())
+                    except GLib.Error as exc:
+                        if not exc.matches(Gtk.dialog_error_quark(), Gtk.DialogError.DISMISSED):
+                            self._show_alert("Could not select file", exc.message)
+
+                chooser.open(self, None, selected)
+
+            browse.connect("clicked", choose)
+            row.add_suffix(browse)
+            paths.add(row)
+
+        advanced_group = Adw.PreferencesGroup()
+        advanced = Adw.ExpanderRow(title="Advanced", expanded=False)
+        advanced_group.add(advanced)
+        page.add(advanced_group)
+        advanced_content = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=18,
+            margin_top=12,
+            margin_bottom=12,
+            margin_start=12,
+            margin_end=12,
+        )
+        advanced.add_row(advanced_content)
+        options = Adw.PreferencesGroup(
+            title="Launch Parameters",
+            description="Leave fields blank to use Lopaca and llama-server defaults. Press connect "
+            "to apply new settings.",
+        )
+        advanced_content.append(options)
+        for key, title, hint in SERVER_FIELDS:
+            row = Adw.EntryRow(title=title, text=str(config.get(key, "")))
+            row.set_tooltip_text(f"--{key}: {hint}")
+            row.connect("notify::text", lambda entry, _pspec, key=key: save(key, entry.get_text()))
+            options.add(row)
+        for key, title in (
+            ("flash-attn", "Enable Flash Attention"),
+            ("fit", "Fit to Device Memory"),
+        ):
+            row = Adw.ActionRow(
+                title=title, subtitle=f"Pass --{key} on; unchecked uses server defaults"
+            )
+            check = Gtk.CheckButton(active=bool(config.get(key, False)), valign=Gtk.Align.CENTER)
+            check.connect("toggled", lambda button, key=key: save(key, button.get_active()))
+            row.add_suffix(check)
+            row.set_activatable_widget(check)
+            options.add(row)
+
+        extra = Adw.PreferencesGroup(
+            title="Additional Launch Parameters",
+            description="For example: --reasoning on --reasoning-budget 8192. "
+            "Quote paths containing spaces.",
+        )
+        advanced_content.append(extra)
+        text = Gtk.TextView(
+            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+            top_margin=10,
+            bottom_margin=10,
+            left_margin=10,
+            right_margin=10,
+        )
+        text.get_buffer().set_text(config.get("extra", ""))
+        text.get_buffer().connect(
+            "changed", lambda buffer: save("extra", buffer.get_text(*buffer.get_bounds(), False))
+        )
+        scroll = Gtk.ScrolledWindow(
+            min_content_height=95, max_content_height=200, propagate_natural_height=True, child=text
+        )
+        scroll.add_css_class("frame")
+        extra.add(scroll)
+        actions = Adw.PreferencesGroup()
+        page.add(actions)
+        self._model_server_status = Gtk.Label(
+            label=self.controller.model_server.status, wrap=True, xalign=0
+        )
+        self._model_server_status.add_css_class("dim-label")
+        actions.add(self._model_server_status)
+        self._model_connect_button = Gtk.Button(
+            label="Connect", halign=Gtk.Align.END, sensitive=not self.controller.model_server.busy
+        )
+        self._model_connect_button.add_css_class("suggested-action")
+        self._model_connect_button.connect(
+            "clicked", lambda *_: self.controller.connect_model_server()
+        )
+        actions.add(self._model_connect_button)
+        return page
 
     def _settings_subpage(self, title, settings_dialog):
         dialog = Adw.Dialog(title=title, content_width=660, content_height=540)
@@ -2290,6 +2418,10 @@ class Lopaca(Adw.Application):
         super().__init__(application_id="app.lopaca.Lopaca")
         self.controller = controller
         GLib.set_application_name("Lopaca")
+
+    def do_shutdown(self):
+        self.controller.model_server.close()
+        Adw.Application.do_shutdown(self)
 
     def do_activate(self):
         window = self.props.active_window
