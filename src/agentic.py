@@ -120,7 +120,8 @@ FILE_TOOLS = [
     _tool(
         "read_file",
         "Read source lines in the current chat's documents/ and projects/ folders, or "
-        "a knowledge/... article path supplied by knowledge-pack references. "
+        "a knowledge/... article path, or archived earlier chat messages at "
+        "history/transcript.txt and history/message-N.txt (N is a 1-based message number). "
         "Use documents/py65/memory.py or projects/example.py. Unprefixed paths use projects/. "
         "Returns numbered lines and truncation/continuation information. No writes.",
         {
@@ -155,6 +156,37 @@ FILE_TOOLS = [
 ]
 
 
+def _line_excerpt(path, lines, start_line, line_count):
+    if (
+        type(start_line) is not int
+        or type(line_count) is not int
+        or start_line < 1
+        or line_count < 1
+    ):
+        raise ValueError("Line numbers/counts must be positive integers.")
+    if start_line > len(lines) + 1:
+        raise ValueError(f"File has {len(lines)} lines.")
+    selected, chars = [], 0
+    for number in range(start_line, min(len(lines) + 1, start_line + min(line_count, 160))):
+        line = f"{number}: {lines[number - 1]}"
+        if chars + len(line) > 10000:
+            if not selected:
+                raise ValueError("Source line exceeds the 10,000-character output limit.")
+            break
+        selected.append(line)
+        chars += len(line)
+    end = start_line + len(selected) - 1
+    return {
+        "path": path,
+        "start_line": start_line,
+        "end_line": end,
+        "total_lines": len(lines),
+        "text": "\n".join(selected),
+        "truncated": end < len(lines),
+        "next_line": end + 1 if end < len(lines) else None,
+    }
+
+
 class DocumentFiles:
     """Bounded, read-only text access beneath one allowed folder (Linux)."""
 
@@ -186,35 +218,7 @@ class DocumentFiles:
             os.close(fd)
 
     def read_file(self, path, start_line=1, line_count=100):
-        if (
-            type(start_line) is not int
-            or type(line_count) is not int
-            or start_line < 1
-            or line_count < 1
-        ):
-            raise ValueError("Line numbers/counts must be positive integers.")
-        lines = self._text(path).splitlines()
-        if start_line > len(lines) + 1:
-            raise ValueError(f"File has {len(lines)} lines.")
-        selected, chars = [], 0
-        for number in range(start_line, min(len(lines) + 1, start_line + min(line_count, 160))):
-            line = f"{number}: {lines[number - 1]}"
-            if chars + len(line) > 10000:
-                if not selected:
-                    raise ValueError("Source line exceeds the 10,000-character output limit.")
-                break
-            selected.append(line)
-            chars += len(line)
-        end = start_line + len(selected) - 1
-        return {
-            "path": path,
-            "start_line": start_line,
-            "end_line": end,
-            "total_lines": len(lines),
-            "text": "\n".join(selected),
-            "truncated": end < len(lines),
-            "next_line": end + 1 if end < len(lines) else None,
-        }
+        return _line_excerpt(path, self._text(path).splitlines(), start_line, line_count)
 
     def search_files(self, query="", pattern="**/*", case_sensitive=False, *, _deadline=None):
         if (
@@ -286,6 +290,7 @@ class ChatFiles:
     """Expose two named, separately sandboxed roots; never expose the chat root itself."""
 
     def __init__(self, chat_folder):
+        self.chat_folder = Path(chat_folder)
         self.roots = {
             name: DocumentFiles(Path(chat_folder) / name) for name in ("projects", "documents")
         }
@@ -293,6 +298,44 @@ class ChatFiles:
     def read_file(self, path, start_line=1, line_count=100):
         if not isinstance(path, str):
             raise ValueError("Use a projects/... or documents/... path.")
+        if path.startswith("history/"):
+            import sqlite3
+            from contextlib import closing
+
+            from storage import ChatStore
+
+            if path != "history/transcript.txt" and not re.fullmatch(
+                r"history/message-[1-9][0-9]*\.txt", path
+            ):
+                raise ValueError("Use history/transcript.txt or history/message-N.txt.")
+            store = ChatStore(self.chat_folder.parent)
+            boundary = store.load_settings(self.chat_folder.name).get("context_start", 0)
+            number = None if path == "history/transcript.txt" else int(path[16:-4])
+            if number is not None and number > boundary:
+                raise ValueError("That message is still in active context, not archived.")
+            transcript = self.chat_folder / "context.sqlite"
+            if not boundary or not transcript.is_file():
+                return {"path": path, "text": "No archived messages.", "total_lines": 0}
+            if transcript.is_symlink() or self.chat_folder.is_symlink():
+                raise ValueError("History database must not be a symlink.")
+            lines, role = [], None
+            with closing(sqlite3.connect(transcript.as_uri() + "?mode=ro", uri=True)) as db:
+                for position, raw in db.execute(
+                    "SELECT position,message FROM messages WHERE position<? "
+                    "AND (? IS NULL OR position=?) ORDER BY position",
+                    (boundary, number, (number - 1) if number else None),
+                ):
+                    message = json.loads(raw)
+                    role = message["role"]
+                    if number is None:
+                        lines.append(f"Message {position + 1} ({message['role']}):")
+                    lines.extend(message.get("content", "").splitlines())
+                    if number is None:
+                        lines.append("")
+            result = _line_excerpt(path, lines, start_line, line_count)
+            if number is not None:
+                result["role"] = role
+            return result
         if path.startswith("knowledge/"):
             from knowledge import KnowledgeStore
 

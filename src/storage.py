@@ -110,7 +110,7 @@ class ChatStore:
         for key in ("title", "created", "updated", "inference_stats"):
             if key in settings:
                 data[key] = settings[key]
-        path = self.folder(chat_id) / "chat-history.sqlite"
+        path = self.folder(chat_id) / "context.sqlite"
         if history and path.exists():
             with closing(sqlite3.connect(path)) as connection:
                 data["messages"] = [
@@ -125,7 +125,7 @@ class ChatStore:
         chat_id = data["id"]
         if not 0 <= message_start <= len(data["messages"]):
             raise ValueError("Invalid first message position")
-        history_path = self.folder(chat_id) / "chat-history.sqlite"
+        history_path = self.folder(chat_id) / "context.sqlite"
         if not history_path.exists():
             message_start = 0
         self.documents(chat_id).mkdir(parents=True, exist_ok=True)
@@ -174,7 +174,7 @@ class ChatStore:
             chats = [
                 self.load(entry.name, history=False)
                 for entry in entries
-                if entry.is_dir() and (Path(entry.path) / "chat-history.sqlite").exists()
+                if entry.is_dir() and (Path(entry.path) / "context.sqlite").exists()
             ]
         app_settings = self.load_app_settings()
         pinned_order = {

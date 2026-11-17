@@ -289,6 +289,7 @@ def _without_memory_references(text):
             "knowledge-references",
             "reply-controls",
             "history-references",
+            "archive-references",
         )
     )
     tail = text.rsplit("\n", 1)[-1].lstrip()

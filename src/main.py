@@ -42,8 +42,13 @@ def build_system_prompt(agent_mode, style="neutral", *, memories=False):
         "Use Markdown formatting when it improves readability. "
         "Lopaca can supply relevant excerpts or summaries from other chats in a "
         "lopaca-history-references block. When supplied, use them to answer questions about "
-        "past discussions and identify their source chats. "
-        "Those excerpts are from different chats, "
+        "past discussions and identify their source chats. Earlier messages from this same "
+        "chat may appear in lopaca-archive-references. If needed, read_file can browse "
+        "history/transcript.txt or history/message-N.txt for messages outside active context. "
+        "Use that when missing earlier details materially affect the answer, including when "
+        "the user points out something you previously discussed; do not guess or browse "
+        "for unrelated questions. "
+        "The lopaca-history-references excerpts are from different chats, "
         "not this chat; never call an answer from them an earlier reply in this chat. "
         "Correct past mistakes when relevant and identify them as from another chat. "
         "You do have access to those "
@@ -129,7 +134,7 @@ class ChatController:
         self.chat_sort = settings.chat_sort
         self.view = self.chat = None
         self.busy = self.stop_requested = self.updating_memories = False
-        self._pending_steering = None
+        self._steering_pending = False
         self._pending_messages = deque()
         self._generation_streaming = False
         self._condensing_context = False
@@ -508,9 +513,9 @@ class ChatController:
                 and not self._generation_answer_complete
                 and not self._condensing_context
                 and not self.stop_requested
-                and self._pending_steering is None
+                and not self._steering_pending
             ):
-                self._pending_steering = text
+                self._steering_pending = True
                 self._pending_messages.append((chat_id, text, False))
                 self.stop()
             else:
@@ -567,6 +572,8 @@ class ChatController:
         self._generation_context_used = None
         self._generation_answer_complete = False
         self._generation_streaming = False
+        self._post_response_condensing = False
+        self._post_condense_error = None
         self._generation_memory_review = None
         self._generation_thinking = self.thinking_parameters(chat_id)
         self._generation_thinking_options = auto_thinking_options(tuple(self._thinking_levels))
@@ -607,6 +614,13 @@ class ChatController:
                     return
         self.document_indexer.schedule(folder, priority=True)
         self.document_indexer.wait(folder, lambda: self.stop_requested)
+        # Usually already indexed in the background; finish a just-rolled archive before
+        # retrieval if the user submits immediately. This raw work needs no model lock.
+        if not self.stop_requested:
+            try:
+                self.history_index.update_local(self._generation_chat_id)
+            except Exception as exc:
+                self.view.dispatch(self.view.notify, f"Chat archive indexing unavailable: {exc}")
         # Never hold the model lock while waiting for an indexer that needs it.
         while not self.stop_requested:
             if self._model_lock.acquire(timeout=0.1):
@@ -711,6 +725,14 @@ class ChatController:
         if self.stop_requested:
             self.view.dispatch(self.finish_response, "", "", None)
             return
+        archive_context = ""
+        if not self.stop_requested:
+            try:
+                archive_context = self.history_index.local_context(
+                    query, self._generation_chat_id, expand=expand if query_expansion else None
+                )
+            except Exception as exc:
+                self.view.dispatch(self.view.notify, f"Chat archive retrieval unavailable: {exc}")
         core_context, casual_context = memory_context(memory_rows) if memory_enabled else ("", "")
         messages.insert(
             0,
@@ -742,7 +764,7 @@ class ChatController:
         except Exception as exc:
             self.view.dispatch(self.view.notify, f"Knowledge retrieval unavailable: {exc}")
         messages[-1]["content"] += knowledge_context
-        messages[-1]["content"] += history_context
+        messages[-1]["content"] += history_context + archive_context
         if memory_enabled:
             # Query-specific recall must not invalidate the cached system/core profile.
             messages[-1]["content"] += casual_context
@@ -816,6 +838,8 @@ class ChatController:
                     self.updating_memories = False
 
         if not error and not self.stop_requested and self.client.needs_context_roll():
+            self._post_response_condensing = True
+            self._set_context_processing(True)
             # Build the next stable history prefix without this request's transient RAG.
             removed = self._generation_context_start - initial_start
             completed = {"role": "assistant", "content": answer}
@@ -846,7 +870,7 @@ class ChatController:
                     preserve_thinking,
                     thinking_parameters_for_reply,
                     lambda: self.stop_requested,
-                    self._set_context_processing,
+                    lambda _active: None,  # Controller keeps the status through indexing.
                     on_usage=lambda used: self.view.dispatch(
                         self._update_inference_stats, used, None
                     ),
@@ -856,6 +880,10 @@ class ChatController:
                 if not self.stop_requested:
                     self.view.dispatch(self.view.notify, f"Could not condense context: {exc}")
 
+        if self._generation_context_start != initial_start and not self._post_response_condensing:
+            # Reactive mid-response rolls also need their new archive before queued input.
+            self._post_response_condensing = True
+            self._set_context_processing(True)
         clarification = clarification and memories_enabled()
         self.view.dispatch(
             self.finish_response,
@@ -906,10 +934,10 @@ class ChatController:
         self, answer, reasoning, error, finished_at=None, clarification=False, request_seeds=None
     ):
         answer = self.visible_answer(answer)
-        steering = self._pending_steering
-        self._pending_steering = None
+        steering = self._steering_pending
+        self._steering_pending = False
         interrupted = not getattr(self, "_generation_answer_complete", False)
-        if steering is not None and interrupted:
+        if steering and interrupted:
             phase = "Response" if answer.strip() else "Thinking" if reasoning.strip() else "Request"
             answer = answer.rstrip() + f"\n\n*{phase} interrupted by user.*"
             error = None
@@ -961,6 +989,38 @@ class ChatController:
         chat["context_start"] = getattr(self, "_generation_context_start", 0)
         chat["updated"] = finished_at
         self.store.save(chat, message_start=len(chat["messages"]) - 1)
+        if self._post_response_condensing:
+            # Save precedes indexing so the archive can include the completed response when
+            # the entire active window was removed. Never block GTK while indexing.
+            def index_archive():
+                error = None
+                try:
+                    self.history_index.update_local(chat["id"])
+                except Exception as exc:
+                    error = str(exc)
+                self.view.dispatch(
+                    self._finish_saved_response,
+                    chat,
+                    answer,
+                    reasoning,
+                    steering,
+                    interrupted,
+                    error,
+                )
+
+            threading.Thread(target=index_archive, daemon=True).start()
+            return
+        self._finish_saved_response(chat, answer, reasoning, steering, interrupted)
+
+    def _finish_saved_response(self, chat, answer, reasoning, steering, interrupted, error=None):
+        if self._post_response_condensing:
+            self._post_response_condensing = False
+            self._condensing_context = False
+            self.view.set_context_processing(False)
+        if error:
+            self.view.notify(f"Chat archive indexing unavailable: {error}")
+        elif getattr(self, "_post_condense_error", None):
+            self.view.notify(self._post_condense_error)
         self.history_index.schedule(chat["id"])
         self.refresh()
         self.updating_memories = False
@@ -969,7 +1029,7 @@ class ChatController:
             self.view.finish_response(answer, reasoning)
         else:
             self.view.end_response()
-        if steering is not None:
+        if steering:
             for index, (queued_chat, text, _) in enumerate(self._pending_messages):
                 if queued_chat == chat["id"]:
                     self._pending_messages[index] = (queued_chat, text, interrupted)

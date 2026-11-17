@@ -200,7 +200,7 @@ class LlamaClient:
                 else:
                     low = mid + 1
             boundary = boundaries[low]
-            remaining = count(boundary)
+            remaining = full if boundary == 1 else count(boundary)
             if stopped():
                 return 0
             # This is the prepared next-request prefix, not the previous response's usage.
@@ -269,7 +269,6 @@ class LlamaClient:
             return
         # Only the historical user turns preceding the original current user are removable.
         while size > target:
-            boundary = None
             current = next(
                 (i for i, m in enumerate(messages) if id(m) == self._context_current), None
             )
@@ -300,7 +299,7 @@ class LlamaClient:
             suffix = content[len(original) :]
             blocks = list(
                 re.finditer(
-                    r"<lopaca-(document|knowledge|history|memory)-references>.*?"
+                    r"<lopaca-(document|knowledge|history|memory|archive)-references>.*?"
                     r"</lopaca-\1-references>",
                     suffix,
                     re.DOTALL,
