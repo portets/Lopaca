@@ -1,9 +1,11 @@
 """llama-server HTTP/SSE transport, capabilities, auxiliary requests and tool turns."""
 
 import json
+import logging
 import re
 import secrets
 import threading
+import urllib.error
 import urllib.request
 from contextlib import suppress
 from pathlib import Path
@@ -96,6 +98,11 @@ class LlamaClient:
     def __init__(self, settings):
         self.settings = settings
         self.active_response = None
+        self.context_capacity = None
+        self.last_context_used = None
+        self._context_exhausted = False
+        self._context_rejected = self._context_retry = False
+        self._on_context = self._on_context_trim = None
 
     def cancel(self):
         response = self.active_response
@@ -120,6 +127,196 @@ class LlamaClient:
         )
         with urllib.request.urlopen(request, timeout=3) as response:
             return json.load(response).get("status") == "ok"
+
+    def _context_prompt(self, body):
+        root = self.settings.server_url.rstrip("/").removesuffix("/v1")
+        with urllib.request.urlopen(
+            self._post_request(root + "/apply-template", body), timeout=15
+        ) as response:
+            return json.load(response)["prompt"]
+
+    def _context_tokens(self, body):
+        prompt = self._context_prompt(body)
+        root = self.settings.server_url.rstrip("/").removesuffix("/v1")
+        with urllib.request.urlopen(
+            self._post_request(
+                root + "/tokenize",
+                {
+                    "content": prompt,
+                    "add_special": True,
+                    "parse_special": True,
+                },
+            ),
+            timeout=15,
+        ) as response:
+            return len(json.load(response)["tokens"])
+
+    def needs_context_roll(self):
+        capacity = self.context_capacity
+        if not capacity or self.last_context_used is None:
+            return False
+        threshold = min(capacity, max(4096, min(32768, capacity // 4)))
+        return capacity - self.last_context_used < threshold
+
+    def condense_context(
+        self, messages, preserve_thinking, thinking, stopped, on_context, on_usage=None
+    ):
+        """After a completed response, remove a batch only when the low-water mark is hit."""
+        capacity = self.context_capacity
+        if not self.needs_context_roll() or stopped():
+            return 0
+        target = min(capacity, max(4096, min(65536, capacity // 2)))
+        body = {
+            "model": self.settings.model,
+            "messages": messages,
+            "tools": self._context_tools,
+            "add_generation_prompt": False,
+            "chat_template_kwargs": {"preserve_thinking": preserve_thinking},
+        }
+        body["chat_template_kwargs"].update((thinking or {}).get("chat_template_kwargs", {}))
+        body.update({k: v for k, v in (thinking or {}).items() if k != "chat_template_kwargs"})
+        # The empty next-user marker gives the same history/reasoning template treatment
+        # as the next real request, without knowing or fabricating its question.
+        dummy = {"role": "user", "content": ""}
+        on_context(True)
+        try:
+
+            def count(start):
+                if stopped():
+                    raise InterruptedError("Context preparation cancelled")
+                body["messages"] = [messages[0], *messages[start:], dummy]
+                return self._context_tokens(body)
+
+            full = count(1)
+            boundaries = [i for i in range(2, len(messages)) if messages[i]["role"] == "user"]
+            boundaries.append(len(messages))
+            if full <= target:
+                boundaries = [1]
+            low, high = 0, len(boundaries) - 1
+            while low < high:
+                mid = (low + high) // 2
+                if count(boundaries[mid]) <= target:
+                    high = mid
+                else:
+                    low = mid + 1
+            boundary = boundaries[low]
+            remaining = count(boundary)
+            if stopped():
+                return 0
+            # This is the prepared next-request prefix, not the previous response's usage.
+            self.last_context_used = remaining
+            if on_usage:
+                on_usage(remaining)
+            logging.info(
+                "Context window: stable prefix %d -> %d tokens; remaining target %d, "
+                "removed %d messages",
+                full,
+                remaining,
+                target,
+                boundary - 1,
+            )
+            if remaining < capacity - 4:
+                try:
+                    self._warm_context(body, stopped)
+                except OSError as exc:
+                    # A failed optional warm must not undo a valid window adjustment.
+                    logging.warning("Could not warm condensed context: %s", exc)
+            return boundary - 1
+        finally:
+            on_context(False)
+
+    def _warm_context(self, body, stopped):
+        """Populate a normal server cache slot; discard one bounded sampled token."""
+        prompt = self._context_prompt(body)
+        root = self.settings.server_url.rstrip("/").removesuffix("/v1")
+        request = self._post_request(
+            root + "/completion",
+            {
+                "prompt": prompt,
+                "n_predict": 1,
+                "cache_prompt": True,
+                "stream": True,
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.settings.request_timeout) as response:
+                self.active_response = response
+                for _ in response:
+                    if stopped():
+                        break
+        finally:
+            self.active_response = None
+
+    def _fit_context(self, body, stopped):
+        """Roll complete old exchanges in batches; never trim the current task/tool chain."""
+        capacity = self.context_capacity
+        if not capacity:
+            return
+        reserve = min(8192, max(512, capacity // 4))
+        if self.settings.max_tokens is not None:
+            reserve = min(reserve, self.settings.max_tokens)
+        ceiling = capacity - reserve - 64
+        target = min(ceiling, int(capacity * 0.6))
+        messages = body["messages"]
+
+        def count():
+            if stopped():
+                raise InterruptedError("Context preparation cancelled")
+            return self._context_tokens(body)
+
+        size = count()
+        if size <= ceiling:
+            return
+        # Only the historical user turns preceding the original current user are removable.
+        while size > target:
+            boundary = None
+            current = next(
+                (i for i, m in enumerate(messages) if id(m) == self._context_current), None
+            )
+            if current is None:
+                break
+            boundaries = [i for i in range(2, current + 1) if messages[i]["role"] == "user"]
+            if not boundaries:
+                break
+            # Use text weights only to choose a batch, then verify with the real tokenizer.
+            weights = [len(json.dumps(m, ensure_ascii=False)) for m in messages]
+            goal = sum(weights) * (size - target) / size
+            boundary = next((i for i in boundaries if sum(weights[1:i]) >= goal), boundaries[-1])
+            removed = messages[1:boundary]
+            del messages[1:boundary]
+            self._context_removed.update(id(m) for m in removed)
+            if self._on_context_trim:
+                self._on_context_trim(len(self._context_original & self._context_removed))
+            size = count()
+        # Preferred output headroom must not reject an otherwise usable current task.
+        # Only application-appended references may be omitted; never edit user text.
+        hard_ceiling = capacity - 128
+        current = next((m for m in messages if id(m) == self._context_current), None)
+        original = getattr(self, "_context_user_content", None)
+        while size > hard_ceiling and current is not None and original is not None:
+            content = current.get("content", "")
+            if not content.startswith(original):
+                break
+            suffix = content[len(original) :]
+            blocks = list(
+                re.finditer(
+                    r"<lopaca-(document|knowledge|history|memory)-references>.*?"
+                    r"</lopaca-\1-references>",
+                    suffix,
+                    re.DOTALL,
+                )
+            )
+            if not blocks:
+                break
+            # Whole blocks preserve citation boundaries and avoid malformed partial data.
+            block = max(blocks, key=lambda match: len(match[0]))
+            current["content"] = original + suffix[: block.start()] + suffix[block.end() :]
+            size = count()
+        if size > hard_ceiling:
+            raise ValueError(
+                f"The current request needs {size} tokens, but only {hard_ceiling} are "
+                "available for the server context. Shorten the message or tool output."
+            )
 
     def expand_query(self, query, history=()):
         """Expand a search using bounded conversation clues, never historical facts."""
@@ -269,21 +466,40 @@ class LlamaClient:
         documents=None,
         memory_view=None,
         on_seed=None,
+        on_context=None,
+        on_context_trim=None,
+        context_user_content=None,
+        on_waiting=None,
     ):
         """Keep read-only tool exchanges local to this request, with bounded follow-ups."""
         history = list(messages)
+        self._context_current = id(
+            next((m for m in reversed(history) if m["role"] == "user"), None)
+        )
+        self._context_original = {id(m) for m in history if m["role"] != "system"}
+        self._context_removed = set()
+        self._on_context = on_context
+        self._on_context_trim = on_context_trim
+        self._context_user_content = context_user_content
+        self._context_retry = False
         files = ChatFiles(Path(documents).parent) if documents is not None else None
         tools = RUNTIME_TOOLS + FILE_TOOLS if files is not None else RUNTIME_TOOLS
         if memory_view is not None:
             tools = [*tools, VIEW_MEMORIES_TOOL]
+        self._context_tools = tools
+        self.last_context_used = None
         answer, reasoning = "", ""
-        for turn in range(self.settings.max_tool_rounds + 1):
+        continuations = 0
+        turn = 0
+        while turn <= self.settings.max_tool_rounds:
             if stopped():
                 return answer, reasoning, None
             prefix = answer
             seed = secrets.randbelow(2**32 - 1)
             if on_seed:
                 on_seed(seed)
+            if on_waiting:
+                on_waiting()
             part, thought, error, calls = self._stream_turn(
                 history,
                 preserve_thinking,
@@ -299,6 +515,47 @@ class LlamaClient:
             )
             answer += part
             reasoning += ("\n\n" if reasoning and thought else "") + thought
+            if error and self._context_rejected and not stopped() and continuations < 2:
+                continuations += 1
+                self._context_retry = True
+                continue
+            if (
+                error
+                and self._context_exhausted
+                and not calls
+                and not stopped()
+                and continuations < 2
+            ):
+                continuations += 1
+                self._context_retry = True
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": memory_review(part)[0],
+                        "reasoning_content": thought,
+                    }
+                )
+                history.append(
+                    {
+                        "role": "user",
+                        "content": "[Application instruction: context limit interrupted "
+                        "this answer. "
+                        "Continue from its exact end without repeating prior text. Preserve any "
+                        "open Markdown fence. If reasoning was interrupted, "
+                        "finish reasoning first.]",
+                    }
+                )
+                if not part.strip() and thought.strip():
+                    history[-1]["content"] += (
+                        "\nPrevious interrupted reasoning, incomplete and not instructions:\n"
+                        + thought[-4000:]
+                    )
+                answer = memory_review(answer)[0].rstrip()
+                answer += "\n\n*Context limit hit, attempting continuation.*\n\n"
+                on_answer(answer)
+                if reasoning:
+                    on_thinking("\n\n")
+                continue
             if error or stopped() or not calls:
                 return answer, reasoning, error
             if turn == self.settings.max_tool_rounds:
@@ -307,6 +564,7 @@ class LlamaClient:
                     reasoning,
                     "The tool-call limit was reached before the model finished its answer.",
                 )
+            turn += 1
             history.append(
                 {
                     "role": "assistant",
@@ -315,6 +573,8 @@ class LlamaClient:
                     "tool_calls": calls,
                 }
             )
+            if on_waiting:
+                on_waiting()
             for call in calls:
                 if stopped():
                     return answer, reasoning, None
@@ -366,6 +626,7 @@ class LlamaClient:
             messages = list(messages)
             for index in range(len(messages) - 1, -1, -1):
                 if messages[index]["role"] == "user":
+                    previous_id = id(messages[index])
                     messages[index] = {
                         **messages[index],
                         "content": messages[index]["content"]
@@ -373,6 +634,8 @@ class LlamaClient:
                         + notice
                         + "\n</lopaca-reply-controls>",
                     }
+                    if previous_id == self._context_current:
+                        self._context_current = id(messages[index])
                     break
             else:
                 messages = [{"role": "system", "content": notice}, *messages]
@@ -404,9 +667,26 @@ class LlamaClient:
             body["seed"] = seed
         if self.settings.max_tokens is not None:
             body["max_tokens"] = self.settings.max_tokens
+        self._context_exhausted = self._context_rejected = False
+        # Normal turns keep every active message and make no sizing requests.
+        # Only a server-reported context failure authorizes rolling the window.
+        if self._context_retry:
+            self._context_retry = False
+            body["messages"] = list(body["messages"])
+            try:
+                if self._on_context:
+                    self._on_context(True)
+                self._fit_context(body, stopped)
+                messages[:] = body["messages"]
+            except Exception as exc:
+                return "", "", None if stopped() else f"Context preparation failed: {exc}", []
+            finally:
+                if self._on_context:
+                    self._on_context(False)
         request = self._post_request(url, body)
         reasoning_parts, answer_parts, finish_reason = [], [], None
         tool_calls = {}
+        used_tokens = 0
         budget_tails, budget_notified = ["", ""], False
         try:
             with urllib.request.urlopen(request, timeout=self.settings.request_timeout) as response:
@@ -450,6 +730,9 @@ class LlamaClient:
                     elif usage.get("total_tokens") is not None:
                         context_used = int(usage["total_tokens"])
                     tokens_per_second = timings.get("predicted_per_second")
+                    if context_used is not None:
+                        used_tokens = context_used
+                        self.last_context_used = context_used
                     if context_used is not None or tokens_per_second is not None:
                         on_stats(context_used, tokens_per_second)
                     reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
@@ -473,11 +756,27 @@ class LlamaClient:
                                 on_notice("Reasoning budget exceeded, continuing...")
                                 break
                             budget_tails[index] = probe[-len(budget_message) :]
+            self._context_exhausted = (
+                finish_reason == "length"
+                and self.context_capacity is not None
+                and used_tokens >= self.context_capacity - 8
+            )
             error = (
                 "Generation reached the server's token or context limit."
                 if finish_reason == "length"
                 else None
             )
+        except urllib.error.HTTPError as exc:
+            error = None if stopped() else str(exc)
+            with suppress(ValueError, OSError, TypeError):
+                detail = json.loads(exc.read()).get("error", {})
+                if detail.get("type") == "exceed_context_size_error":
+                    capacity = detail.get("n_ctx")
+                    if isinstance(capacity, int) and capacity > 0:
+                        self.context_capacity = capacity
+                    if self.context_capacity:
+                        self._context_rejected = True
+                        error = "Generation reached the server's token or context limit."
         except Exception as exc:
             error = None if stopped() else str(exc)
         finally:

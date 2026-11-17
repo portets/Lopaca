@@ -259,6 +259,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._notification_timer = None
         self._notification_deadline = 0
         self._notification_model_busy = False
+        self._condensing_context = False
         self._response_row = None
         self._response_chat_id = None
         self._scroll_idle_id = None
@@ -492,10 +493,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.send_button.connect(
             "clicked",
             lambda *_: (
-                self.controller.stop()
-                if self.busy
-                and (not self.prompt_text() or self.chat["id"] != self._response_chat_id)
-                else self._send()
+                self.controller.stop() if self.busy and not self.prompt_text() else self._send()
             ),
         )
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -615,10 +613,21 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def set_document_processing(self, active):
         self._processing_documents = active
-        if active and self._notification_timer is not None:
+        if (
+            active
+            and self._notification_timer is not None
+            and self._status_text != "Condensing context"
+        ):
             GLib.source_remove(self._notification_timer)
             self._notification_timer = None
         self.set_status(self._activity_status)
+
+    def set_context_processing(self, active):
+        self._condensing_context = active
+        if active:
+            self.notify("Condensing context")
+        else:
+            self._prompt_changed()
 
     def notify(self, text):
         if self._notification_timer is not None:
@@ -627,10 +636,12 @@ class ChatWindow(Adw.ApplicationWindow):
         self._notification_model_busy = self.controller.busy
         self._notification_deadline = GLib.get_monotonic_time() + 3_000_000
         self._notification_timer = GLib.timeout_add(3000, self._restore_status)
+        self._prompt_changed()
 
     def _restore_status(self):
         if self.controller.busy and (
             self._status_text == "Cancelling"
+            or (self._status_text == "Condensing context" and self._condensing_context)
             or (self._status_text == "Updating memories" and self.controller.updating_memories)
         ):
             self._notification_deadline = GLib.get_monotonic_time() + 3_000_000
@@ -657,6 +668,7 @@ class ChatWindow(Adw.ApplicationWindow):
             "Assistant processing documents",
             "Updating memories",
             "Cancelling",
+            "Condensing context",
         ):
             self._status_timer = GLib.timeout_add(650, self._animate_status)
 
@@ -708,26 +720,31 @@ class ChatWindow(Adw.ApplicationWindow):
         self.total_usage.set_text(f"Total: {format_size(total_size)}")
 
     def _prompt_changed(self):
-        self.send_button.set_sensitive(self.busy or bool(self.prompt_text()))
+        text = bool(self.prompt_text())
+        can_stop = (
+            self.busy
+            and not self.controller._generation_answer_complete
+            and not self.controller._condensing_context
+        )
+        self.send_button.set_sensitive(text or can_stop)
         if self.busy:
-            steering = bool(self.prompt_text()) and self.chat["id"] == self._response_chat_id
-            self.send_button.set_icon_name(
-                "go-up-symbolic" if steering else "window-close-symbolic"
+            steering = (
+                self.controller._generation_streaming
+                and can_stop
+                and not self.controller.stop_requested
+                and self.chat["id"] == self._response_chat_id
             )
+            self.send_button.set_icon_name("go-up-symbolic" if text else "window-close-symbolic")
             self.send_button.set_tooltip_text(
-                "Interrupt and send" if steering else "Stop generation"
+                ("Interrupt and send" if steering else "Queue message")
+                if text
+                else "Stop generation"
             )
 
     def _send(self):
-        if self.busy and (
-            self.chat["id"] != self._response_chat_id
-            or self.controller._pending_steering is not None
-        ):
-            return
         text = self.prompt_text()
-        if text:
+        if text and self.controller.send(text):
             self.prompt.get_buffer().set_text("")
-            self.controller.send(text)
 
     def _key_pressed(self, _controller, key, _code, state):
         if key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and state & Gdk.ModifierType.CONTROL_MASK:

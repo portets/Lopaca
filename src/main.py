@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 from contextlib import suppress
 from pathlib import Path
 
@@ -129,6 +130,9 @@ class ChatController:
         self.view = self.chat = None
         self.busy = self.stop_requested = self.updating_memories = False
         self._pending_steering = None
+        self._pending_messages = deque()
+        self._generation_streaming = False
+        self._condensing_context = False
         self._generation_chat_id = None
         self._generation_context_used = None
         self._generation_clarification = None
@@ -170,6 +174,8 @@ class ChatController:
             self.was_connected = True
         if changed and not self.busy:
             self.view.set_status(self.idle_status())
+        if connected and not self.busy:
+            self._drain_messages()
         return False
 
     def _monitor_connection(self):
@@ -194,7 +200,8 @@ class ChatController:
 
     def _server_properties_changed(self, props):
         capacity = props.get("default_generation_settings", {}).get("n_ctx")
-        if isinstance(capacity, int):
+        if isinstance(capacity, int) and capacity > 0:
+            self.client.context_capacity = capacity
             self.view.set_context_capacity(capacity)
         levels = props.get("chat_template_caps", {}).get("reasoning_effort_levels", [])
         levels = (
@@ -486,16 +493,29 @@ class ChatController:
 
     def send(self, text, chat_id=None, *, steering=False):
         if not self.chat:
-            return
+            return False
         text = text.strip()
         if not text:
-            return
+            return False
         chat_id = chat_id or self.chat["id"]
+        if not self.connected:
+            self.view.notify("Not connected")
+            return False
         if self.busy:
-            if chat_id == self._generation_chat_id and self._pending_steering is None:
+            if (
+                chat_id == self._generation_chat_id
+                and self._generation_streaming
+                and not self._generation_answer_complete
+                and not self._condensing_context
+                and not self.stop_requested
+                and self._pending_steering is None
+            ):
                 self._pending_steering = text
+                self._pending_messages.append((chat_id, text, False))
                 self.stop()
-            return
+            else:
+                self._pending_messages.append((chat_id, text, False))
+            return True
         chat = self.chat if chat_id == self.chat["id"] else self.store.load(chat_id)
         settings = self.get_chat_settings(chat_id)
         preserve_thinking = settings["preserve_reasoning"] is True
@@ -516,8 +536,12 @@ class ChatController:
         if chat_id == self.chat["id"]:
             self.view.set_chat_title(chat["title"])
             self.view.append_message("user", text, timestamp=timestamp)
+        start = self.store.load_settings(chat_id).get("context_start", 0)
+        if type(start) is not int or not 0 <= start < len(chat["messages"]):
+            start = 0
+        self._generation_context_start = start
         messages = []
-        for message in chat["messages"]:
+        for message in chat["messages"][start:]:
             content = message.get("content", "")
             if message["role"] == "assistant":
                 content = self.visible_answer(content)
@@ -541,9 +565,10 @@ class ChatController:
             )
         self._generation_chat_id = chat_id
         self._generation_context_used = None
+        self._generation_answer_complete = False
+        self._generation_streaming = False
         self._generation_memory_review = None
         self._generation_thinking = self.thinking_parameters(chat_id)
-        self._generation_memory_review = None
         self._generation_thinking_options = auto_thinking_options(tuple(self._thinking_levels))
         self.busy = True
         self.stop_requested = False
@@ -562,6 +587,14 @@ class ChatController:
             ),
             daemon=True,
         ).start()
+
+        return True
+
+    def _drain_messages(self):
+        while self.connected and not self.busy and self._pending_messages:
+            chat_id, text, steering = self._pending_messages.popleft()
+            if self.store.folder(chat_id).exists():
+                self.send(text, chat_id, steering=steering)
 
     def _stream(
         self, messages, preserve_thinking, query, folder, agent_mode, query_expansion, imports=()
@@ -620,11 +653,15 @@ class ChatController:
         def answer_changed(text):
             nonlocal last_answer
             visible = self.visible_answer(text)
+            if visible:
+                self._generation_streaming = True
             if visible != last_answer:
                 self.view.dispatch(self.view.update_answer, visible)
                 last_answer = visible
 
         def thinking(text):
+            if text.strip():
+                self._generation_streaming = True
             self.view.dispatch(self.view.update_thinking, text)
 
         def expand(search_query):
@@ -687,6 +724,7 @@ class ChatController:
                 + core_context,
             },
         )
+        context_user_content = messages[-1]["content"]
         # Keep fresh evidence beside the current question, after historical answers/reasoning.
         # These are request-local copies; the user's stored message remains unchanged.
         messages[-1]["content"] += format_document_context(
@@ -717,6 +755,11 @@ class ChatController:
                 flush=True,
             )
 
+        initial_start = self._generation_context_start
+
+        def context_trimmed(removed):
+            self._generation_context_start = initial_start + removed
+
         answer, reasoning, error = self.client.stream(
             messages,
             preserve_thinking,
@@ -733,8 +776,13 @@ class ChatController:
             if memory_enabled
             else None,
             on_seed=record_seed,
+            on_context=self._set_context_processing,
+            on_context_trim=context_trimmed,
+            context_user_content=context_user_content,
+            on_waiting=lambda: setattr(self, "_generation_streaming", False),
         )
         finished_at = time.time()
+        self._generation_answer_complete = not error and not self.stop_requested
 
         clarification = False
         if memory_enabled:
@@ -767,6 +815,47 @@ class ChatController:
                 finally:
                     self.updating_memories = False
 
+        if not error and not self.stop_requested and self.client.needs_context_roll():
+            # Build the next stable history prefix without this request's transient RAG.
+            removed = self._generation_context_start - initial_start
+            completed = {"role": "assistant", "content": answer}
+            if self._generation_memory_review:
+                completed["content"] += (
+                    f"\n<memory-review>{self._generation_memory_review}</memory-review>"
+                )
+            if preserve_thinking and reasoning:
+                completed["reasoning_content"] = reasoning
+            try:
+                stable_system = messages[0]
+                if memory_enabled:
+                    stable_system = dict(
+                        stable_system,
+                        content=build_system_prompt(
+                            agent_mode, generation_settings["conversation_style"], memories=True
+                        )
+                        + memory_context(self.memories.records())[0],
+                    )
+                retained = [
+                    stable_system,
+                    *history[removed:],
+                    {"role": "user", "content": context_user_content},
+                    completed,
+                ]
+                rolled = self.client.condense_context(
+                    retained,
+                    preserve_thinking,
+                    thinking_parameters_for_reply,
+                    lambda: self.stop_requested,
+                    self._set_context_processing,
+                    on_usage=lambda used: self.view.dispatch(
+                        self._update_inference_stats, used, None
+                    ),
+                )
+                self._generation_context_start += rolled
+            except Exception as exc:
+                if not self.stop_requested:
+                    self.view.dispatch(self.view.notify, f"Could not condense context: {exc}")
+
         clarification = clarification and memories_enabled()
         self.view.dispatch(
             self.finish_response,
@@ -778,6 +867,10 @@ class ChatController:
             request_seeds,
         )
 
+    def _set_context_processing(self, active):
+        self._condensing_context = active
+        self.view.dispatch(self.view.set_context_processing, active)
+
     def _update_inference_stats(self, context_used, tokens_per_second):
         if context_used is not None:
             self._generation_context_used = context_used
@@ -788,7 +881,12 @@ class ChatController:
         return False
 
     def stop(self):
-        if self.busy and not self.stop_requested:
+        if (
+            self.busy
+            and not self.stop_requested
+            and not self._generation_answer_complete
+            and not self._condensing_context
+        ):
             self.stop_requested = True
             self.view.notify("Cancelling")
             self.client.cancel()
@@ -810,18 +908,24 @@ class ChatController:
         answer = self.visible_answer(answer)
         steering = self._pending_steering
         self._pending_steering = None
-        if steering is not None:
+        interrupted = not getattr(self, "_generation_answer_complete", False)
+        if steering is not None and interrupted:
             phase = "Response" if answer.strip() else "Thinking" if reasoning.strip() else "Request"
             answer = answer.rstrip() + f"\n\n*{phase} interrupted by user.*"
             error = None
             clarification = False
         finished_at = time.time() if finished_at is None else finished_at
-        if error and "token or context limit" not in error:
+        context_error = error and (
+            "token or context limit" in error
+            or "for the server context" in error
+            or "Context preparation" in error
+        )
+        if error and not context_error:
             self._connection_changed(False)
         elif not self.stop_requested:
             self._connection_changed(True)
         if error:
-            if "token or context limit" in error:
+            if context_error:
                 answer += f"\n\n[Generation ended: {error}]"
             else:
                 answer = (
@@ -854,6 +958,7 @@ class ChatController:
             chat["messages"][-1]["memory_review"] = self._generation_memory_review
         if self._generation_context_used is not None:
             chat.setdefault("inference_stats", {})["context_used"] = self._generation_context_used
+        chat["context_start"] = getattr(self, "_generation_context_start", 0)
         chat["updated"] = finished_at
         self.store.save(chat, message_start=len(chat["messages"]) - 1)
         self.history_index.schedule(chat["id"])
@@ -865,7 +970,11 @@ class ChatController:
         else:
             self.view.end_response()
         if steering is not None:
-            self.send(steering, chat["id"], steering=True)
+            for index, (queued_chat, text, _) in enumerate(self._pending_messages):
+                if queued_chat == chat["id"]:
+                    self._pending_messages[index] = (queued_chat, text, interrupted)
+                    break
+        self._drain_messages()
 
     def commands_in(self, text):
         return extract_commands(text) if self.settings.enable_command_approval else []
