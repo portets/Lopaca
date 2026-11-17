@@ -71,7 +71,6 @@ class Settings:
 
 CHAT_SETTING_DEFAULTS = {
     "global_memories": Settings.global_memories,
-    "preserve_reasoning": Settings.preserve_thinking,
     "rag_query_expansion": Settings.rag_query_expansion,
     "rag_model_indexing": Settings.rag_model_indexing,
     "history_model_indexing": Settings.history_model_indexing,

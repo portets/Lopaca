@@ -130,7 +130,6 @@ class ChatController:
             self._model_lock,
             lambda active: self.view.dispatch(self.view.set_document_processing, active),
         )
-        self.preserve_thinking = settings.preserve_thinking
         self.rag_query_expansion = settings.rag_query_expansion
         self.chat_sort = settings.chat_sort
         self.view = self.chat = None
@@ -452,10 +451,14 @@ class ChatController:
             self.view.notify(f"Could not open folder: {exc}")
 
     def get_chat_settings(self, chat_id=None):
+        app_settings = self.store.load_app_settings()
         settings = {"global_chat_histories": self.settings.global_chat_histories}
-        settings.update(CHAT_SETTING_DEFAULTS | self.store.load_app_settings())
+        settings.update(CHAT_SETTING_DEFAULTS | app_settings)
         if chat_id is not None:
             settings.update(self.store.load_settings(chat_id))
+        settings["preserve_reasoning"] = app_settings.get(
+            "preserve_reasoning", self.settings.preserve_thinking
+        )
         return settings
 
     def get_chat_overrides(self, chat_id):
@@ -463,7 +466,6 @@ class ChatController:
 
     def _apply_chat_settings(self):
         settings = self.get_chat_settings(self.chat["id"])
-        self.preserve_thinking = settings["preserve_reasoning"] is True
         self.rag_query_expansion = settings["rag_query_expansion"] is True
         folder = self.store.documents(self.chat["id"])
         self.document_indexer.configure(settings["rag_model_indexing"] is True, folder)

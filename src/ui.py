@@ -1480,20 +1480,11 @@ class ChatWindow(Adw.ApplicationWindow):
             memories_row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
             memories_row.connect("activated", lambda *_: self._show_memories(dialog))
             group.add(memories_row)
-            packs_row = Adw.ActionRow(title="Knowledge Packs", activatable=True)
-            packs_row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
-            packs_row.connect("activated", lambda *_: self._show_knowledge_packs(dialog))
-            group.add(packs_row)
             add_switch(
                 "global_chat_histories",
                 "Global Chat Histories",
                 "Recall relevant discussions from other chats.",
             )
-        add_switch(
-            "preserve_reasoning",
-            "Preserve Reasoning",
-            "Allow model to remember previous thinking blocks.",
-        )
         add_switch(
             "rag_query_expansion",
             "Expand Document, Memory and Chat Searches",
@@ -1562,6 +1553,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 self.controller.set_chat_sort,
             )
             dialog.add(self._model_settings_page())
+            dialog.add(self._knowledge_settings_page(dialog))
         dialog.present(self)
 
     def update_model_server(self, text, busy):
@@ -1624,6 +1616,25 @@ class ChatWindow(Adw.ApplicationWindow):
             margin_end=12,
         )
         advanced.add_row(advanced_content)
+        reasoning = Adw.PreferencesGroup()
+        advanced_content.append(reasoning)
+        preserve = Adw.SwitchRow(
+            title="Preserve Reasoning",
+            subtitle="Include earlier thinking in future replies when the model supports it.",
+            active=self.controller.get_chat_settings()["preserve_reasoning"] is True,
+        )
+
+        def save_reasoning(row, _pspec):
+            active = row.get_active()
+            try:
+                self.controller.set_setting("preserve_reasoning", active)
+            except OSError as exc:
+                with row.handler_block(reasoning_handler):
+                    row.set_active(not active)
+                self._show_alert("Could not save settings", str(exc))
+
+        reasoning_handler = preserve.connect("notify::active", save_reasoning)
+        reasoning.add(preserve)
         options = Adw.PreferencesGroup(
             title="Launch Parameters",
             description="Leave fields blank to use Lopaca and llama-server defaults. Press connect "
@@ -1808,8 +1819,20 @@ class ChatWindow(Adw.ApplicationWindow):
 
         alert.choose(self, None, confirmed)
 
-    def _show_knowledge_packs(self, settings_dialog):
-        dialog, group = self._settings_subpage("Knowledge Packs", settings_dialog)
+    def _knowledge_settings_page(self, dialog):
+        page = Adw.PreferencesPage(title="Knowledge", icon_name="application-x-addon-symbolic")
+        page.connect("map", self._sync_native_scroll)
+        group = Adw.PreferencesGroup(title="Knowledge Packs")
+        page.add(group)
+
+        def load(page):
+            page.disconnect(load_handler)
+            self._populate_knowledge_packs(dialog, group)
+
+        load_handler = page.connect("map", load)
+        return page
+
+    def _populate_knowledge_packs(self, dialog, group):
         group.set_description("Download and manage knowledge packs.")
         from packs import compatibility_error, load_catalog
 
@@ -2099,7 +2122,6 @@ class ChatWindow(Adw.ApplicationWindow):
         merge.connect("clicked", confirm_merge)
         self._knowledge_refresh = refresh
         refresh()
-        dialog.present(self)
 
         def fetch_catalog():
             try:
