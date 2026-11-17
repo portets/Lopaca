@@ -448,6 +448,15 @@ class KnowledgeStore:
         # Search the existing FTS heading index, then verify the complete article title.
         # Unlike general query terms, a single-letter word can be significant inside a title.
         words = re.findall(r"\w+", query.casefold())[:48]
+
+        def title_key(text):
+            return " ".join(
+                word[:-1]
+                if len(word) > 3 and word.endswith("s") and not word.endswith(("ss", "us", "is"))
+                else word
+                for word in re.findall(r"\w+", text.casefold())
+            )
+
         found = {}
         for length in range(min(8, len(words)), 1, -1):
             for start in range(len(words) - length + 1):
@@ -464,14 +473,14 @@ class KnowledgeStore:
                 matches = {}
                 for source, section in rows:
                     heading = section.split(" > ", 1)[0]
-                    if " ".join(re.findall(r"\w+", heading.casefold())) != normalized:
+                    if title_key(heading) != title_key(normalized):
                         continue
                     record = db.execute(
                         "SELECT metadata FROM articles WHERE source=?", (source,)
                     ).fetchone()
                     if record:
                         title = json.loads(record[0])["title"]
-                        if " ".join(re.findall(r"\w+", title.casefold())) == normalized:
+                        if title_key(title) == title_key(normalized):
                             matches[source] = (source, title, normalized)
                 found.update(matches)
         if not found:
@@ -774,6 +783,7 @@ class KnowledgeStore:
                 or "_" in term
             ]
             rows = []
+            outlined_sources = set()
             for _, source, section, body, first, last in ranked:
                 metadata = json.loads(
                     db.execute(
@@ -798,6 +808,25 @@ class KnowledgeStore:
                         + ", ".join(unmatched)
                         + ". It may cover another part of the request; do not infer a "
                         "relationship to those identifiers.\n\n" + body
+                    )
+                outline = []
+                if source not in outlined_sources and source in {item[0] for item in title_matches}:
+                    outline = [
+                        {"section": name.split(" > ")[-1], "line": line}
+                        for name, line in db.execute(
+                            "SELECT section,min(start_line) FROM passages WHERE source=? "
+                            "GROUP BY section ORDER BY min(start_line)",
+                            (source,),
+                        )
+                        if name.count(" > ") == 1
+                    ][:24]
+                if outline:
+                    outlined_sources.add(source)
+                    body = (
+                        "Article section navigation (not a complete factual excerpt): "
+                        + json.dumps(outline, ensure_ascii=False)
+                        + "\n\n"
+                        + body
                     )
                 if source in matched_titles:
                     names = json.dumps(sorted(matched_titles[source]), ensure_ascii=False)

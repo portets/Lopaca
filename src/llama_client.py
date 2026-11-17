@@ -2,9 +2,11 @@
 
 import json
 import logging
+import os
 import re
 import secrets
 import threading
+import time
 import urllib.error
 import urllib.request
 from contextlib import suppress
@@ -19,6 +21,38 @@ from rag import (
     document_grammar,
     parse_document_questions,
 )
+from settings import APP_DIR
+
+
+# Temporary diagnostics: delete this class and its capture hooks to remove capture.
+# Only the latest streamed response (including its tool turns) is retained.
+class _DebugCapture:
+    enabled = True
+
+    def __init__(self):
+        self.path = APP_DIR / "debug-last-response.jsonl"
+        self.active = self.enabled
+        if self.active:
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                os.fchmod(fd, 0o600)
+                os.close(fd)
+            except OSError as exc:
+                self.active = False
+                logging.warning("Could not start debug capture: %s", exc)
+
+    def write(self, kind, **data):
+        if self.active:
+            try:
+                with self.path.open("a", encoding="utf-8") as stream:
+                    stream.write(
+                        json.dumps({"time": time.time(), "kind": kind, **data}, ensure_ascii=False)
+                        + "\n"
+                    )
+            except OSError as exc:
+                self.active = False
+                logging.warning("Could not write debug capture: %s", exc)
 
 
 def recent_messages(history, limit=3):
@@ -476,6 +510,8 @@ class LlamaClient:
         expand_context=False,
     ):
         """Keep read-only tool exchanges local to this request, with bounded follow-ups."""
+        self._capture = _DebugCapture()
+        self._capture.write("start", server_url=self.settings.server_url)
         history = list(messages)
         self._context_current = id(
             next((m for m in reversed(history) if m["role"] == "user"), None)
@@ -688,6 +724,9 @@ class LlamaClient:
                 self._context_expanding = False
                 if self._on_context:
                     self._on_context(False)
+        capture = getattr(self, "_capture", None)
+        if capture:
+            capture.write("request", url=url, body=body)
         request = self._post_request(url, body)
         reasoning_parts, answer_parts, finish_reason = [], [], None
         tool_calls = {}
@@ -697,6 +736,8 @@ class LlamaClient:
             with urllib.request.urlopen(request, timeout=self.settings.request_timeout) as response:
                 self.active_response = response
                 for raw in response:
+                    if capture:
+                        capture.write("server", raw=raw.decode("utf-8", errors="replace"))
                     if stopped():
                         break
                     line = raw.decode("utf-8", errors="replace").strip()
@@ -787,4 +828,6 @@ class LlamaClient:
         finally:
             self.active_response = None
         calls = [tool_calls[index] for index in sorted(tool_calls)]
+        if capture:
+            capture.write("end", error=error, finish_reason=finish_reason, cancelled=stopped())
         return "".join(answer_parts), "".join(reasoning_parts), error, calls
