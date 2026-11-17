@@ -1508,7 +1508,8 @@ class ChatWindow(Adw.ApplicationWindow):
         add_switch(
             "history_model_indexing",
             "Model-Assisted History Indexing (SLOW)",
-            "Creates compact searchable chat summaries. CAN BE SLOW, best used with t/s > 80.",
+            "Improves search in archived messages in this chat and in other chats. "
+            "CAN BE SLOW, best used with t/s > 80.",
         )
 
         def add_choices(title, options, key, setter):

@@ -481,11 +481,15 @@ class ChatController:
             settings[key] = value
         if chat_id is None:
             self.store.save_app_settings(settings)
-            if key == "global_chat_histories" and value is True:
+            if key == "history_model_indexing" or (
+                key == "global_chat_histories" and value is True
+            ):
                 for chat in self.store.list():
                     self.history_index.schedule(chat["id"])
         else:
             self.store.save_settings(chat_id, settings)
+            if key == "history_model_indexing":
+                self.history_index.schedule(chat_id)
         if self.chat and (chat_id is None or chat_id == self.chat["id"]):
             self._apply_chat_settings()
 
