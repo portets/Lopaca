@@ -2,6 +2,7 @@
 """Application controller, request coordination and Lopaca entry point."""
 
 import re
+import sqlite3
 import subprocess
 import threading
 import time
@@ -456,6 +457,7 @@ class ChatController:
         settings.update(CHAT_SETTING_DEFAULTS | app_settings)
         if chat_id is not None:
             settings.update(self.store.load_settings(chat_id))
+            settings.setdefault("exclude_from_history", False)
         settings["preserve_reasoning"] = app_settings.get(
             "preserve_reasoning", self.settings.preserve_thinking
         )
@@ -490,7 +492,12 @@ class ChatController:
                     self.history_index.schedule(chat["id"])
         else:
             self.store.save_settings(chat_id, settings)
-            if key == "history_model_indexing":
+            if key == "exclude_from_history" and value is True:
+                try:
+                    self.history_index.delete(chat_id)
+                except (OSError, sqlite3.Error, ValueError) as exc:
+                    self.view.notify(f"Could not remove chat from global history: {exc}")
+            if key in ("history_model_indexing", "exclude_from_history"):
                 self.history_index.schedule(chat_id)
         if self.chat and (chat_id is None or chat_id == self.chat["id"]):
             self._apply_chat_settings()

@@ -1484,33 +1484,32 @@ class ChatWindow(Adw.ApplicationWindow):
                 update_markers()
             row.set_activatable_widget(button)
 
-        def add_switch(key, title, tooltip):
+        def add_switch(key, title, tooltip, *, inverted=False):
             row = Adw.ActionRow(title=title)
-            button = Gtk.Switch(active=settings[key] is True, valign=Gtk.Align.CENTER)
+            button = Gtk.Switch(active=(settings[key] is True) != inverted, valign=Gtk.Align.CENTER)
             add_control(row, button, key)
             row.set_tooltip_text(tooltip)
 
             def changed(row, _param):
                 try:
-                    self.controller.set_setting(key, row.get_active(), chat_id)
-                    settings[key] = row.get_active()
+                    value = row.get_active() != inverted
+                    self.controller.set_setting(key, value, chat_id)
+                    settings[key] = value
                     overrides.add(key)
                     update_markers()
                 except OSError as exc:
                     with row.handler_block(handler):
-                        row.set_active(settings[key] is True)
+                        row.set_active((settings[key] is True) != inverted)
                     self._show_alert("Could not save settings", str(exc))
 
             handler = button.connect("notify::active", changed)
-            setting_controls[key] = [(button, handler, None)]
+            setting_controls[key] = [(button, handler, False if inverted else None)]
             group.add(row)
 
-        add_switch(
-            "global_memories",
-            "Global Memories",
-            "Recall and learn personal memories across chats.",
-        )
         if chat_id is None:
+            add_switch(
+                "global_memories", "Global Memories", "Recall and learn memories across chats."
+            )
             memories_row = Adw.ActionRow(title="Manage Memories", activatable=True)
             memories_row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
             memories_row.connect("activated", lambda *_: self._show_memories(dialog))
@@ -1519,6 +1518,18 @@ class ChatWindow(Adw.ApplicationWindow):
                 "global_chat_histories",
                 "Global Chat Histories",
                 "Recall relevant discussions from other chats.",
+            )
+        else:
+            add_switch(
+                "global_memories",
+                "Exclude From Memories",
+                "Turn off memory recall and learning in this chat.",
+                inverted=True,
+            )
+            add_switch(
+                "exclude_from_history",
+                "Exclude From History",
+                "Keep this chat out of cross-chat history searches.",
             )
         add_switch(
             "rag_query_expansion",

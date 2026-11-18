@@ -83,14 +83,22 @@ class HistoryIndex:
         )
 
     def delete(self, chat_id):
+        if not self.path.exists():
+            return
         with closing(self._connect()) as db, db:
-            sources = [
-                r[0] for r in db.execute("SELECT source FROM records WHERE chat=?", (chat_id,))
-            ]
-            for source in sources:
-                db.execute("DELETE FROM chunk_content WHERE source=?", (source,))
-                db.execute("DELETE FROM files WHERE path=?", (source,))
+            db.execute(
+                "DELETE FROM chunk_content "
+                "WHERE source IN (SELECT source FROM records WHERE chat=?)",
+                (chat_id,),
+            )
+            db.execute(
+                "DELETE FROM files WHERE path IN (SELECT source FROM records WHERE chat=?)",
+                (chat_id,),
+            )
             db.execute("DELETE FROM records WHERE chat=?", (chat_id,))
+
+    def _excluded_chat(self, chat_id):
+        return self.store.load_settings(chat_id).get("exclude_from_history") is True
 
     def _run(self):
         while True:
@@ -98,6 +106,8 @@ class HistoryIndex:
             with self.lock:
                 self.queued.discard(chat_id)
             try:
+                if self._excluded_chat(chat_id):
+                    self.delete(chat_id)
                 self.update_local(chat_id)
                 self._assist_local(chat_id)
                 self._update(chat_id)
@@ -208,13 +218,15 @@ class HistoryIndex:
         return local.context(query, chat_id, expand, previous_queries=previous_queries)
 
     def _update(self, chat_id, *, keep_hints=False):
+        local = getattr(self, "local", False)
+        if not local and self._excluded_chat(chat_id):
+            return
         if not self.enabled():
             return
         if not self.store.folder(chat_id).exists():
             self.delete(chat_id)
             return
         chat = self.store.load(chat_id)
-        local = getattr(self, "local", False)
         assisted = not local and self._assisted(chat_id)
         windows = []
         messages = chat["messages"]
@@ -252,7 +264,7 @@ class HistoryIndex:
             body = text
             if assisted:
                 with self.model_lock:
-                    if not self.enabled():
+                    if not self.enabled() or self._excluded_chat(chat_id):
                         return
                     # Recheck the setting after waiting for an active model request.
                     if not self._assisted(chat_id):
@@ -265,7 +277,10 @@ class HistoryIndex:
                     self.schedule(chat_id)
                     return
             with closing(self._connect()) as db, db:
-                if not self.enabled():
+                if not local:
+                    # Serialize the exclusion check and write with deletion from Chat Settings.
+                    db.execute("BEGIN IMMEDIATE")
+                if not self.enabled() or (not local and self._excluded_chat(chat_id)):
                     return
                 # A chat deleted during a slow model request must never reappear in the index.
                 if not self.store.folder(chat_id).exists():
@@ -318,10 +333,14 @@ class HistoryIndex:
                     db.execute("DELETE FROM records WHERE source=?", (source,))
 
     def context(self, query, chat_id, expand=None, *, previous_queries=()):
-        if not self.enabled() or not self.path.exists():
+        local = getattr(self, "local", False)
+        if (
+            not self.enabled()
+            or not self.path.exists()
+            or (not local and self._excluded_chat(chat_id))
+        ):
             return ""
         with closing(self._connect()) as db:
-            local = getattr(self, "local", False)
             # Exclude still-active records even if a stale archive index has not caught up.
             boundary = getattr(self, "boundary", None)
             if boundary is None:
@@ -366,6 +385,8 @@ class HistoryIndex:
                 ).fetchone()
                 if row:
                     identity, title, first, last, assisted = row
+                    if not local and self._excluded_chat(identity):
+                        continue
                     citation = json.dumps(
                         {"chat": title, "id": identity, "messages": [first, last]},
                         ensure_ascii=False,
