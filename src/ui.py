@@ -165,6 +165,12 @@ window.lopaca-main, .transcript-scroll, .transcript {
 .prompt-view, .prompt-view text {
     background-color: transparent;
 }
+.model-advanced image.expander-row-arrow {
+    -gtk-icon-transform: rotate(0turn);
+}
+.model-advanced:checked image.expander-row-arrow {
+    -gtk-icon-transform: rotate(0.5turn);
+}
 .command-preview {
     border-radius: 6px;
 }
@@ -1418,13 +1424,13 @@ class ChatWindow(Adw.ApplicationWindow):
     def _show_settings(self, chat_id=None):
         dialog = Adw.PreferencesDialog(
             title="App Settings" if chat_id is None else "Chat Settings",
-            content_width=660,
-            content_height=540,
+            content_width=720,
+            content_height=640,
         )
         dialog.set_search_enabled(False)
         page = Adw.PreferencesPage(
             title="General" if chat_id is None else "Chat Settings",
-            icon_name="user-idle-symbolic",
+            icon_name="user-available-symbolic",
         )
         page.connect("map", self._sync_native_scroll)
         dialog.add(page)
@@ -1583,7 +1589,55 @@ class ChatWindow(Adw.ApplicationWindow):
             )
             dialog.add(self._model_settings_page())
             dialog.add(self._knowledge_settings_page(dialog))
+            dialog.add(self._about_settings_page())
         dialog.present(self)
+
+    def _about_settings_page(self):
+        page = Adw.PreferencesPage(title="About", icon_name="preferences-system-details-symbolic")
+        about = Adw.PreferencesGroup(title="Lopaca")
+        about.add(
+            Adw.ActionRow(
+                title='Created by <a href="https://github.com/portets">Timothy Porter</a>',
+                subtitle="Lopaca developer and maintainer",
+                use_markup=True,
+            )
+        )
+        page.add(about)
+
+        licenses = Adw.PreferencesGroup(title="Licenses")
+        page.add(licenses)
+        for title, notice in (
+            (
+                "Lopaca",
+                "Copyright © (2026-Current) "
+                'Timothy Porter · <a href="https://www.gnu.org/licenses/agpl-3.0.en.html"> GNU '
+                "Affero General Public License v3.0</a>, provided without warranty or liability.",
+            ),
+            (
+                "Wikipedia knowledge packs",
+                "Text adapted and indexed from Wikipedia contributors under the "
+                '<a href="https://creativecommons.org/licenses/by-sa/4.0/">'
+                "Creative Commons Attribution-ShareAlike 4.0 International license</a>. "
+                "Article links provide source and contributor history.",
+            ),
+            (
+                "llama-server (llama.cpp)",
+                'Copyright © The ggml authors · <a href="https://github.com/ggml-org/llama.cpp/'
+                'blob/master/LICENSE">MIT License</a>',
+            ),
+        ):
+            licenses.add(Adw.ActionRow(title=title, subtitle=notice, use_markup=True))
+
+        donations = Adw.PreferencesGroup(title="Donate")
+        donations.add(
+            Adw.ActionRow(
+                title='<a href="https://buymeacoffee.com/portets">Buy Me a Coffee</a>',
+                subtitle="Thanks!",
+                use_markup=True,
+            )
+        )
+        page.add(donations)
+        return page
 
     def update_model_server(self, text, busy):
         if self._connecting_model != busy:
@@ -1640,6 +1694,7 @@ class ChatWindow(Adw.ApplicationWindow):
 
         advanced_group = Adw.PreferencesGroup()
         advanced = Adw.ExpanderRow(title="Advanced", expanded=False)
+        advanced.add_css_class("model-advanced")
         advanced_group.add(advanced)
         page.add(advanced_group)
         advanced_content = Gtk.Box(
