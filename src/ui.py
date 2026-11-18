@@ -256,6 +256,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._status_timer = None
         self._status_dots = 0
         self._activity_status = "Not Connected"
+        self._connecting_model = False
         self._processing_documents = False
         self._notification_timer = None
         self._notification_deadline = 0
@@ -498,7 +499,7 @@ class ChatWindow(Adw.ApplicationWindow):
             ),
         )
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        hint = Gtk.Label(label="Enter for a new line · Ctrl+Enter to send", xalign=0)
+        hint = Gtk.Label(label="Shift+Enter for new line · Enter to send", xalign=0)
         hint.set_hexpand(True)
         hint.add_css_class("muted")
         actions.append(hint)
@@ -601,7 +602,7 @@ class ChatWindow(Adw.ApplicationWindow):
             self._notification_timer is not None
             and self._notification_model_busy
             and not self.controller.busy
-            and text in ("Ready", "Disconnected", "Not Connected")
+            and text in ("Ready", "Disconnected", "Not connected")
             and self._notification_deadline - GLib.get_monotonic_time() > 1_000_000
         ):
             GLib.source_remove(self._notification_timer)
@@ -653,6 +654,8 @@ class ChatWindow(Adw.ApplicationWindow):
         return False
 
     def _display_status(self, text):
+        if self._connecting_model:
+            text = "Connecting to model"
         if text == self._status_text:
             return
         self._status_text = text
@@ -670,6 +673,7 @@ class ChatWindow(Adw.ApplicationWindow):
             "Updating memories",
             "Cancelling",
             "Condensing context",
+            "Connecting to model",
         ):
             self._status_timer = GLib.timeout_add(650, self._animate_status)
 
@@ -748,7 +752,7 @@ class ChatWindow(Adw.ApplicationWindow):
             self.prompt.get_buffer().set_text("")
 
     def _key_pressed(self, _controller, key, _code, state):
-        if key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and state & Gdk.ModifierType.CONTROL_MASK:
+        if key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and not state & Gdk.ModifierType.SHIFT_MASK:
             self._send()
             return True
         return False
@@ -1582,6 +1586,12 @@ class ChatWindow(Adw.ApplicationWindow):
         dialog.present(self)
 
     def update_model_server(self, text, busy):
+        if self._connecting_model != busy:
+            self._connecting_model = busy
+            if self._notification_timer is not None:
+                GLib.source_remove(self._notification_timer)
+                self._notification_timer = None
+            self.set_status(self._activity_status)
         if hasattr(self, "_model_server_status"):
             self._model_server_status.set_label(text)
             self._model_connect_button.set_sensitive(not busy)
