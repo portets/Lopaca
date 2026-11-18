@@ -872,18 +872,43 @@ class ChatWindow(Adw.ApplicationWindow):
                 ("Delete Chat", lambda chat_id=chat["id"]: self._confirm_delete_chat(chat_id)),
             )
             for index, (title, callback) in enumerate(choices):
+                if index in (0, 2, 5):
+                    section = Gio.Menu()
+                    menu.append_section(None, section)
                 action = Gio.SimpleAction.new(f"option{index}", None)
                 action.connect(
                     "activate", lambda _action, _parameter, callback=callback: callback()
                 )
                 actions.add_action(action)
-                menu.append(title, f"chat.option{index}")
+                section.append(title, f"chat.option{index}")
             options_button.insert_action_group("chat", actions)
             popover = Gtk.PopoverMenu.new_from_model(menu)
             popover.add_css_class("chat-options-menu")
             options_button.set_popover(popover)
+            popover.set_halign(Gtk.Align.START)
+            popover.set_has_arrow(False)
+            popover.connect("closed", lambda menu: menu.set_pointing_to(None))
             line.append(options_button)
             row.set_child(line)
+            right_click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+            right_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            right_click.connect(
+                "pressed",
+                lambda gesture, *_: gesture.set_state(Gtk.EventSequenceState.CLAIMED),
+            )
+
+            def open_options(gesture, _count, x, y, button=options_button):
+                point = Graphene.Point().init(x, y)
+                success, anchor = gesture.get_widget().compute_point(button, point)
+                if success:
+                    rect = Gdk.Rectangle()
+                    rect.x, rect.y = round(anchor.x), round(anchor.y)
+                    rect.width = rect.height = 1
+                    button.get_popover().set_pointing_to(rect)
+                button.popup()
+
+            right_click.connect("released", open_options)
+            row.add_controller(right_click)
             self.chat_list.append(row)
             self._chat_rows.append(row)
             if pinned or self.controller.chat_sort == "user_selectable":
