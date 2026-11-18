@@ -36,15 +36,17 @@ Retrieval uses SQLite FTS5/BM25, phrase and identifier matching, and filename/se
 
 # TO-DO
 - Add embedding model support?
+- Add PDF and other docs support
 - Combine add folder and add documents? gtk doesn't normally allow it
-- Context compression using RAG once a limit is hit
 - Make features list
 - More advanced agentic mode with more tools, web searching, etc
 
 # Further TO-DOs
 - Add image sending to llm for vision equipped models(not image gen)
-- Make llama-server launchable within Lopaca with parameters
 - Add support for other llm servers
 - Add Image and Code tabs, image can connect to stable-diffusion.cpp
 - Add cross-chat history RAG?
 
+
+# Support Lopaca
+[Buy me a coffee!](https://buymeacoffee.com/portets)
