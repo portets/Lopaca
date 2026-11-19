@@ -323,7 +323,7 @@ class ChatController:
         self.cancel_chat_warm()
         if self.chat:
             self._drafts[self.chat["id"]] = self.view.prompt_text(strip=False)
-        self.chat = self.store.load(chat_id)
+        self.chat = self.store.load(chat_id, recent_only=True)
         self.store.projects(chat_id).mkdir(exist_ok=True)
         self._apply_chat_settings()
         self.view.update_thinking_options()

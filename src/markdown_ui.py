@@ -8,7 +8,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gsk", "4.0")
 gi.require_version("Graphene", "1.0")
-from gi.repository import Graphene, Gtk, Pango  # noqa: E402
+from gi.repository import GLib, Graphene, Gtk, Pango  # noqa: E402
 
 CODE_BLOCK_PATTERN = re.compile(
     r"^ {0,3}(`{3,}|~{3,})([^\n]*)\n(.*?)^ {0,3}\1[ \t]*(?=\n|$)",
@@ -23,7 +23,7 @@ _INLINE = re.compile(
     r"|(`+)(.+?)\3"
     r'|!?\[([^\]]+)\]\(([^\s]+?)(?:\s+"[^"\n]*")?\)'
     r"|<(https?://[^<>\s]+|mailto:[^<>\s]+|[^<>\s@]+@[^<>\s@]+\.[^<>\s@]+)>"
-    r"|((?:https?://|www\.)[^\s<>]+|[\w.+-]+@[\w-]+(?:\.[\w-]+)+)"
+    r"|((?:https?://|www\.)[^\s<>]+|(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+)"
     r"|(\*{1,3}|(?<!\w)_{1,3}|~~|==|~|\^)(?=\S)(.+?)(?<=\S)\9(?:(?![\w*_])|(?<=~)|(?<=\^))"
     r"|\[\^([^\]\n]+)\]"
     r"|<(sub|sup|ins)>(.*?)</\12>",
@@ -348,8 +348,8 @@ def prose_blocks(text):
         else:
             paragraph.append(lines[index])
         index += 1
-    if paragraph:
-        yield "prose", "".join(paragraph).strip("\n")
+    if prose := "".join(paragraph).strip("\n"):
+        yield "prose", prose
 
 
 def table_cells(line):
@@ -619,14 +619,109 @@ class MarkdownTable(HorizontalScrollFrame):
         self.data = data
 
 
+_INLINE_PROSE_MARKUP = re.compile(r"[\\`*_~=^$<&@\[]|https?://|www\.")
+
+
+def _stream_text_blocks(blocks, wrap_boundary):
+    """Bound plain-text layouts while streaming. Keep inline Markdown spans intact."""
+    for kind, value in blocks:
+        if kind != "prose" or len(value) < 2048:
+            yield kind, value
+            continue
+        # Inline Markdown is scoped to its paragraph. One emphasis marker in
+        # another paragraph must not force GTK to reshape an entire response.
+        for i, paragraph in enumerate(value.split("\n\n")):
+            if len(paragraph) < 2048 or _INLINE_PROSE_MARKUP.search(paragraph):
+                yield "prose", paragraph
+                continue
+            start = 0
+            while len(paragraph) - start > 2048:
+                end = start + wrap_boundary(paragraph[start : start + 2048])
+                kind = "paragraph-start" if i and not start else "fragment"
+                yield kind, paragraph[start:end].removesuffix("\n").rstrip(" ")
+                start = end
+            yield "paragraph-start" if i and not start else "fragment", paragraph[start:]
+
+
+class _WrappedBoxLayout(Gtk.BoxLayout):
+    def do_allocate(self, widget, width, height, baseline):
+        Gtk.BoxLayout.do_allocate(self, widget, width, height, baseline)
+        if width > 0 and width != widget._wrap_width and widget._wrap_breaks:
+            widget._wrap_width = width
+            if not widget._rewrap_id:
+                widget._rewrap_id = GLib.idle_add(widget._rewrap)
+
+
 class MarkdownText(Gtk.Box):
     """Share prose/table rendering between stored messages and the streaming tail."""
 
-    def __init__(self, text=""):
+    def __init__(self, text="", *, streaming=False):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self._wrap_width = 680
+        self._wrap_breaks = {}
+        self._rewrap_id = 0
+        self.streaming = streaming
         self.blocks = []
         self._source_text = None
         self.set_text(text)
+
+    def _rewrap(self):
+        self._rewrap_id = 0
+        self._wrap_breaks.clear()
+        text, self._source_text = self._source_text, None
+        self.set_text(text)
+        return False
+
+    def _wrap_boundary(self, sample):
+        if sample not in self._wrap_breaks:
+            if not isinstance(self.get_layout_manager(), _WrappedBoxLayout):
+                self.set_layout_manager(_WrappedBoxLayout(orientation=Gtk.Orientation.VERTICAL))
+            layout = self.create_pango_layout(sample)
+            layout.set_width(self._wrap_width * Pango.SCALE)
+            layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+            # Leave the incomplete last display line for the following label.
+            line = layout.get_line_readonly(layout.get_line_count() - 1)
+            end = len(sample.encode("utf-8")[: line.start_index].decode("utf-8"))
+            self._wrap_breaks[sample] = end or len(sample)
+        return self._wrap_breaks[sample]
+
+    def prepend_prose(self, text, width):
+        """Yield between preparing and revealing the pieces of one archived paragraph."""
+        if (
+            len(text) < 8192
+            or width <= 0
+            or _INLINE_PROSE_MARKUP.search(text)
+            or list(prose_blocks(text)) != [("prose", text)]
+            or "|" in text
+        ):
+            self.set_text(text)
+            yield True
+            return
+
+        # Find real wrap boundaries from the start, then reveal from the end.
+        # Keep the same MarkdownText so resize rewraps the visible text together.
+        self._wrap_width = width
+        starts = [0]
+        while len(text) - starts[-1] > 2048:
+            start = starts[-1]
+            starts.append(start + self._wrap_boundary(text[start : start + 2048]))
+            yield False
+
+        self.set_spacing(0)
+        end = len(text)
+        for start in reversed(starts):
+            if self._wrap_width != width:
+                # A resize invalidated the old line starts.
+                self.set_text(text)
+                yield True
+                return
+            value = text[start:end].removesuffix("\n").rstrip(" ")
+            label = render_markdown_block("fragment", value)
+            self.prepend(label)
+            self.blocks.insert(0, ("fragment", label, value))
+            self._source_text = text[start:]
+            yield True
+            end = start
 
     def set_text(self, text):
         # While a fenced block streams, its preceding prose often stays identical.
@@ -657,7 +752,11 @@ class MarkdownText(Gtk.Box):
         ]
         blocks.extend(notes)
         grouped = []
-        for kind, value in blocks:
+        fragmented = self.streaming or len(text) > 8192
+        self.set_spacing(0 if fragmented else 6)
+        for kind, value in (
+            _stream_text_blocks(blocks, self._wrap_boundary) if fragmented else blocks
+        ):
             if kind in ("prose", "heading", "item", "footnote"):
                 if not grouped or grouped[-1][0] != "text":
                     grouped.append(("text", []))
@@ -675,6 +774,14 @@ class MarkdownText(Gtk.Box):
                 _, child, previous = self.blocks[index]
                 if value != previous:
                     render_markdown_block(kind, value, child)
+            continuation = (
+                index
+                and kind == "fragment"
+                and blocks[index - 1][0] in ("fragment", "paragraph-start")
+            )
+            margin = 6 if fragmented and index and not continuation else 0
+            if child.get_margin_top() != margin:
+                child.set_margin_top(margin)
             block = (kind, child, value)
             if index == len(self.blocks):
                 self.blocks.append(block)
@@ -695,6 +802,10 @@ def selectable_markdown(label, blocks):
     parts, plain, previous = [], "", None
     label.markdown_anchors = []
     for kind, value in blocks:
+        if kind == "prose" and not value:
+            # Blank lines separate adjacent blocks once, including loose list items.
+            previous = kind
+            continue
         separator = "\n" if kind == previous == "item" else "\n\n"
         if parts:
             parts.append(separator)
@@ -717,6 +828,10 @@ def selectable_markdown(label, blocks):
         parts.append(markup)
         plain += html.unescape(re.sub(r"<[^>]*>", "", markup))
         previous = kind
+    if any(kind == "heading" for kind, _ in blocks):
+        label.remove_css_class("chat-prose")
+    else:
+        label.add_css_class("chat-prose")
     label.set_markup("".join(parts))
 
 
@@ -748,7 +863,11 @@ def render_markdown_block(kind, value, widget=None):
     else:
         if widget is None:
             widget = markdown_label()
-        selectable_markdown(widget, value if kind == "text" else [(kind, value)])
+        if kind in ("fragment", "paragraph-start"):
+            widget.add_css_class("chat-prose")
+            widget.set_text(value)
+        else:
+            selectable_markdown(widget, value if kind == "text" else [(kind, value)])
     return widget
 
 

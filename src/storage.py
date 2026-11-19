@@ -24,6 +24,49 @@ def _write_json(path, data):
     temp_path.replace(path)
 
 
+class _PagedMessages:
+    """Keep recent messages mutable in memory and fetch older ranges by position."""
+
+    def __init__(self, path, start, recent):
+        self.path = path
+        self.start = start
+        self.recent = recent
+
+    def __len__(self):
+        return self.start + len(self.recent)
+
+    def append(self, message):
+        self.recent.append(message)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            index = key if key >= 0 else len(self) + key
+            if not 0 <= index < len(self):
+                raise IndexError(key)
+            if index >= self.start:
+                return self.recent[index - self.start]
+            return self[index : index + 1][0]
+        start, stop, step = key.indices(len(self))
+        if step != 1:
+            return self[:][key]
+        if start >= stop:
+            return []
+        rows = []
+        if start < self.start:
+            with closing(sqlite3.connect(self.path)) as db:
+                rows = [
+                    json.loads(row[0])
+                    for row in db.execute(
+                        "SELECT message FROM messages WHERE position >= ? AND position < ? "
+                        "ORDER BY position",
+                        (start, min(stop, self.start)),
+                    )
+                ]
+        if stop > self.start:
+            rows.extend(self.recent[max(0, start - self.start) : stop - self.start])
+        return rows
+
+
 class ChatStore:
     def __init__(self, root=CHATS_DIR):
         self.root = Path(root)
@@ -102,7 +145,7 @@ class ChatStore:
         self.ensure()
         _write_json(self.root.parent / "app-settings.json", settings)
 
-    def load(self, chat_id, *, history=True):
+    def load(self, chat_id, *, history=True, recent_only=False):
         settings = self.load_settings(chat_id)
         data = {"id": chat_id, "title": "New chat", "created": settings["created"], "messages": []}
         for key in ("title", "created", "updated", "inference_stats"):
@@ -111,12 +154,20 @@ class ChatStore:
         path = self.folder(chat_id) / "context.sqlite"
         if history and path.exists():
             with closing(sqlite3.connect(path)) as connection:
-                data["messages"] = [
+                start = 0
+                if recent_only:
+                    size = connection.execute(
+                        "SELECT IFNULL(MAX(position) + 1, 0) FROM messages"
+                    ).fetchone()[0]
+                    start = max(0, size - 32)
+                recent = [
                     json.loads(message)
                     for (message,) in connection.execute(
-                        "SELECT message FROM messages ORDER BY position"
+                        "SELECT message FROM messages WHERE position >= ? ORDER BY position",
+                        (start,),
                     )
                 ]
+                data["messages"] = _PagedMessages(path, start, recent) if start else recent
         return data
 
     def save(self, data, *, message_start=0):

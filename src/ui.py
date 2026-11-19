@@ -95,6 +95,9 @@ window.lopaca-main, .transcript-scroll, .transcript {
     caret-color: transparent;
     -gtk-secondary-caret-color: transparent;
 }
+.chat-prose {
+    line-height: 1.4em;
+}
 .user-message {
     background-color: alpha(@accent_bg_color,0.4);
 }
@@ -253,6 +256,12 @@ class ChatWindow(Adw.ApplicationWindow):
         self.current_wrapper = self.current_answer = self.current_thinking = None
         self.context_capacity = self.context_used = self.tokens_per_second = None
         self._review_pending = False
+        self._earlier_prose = None
+        self._history_start = 0
+        self._prepend_upper = None
+        self._history_load_id = None
+        self._stream_lock = threading.Lock()
+        self._incoming_stream = {}
         self._stream_updates = {}
         self._date_display = None
         self._stream_update_id = None
@@ -293,7 +302,11 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def _apply_css(self):
         provider = Gtk.CssProvider()
-        provider.load_from_string(CSS)
+        # Resolve the relative font size first, then align baselines to pixels.
+        css = CSS
+        if Gtk.check_version(4, 16, 0) is None:
+            css = css.replace("line-height: 1.4em", "line-height: round(1.4em, 1px)")
+        provider.load_from_string(css)
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
@@ -561,12 +574,40 @@ class ChatWindow(Adw.ApplicationWindow):
             self._show_alert("Could not save thinking setting", str(exc))
 
     def dispatch(self, callback, *args):
-        if callback in (self.update_answer, self.controller._update_inference_stats):
-            GLib.idle_add(self._queue_stream_update, callback, args)
+        if callback in (
+            self.update_answer,
+            self.update_thinking,
+            self.controller._update_inference_stats,
+        ):
+            # Coalesce before crossing into GTK. A fast server otherwise queues
+            # one idle callback (and a full answer snapshot) per token.
+            with self._stream_lock:
+                if not self._incoming_stream:
+                    GLib.idle_add(self._drain_stream)
+                previous = self._incoming_stream.get(callback)
+                if callback == self.update_thinking:
+                    self._incoming_stream.setdefault(callback, []).append(args[0])
+                elif callback == self.controller._update_inference_stats and previous:
+                    self._incoming_stream[callback] = tuple(
+                        new if new is not None else old
+                        for new, old in zip(args, previous, strict=True)
+                    )
+                else:
+                    self._incoming_stream[callback] = args
         elif callback == self.controller.finish_response:
             GLib.idle_add(self._finish_stream_update, callback, args)
         else:
             GLib.idle_add(callback, *args)
+
+    def _drain_stream(self):
+        with self._stream_lock:
+            incoming, self._incoming_stream = self._incoming_stream, {}
+        for callback, args in incoming.items():
+            if callback == self.update_thinking:
+                callback("".join(args))
+            else:
+                self._queue_stream_update(callback, args)
+        return False
 
     def _queue_stream_update(self, callback, args):
         if callback == self.update_answer and not self._first_answer_shown:
@@ -814,8 +855,32 @@ class ChatWindow(Adw.ApplicationWindow):
                 first.set_opacity(1)
         if not self._scroll_guard:
             self.follow_output = self._is_near_bottom(adjustment)
+            self._schedule_older_history(adjustment)
 
-    def _adjustment_changed(self, _adjustment):
+    def _schedule_older_history(self, adjustment):
+        if (
+            self._history_load_id is None
+            and self._prepend_upper is None
+            and self._history_reveal_id is None
+            and (self._history_start or self._earlier_prose)
+            and not self.follow_output
+            and adjustment.get_value() < adjustment.get_page_size()
+        ):
+            # Keep work out of the wheel handler. Wait for GTK to lay out
+            # each prepend before considering another.
+            self._history_load_id = GLib.idle_add(
+                self._prepend_history, adjustment, priority=GLib.PRIORITY_LOW
+            )
+
+    def _adjustment_changed(self, adjustment):
+        if self._prepend_upper is not None and adjustment.get_upper() > self._prepend_upper:
+            shift = adjustment.get_upper() - self._prepend_upper
+            self._scroll_guard = True
+            adjustment.set_value(adjustment.get_value() + shift)
+            self._scroll_guard = False
+            self._prepend_upper = None
+            self._schedule_older_history(adjustment)
+            return
         self.scroll_bottom()
 
     def show_chat(self, chat, folder):
@@ -1059,19 +1124,26 @@ class ChatWindow(Adw.ApplicationWindow):
         return self.controller.move_chat(chat_id, row.chat_id, after) if row is not None else False
 
     def render_history(self, messages):
+        if self._history_load_id is not None:
+            GLib.source_remove(self._history_load_id)
+            self._history_load_id = None
         if self._history_reveal_id is not None:
             self.transcript_scroll.remove_tick_callback(self._history_reveal_id)
         self.transcript_scroll.set_opacity(0)
         while (child := self.transcript.get_first_child()) is not None:
             self.transcript.remove(child)
-        for message in messages:
-            self.append_message(
-                message.get("role"),
-                message.get("content", ""),
-                message.get("reasoning_content", ""),
-                message["timestamp"],
-                refresh_dates=False,
-            )
+        # A handful of very long replies can exceed a screenful many times over.
+        self._history_start = len(messages)
+        chars = 0
+        for message in reversed(messages[-32:]):
+            self._history_start -= 1
+            chars += len(message.get("content", ""))
+            if chars >= 6000:
+                break
+        self._prepend_upper = None
+        self._earlier_prose = None
+        for index, message in enumerate(messages[self._history_start :]):
+            self._append_history_message(message, attach=True, page_prose=index == 0)
         self._refresh_message_dates()
         first = self.transcript.get_first_child()
         if first is not None:
@@ -1092,6 +1164,75 @@ class ChatWindow(Adw.ApplicationWindow):
 
         # Allow layout and its deferred scroll update before exposing the rebuilt viewport.
         self._history_reveal_id = self.transcript_scroll.add_tick_callback(reveal)
+
+    def _prepend_history(self, adjustment):
+        self._history_load_id = None
+        if self.follow_output or adjustment.get_value() >= adjustment.get_page_size():
+            return False
+        # Keep the current rows in place on screen when older rows gain height.
+        self._prepend_upper = adjustment.get_upper()
+        if self._earlier_prose is not None:
+            grew = next(self._earlier_prose, None)
+            if grew is not None:
+                if not grew:
+                    self._prepend_upper = None
+                    self._schedule_older_history(adjustment)
+                return False
+            self._earlier_prose = None
+        if not self._history_start:
+            self._prepend_upper = None
+            return False
+        self._history_start -= 1
+        message = self.chat["messages"][self._history_start]
+        timestamp = message["timestamp"]
+        day = datetime.fromtimestamp(timestamp).date()
+        header = self.transcript.get_first_child()
+        if header.message_date != day:
+            header = self._message_day_label(day)
+            self.transcript.prepend(header)
+        wrapper = self._append_history_message(message, attach=False, page_prose=True)
+        self.transcript.insert_child_after(wrapper.message_row, header)
+        return False
+
+    def _append_history_message(self, message, *, attach, page_prose):
+        role = message.get("role")
+        text = message.get("content", "")
+        earlier = ""
+        if page_prose and role == "assistant" and len(text) > 16000:
+            text = self.controller.visible_answer(text)
+            # Fences, notes and reference definitions can affect later paragraphs.
+            if not re.search(r"[`~<>]|^ {0,3}\[.+?\]:|^ {4}|^\t", text, re.MULTILINE):
+                split = text.rfind("\n\n", 0, len(text) - 2000)
+                if split > 0:
+                    earlier, text = text[:split], text[split + 2 :]
+        wrapper = self.append_message(
+            role,
+            text,
+            message.get("reasoning_content", ""),
+            message["timestamp"],
+            refresh_dates=False,
+            attach=attach,
+        )
+        if earlier:
+            self._earlier_prose = self._older_prose_sections(wrapper, earlier)
+        return wrapper
+
+    @staticmethod
+    def _older_prose_sections(wrapper, text):
+        first_body = wrapper.get_first_child().get_next_sibling()
+        if first_body.has_css_class("thinking"):
+            first_body = first_body.get_next_sibling()
+        after = first_body.get_prev_sibling()
+        # Reveal from the nearest paragraph backwards. A large plain paragraph
+        # prepares natural line breaks before adding its labels individually.
+        for paragraph in reversed(text.split("\n\n")):
+            if not paragraph.strip():
+                continue
+            section = MarkdownText()
+            for grew in section.prepend_prose(paragraph, first_body.get_width()):
+                if grew and section.get_parent() is None:
+                    wrapper.insert_child_after(section, after)
+                yield grew
 
     def _refresh_message_dates(self):
         now = datetime.now()
@@ -1119,13 +1260,18 @@ class ChatWindow(Adw.ApplicationWindow):
         if previous is None or datetime.fromtimestamp(previous.timestamp).date() != day:
             if previous is not None:
                 self.transcript.get_first_child().set_opacity(1)
-            separator = Gtk.Label(label=message_day(day))
-            separator.message_date = day
-            separator.add_css_class("muted")
-            separator.set_margin_top(12)
-            separator.set_margin_bottom(2 + separator.get_layout().get_pixel_size()[1])
+            separator = self._message_day_label(day)
             separator.set_opacity(0 if previous is None else 1)
             self.transcript.append(separator)
+
+    @staticmethod
+    def _message_day_label(day):
+        separator = Gtk.Label(label=message_day(day))
+        separator.message_date = day
+        separator.add_css_class("muted")
+        separator.set_margin_top(12)
+        separator.set_margin_bottom(2 + separator.get_layout().get_pixel_size()[1])
+        return separator
 
     def append_message(
         self, role, text, reasoning="", timestamp=None, *, refresh_dates=True, attach=True
@@ -1183,7 +1329,9 @@ class ChatWindow(Adw.ApplicationWindow):
         header_button.set_child(content)
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         body.thinking_arrow = arrow
-        self._set_thinking_body(body, text)
+        body.saved_text = text if completed else None
+        if not completed:
+            self._set_thinking_body(body, text)
         body.set_visible(not completed)
         header_button.connect("clicked", lambda _button: self._toggle_thinking(body))
         box.append(header_button)
@@ -1196,6 +1344,9 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def _toggle_thinking(self, body):
         self.follow_output = False
+        if body.saved_text is not None:
+            self._set_thinking_body(body, body.saved_text)
+            body.saved_text = None
         body.set_visible(not body.get_visible())
         body.thinking_arrow.set_text("▾" if body.get_visible() else "▸")
 
@@ -1209,6 +1360,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
                 label.set_max_width_chars(90)
                 label.set_selectable(True)
+                label.add_css_class("chat-prose")
                 body.append(label)
                 body.tail_label = label
             if len(remaining) <= 2000:
@@ -1219,7 +1371,7 @@ class ChatWindow(Adw.ApplicationWindow):
             if boundary < 0:
                 boundary = remaining.rfind(" ", 1000, 2000)
             boundary = boundary + 1 if boundary >= 0 else 2000
-            body.tail_label.set_text(remaining[:boundary])
+            body.tail_label.set_text(remaining[:boundary].removesuffix("\n"))
             remaining = remaining[boundary:]
             body.tail_label = None
             body.tail_text = ""
@@ -1243,7 +1395,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.current_wrapper = self.append_message(
             "assistant", "", timestamp=timestamp, attach=chat_id == self.chat["id"]
         )
-        self.current_answer = MarkdownText()
+        self.current_answer = MarkdownText(streaming=True)
         self.current_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.current_content.append(self.current_answer)
         self.current_wrapper.append(self.current_content)
@@ -1364,7 +1516,10 @@ class ChatWindow(Adw.ApplicationWindow):
         )
         if self.current_thinking:
             self._collapse_thinking()
-            self._set_thinking_body(self.current_thinking, reasoning.strip())
+            if self.current_thinking.get_visible():
+                self._set_thinking_body(self.current_thinking, reasoning.strip())
+            else:
+                self.current_thinking.saved_text = reasoning.strip()
         if not visible or day_changed:
             self.render_history(self.chat["messages"])
         return self.end_response()
