@@ -362,10 +362,18 @@ class ChatController:
                 ),
                 *self._history_messages(history, settings),
             ]
+            thinking = self.thinking_parameters(chat_id, settings=settings)
+            if thinking is None:
+                # Effort can change the very first template tokens. Use the last
+                # Auto choice only for warming; classify the actual question at Send.
+                hint = chat.get("inference_stats", {}).get("last_auto_choice")
+                options = auto_thinking_options(self._thinking_levels)
+                if isinstance(hint, str) and hint in options:
+                    thinking = thinking_parameters(options[hint])
             LlamaClient(self.settings).warm_chat(
                 messages,
                 settings["preserve_reasoning"] is True,
-                self.thinking_parameters(chat_id, settings=settings),
+                thinking,
                 chat_tools(files=True, memories=memories),
                 capacity,
                 self._model_lock,
@@ -1096,6 +1104,12 @@ class ChatController:
         )
         if request_seeds:
             chat["messages"][-1]["request_seeds"] = request_seeds
+        if (
+            not interrupted
+            and self._generation_thinking is None
+            and (choice := self.client.last_auto_choice)
+        ):
+            chat.setdefault("inference_stats", {})["last_auto_choice"] = choice
         if clarification and answer.strip():
             chat["messages"][-1]["memory_clarification"] = True
         if self._generation_memory_review is not None:

@@ -362,7 +362,6 @@ class HistoryIndex:
             ).fetchone()
             if not available:
                 return ""
-            expansion = expand(query) if expand else ""
             subject = re.sub(
                 r"(?<![\w./])(?:" + "|".join(sorted(_HISTORY_STOP_WORDS)) + r")(?![\w./])",
                 " ",
@@ -371,6 +370,7 @@ class HistoryIndex:
             )
             if not _terms(subject):
                 return ""
+            expansion = expand(query) if expand else ""
             hits = _rank(
                 db,
                 subject,
