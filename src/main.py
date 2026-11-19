@@ -723,7 +723,9 @@ class ChatController:
             nonlocal expansion
             if expansion is None:
                 expansion = ""  # A failed/cancelled expansion is not retried for memories.
-                expansion = self.client.expand_query(search_query, history)
+                expansion = self.client.expand_query(
+                    search_query, history, stopped=lambda: self.stop_requested
+                )
             return expansion
 
         expand_query = expand if query_expansion else None

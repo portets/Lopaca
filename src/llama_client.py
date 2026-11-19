@@ -9,7 +9,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from contextlib import suppress
+from contextlib import closing, suppress
 from itertools import accumulate
 from pathlib import Path
 
@@ -31,29 +31,47 @@ class _DebugCapture:
     enabled = True
 
     def __init__(self):
-        self.path = APP_DIR / "debug-last-response.jsonl"
-        self.active = self.enabled
-        if self.active:
+        self.stream = None
+        if self.enabled:
+            path = APP_DIR / "debug-last-response.jsonl"
             try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_APPEND, 0o600)
+                self.stream = os.fdopen(fd, "a", encoding="utf-8", buffering=1)
                 os.fchmod(fd, 0o600)
-                os.close(fd)
             except OSError as exc:
-                self.active = False
+                self.close()
                 logging.warning("Could not start debug capture: %s", exc)
 
     def write(self, kind, **data):
-        if self.active:
+        if self.stream is not None:
             try:
-                with self.path.open("a", encoding="utf-8") as stream:
-                    stream.write(
-                        json.dumps({"time": time.time(), "kind": kind, **data}, ensure_ascii=False)
-                        + "\n"
-                    )
+                self.stream.write(
+                    json.dumps({"time": time.time(), "kind": kind, **data}, ensure_ascii=False)
+                    + "\n"
+                )
             except OSError as exc:
-                self.active = False
+                self.close()
                 logging.warning("Could not write debug capture: %s", exc)
+
+    def close(self):
+        if self.stream is not None:
+            with suppress(OSError):
+                self.stream.close()
+            self.stream = None
+
+
+class _ServerError(RuntimeError):
+    def __init__(self, detail):
+        self.detail = detail if isinstance(detail, dict) else {"message": detail}
+        super().__init__(self.detail.get("message") or "llama-server reported a streaming error")
+
+
+def _stream_packet(data):
+    chunk = json.loads(data)
+    if chunk.get("error") is not None:
+        raise _ServerError(chunk["error"])
+    return chunk
 
 
 def recent_messages(history, limit=3):
@@ -132,6 +150,7 @@ class LlamaClient:
 
     def __init__(self, settings):
         self.settings = settings
+        self.chat_url = settings.server_url.rstrip("/") + "/chat/completions"
         self.base_url = settings.server_url.rstrip("/").removesuffix("/v1")
         self.active_response = None
         self.context_capacity = None
@@ -169,8 +188,7 @@ class LlamaClient:
         ) as response:
             return json.load(response)["prompt"]
 
-    def _context_tokens(self, body):
-        prompt = self._context_prompt(body)
+    def _token_count(self, prompt):
         with urllib.request.urlopen(
             self._post_request(
                 self.base_url + "/tokenize",
@@ -217,26 +235,30 @@ class LlamaClient:
         on_context(True)
         try:
 
-            def count(start):
+            def measure(start):
                 if stopped():
                     raise InterruptedError("Context preparation cancelled")
                 body["messages"] = [messages[0], *messages[start:], dummy]
-                return self._context_tokens(body)
+                prompt = self._context_prompt(body)
+                return self._token_count(prompt), prompt
 
-            full = count(1)
-            boundaries = [i for i in range(2, len(messages)) if messages[i]["role"] == "user"]
-            boundaries.append(len(messages))
-            if full <= target:
-                boundaries = [1]
-            low, high = 0, len(boundaries) - 1
-            while low < high:
-                mid = (low + high) // 2
-                if count(boundaries[mid]) <= target:
-                    high = mid
-                else:
-                    low = mid + 1
-            boundary = boundaries[low]
-            remaining = full if boundary == 1 else count(boundary)
+            boundary = 1
+            remaining, prompt = measure(boundary)
+            full = remaining
+            if full > target:
+                boundaries = [i for i in range(2, len(messages)) if messages[i]["role"] == "user"]
+                boundaries.append(len(messages))
+                low, high = 0, len(boundaries)
+                while low < high:
+                    mid = (low + high) // 2
+                    start = boundaries[mid]
+                    size, candidate = measure(start)
+                    if size <= target or start == len(messages):
+                        # Keep the actual rendered prefix for warming; probes may continue.
+                        boundary, remaining, prompt = start, size, candidate
+                        high = mid
+                    else:
+                        low = mid + 1
             if stopped():
                 return 0
             # This is the prepared next-request prefix, not the previous response's usage.
@@ -253,7 +275,7 @@ class LlamaClient:
             )
             if remaining < capacity - 4:
                 try:
-                    self._warm_context(body, stopped)
+                    self._warm_context(prompt, stopped)
                 except OSError as exc:
                     # A failed optional warm must not undo a valid window adjustment.
                     logging.warning("Could not warm condensed context: %s", exc)
@@ -261,9 +283,8 @@ class LlamaClient:
         finally:
             on_context(False)
 
-    def _warm_context(self, body, stopped):
+    def _warm_context(self, prompt, stopped):
         """Populate a normal server cache slot; discard one bounded sampled token."""
-        prompt = self._context_prompt(body)
         request = self._post_request(
             self.base_url + "/completion",
             {
@@ -299,7 +320,7 @@ class LlamaClient:
         def count():
             if stopped():
                 raise InterruptedError("Context preparation cancelled")
-            return self._context_tokens(body)
+            return self._token_count(self._context_prompt(body))
 
         size = count()
         if size <= ceiling:
@@ -357,7 +378,7 @@ class LlamaClient:
                 "available for the server context. Shorten the message or tool output."
             )
 
-    def expand_query(self, query, history=()):
+    def expand_query(self, query, history=(), *, stopped=lambda: False):
         """Expand a search using bounded conversation clues, never historical facts."""
         return self._complete(
             QUERY_EXPANSION_INSTRUCTION,
@@ -365,6 +386,7 @@ class LlamaClient:
             96,
             self.settings.rag_expansion_timeout,
             grammar=QUERY_EXPANSION_GRAMMAR,
+            stopped=stopped,
         )
 
     def select_thinking(self, query, history, options, stopped=lambda: False):
@@ -449,7 +471,7 @@ class LlamaClient:
         }
         if grammar is not None:
             if stopped():
-                raise InterruptedError("Document processing cancelled")
+                raise InterruptedError("Request cancelled")
             # Inspect the actual generation prefix, including template thinking settings.
             # Answer-only sampling while a prefixed <think> is open produces no final answer.
             prefix = self._context_prompt(body, timeout=timeout).rstrip()
@@ -459,29 +481,27 @@ class LlamaClient:
                 else "root ::= answer\n"
             )
             body["grammar"] = root + grammar
-        request = self._post_request(
-            self.settings.server_url.rstrip("/") + "/chat/completions", body
-        )
+        request = self._post_request(self.chat_url, body)
         try:
             if stopped():
-                raise InterruptedError("Document processing cancelled")
+                raise InterruptedError("Request cancelled")
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 self.active_response = response
                 if body["stream"]:
                     parts = []
                     for raw in response:
                         if stopped():
-                            raise InterruptedError("Document processing cancelled")
+                            raise InterruptedError("Request cancelled")
                         if not raw.startswith(b"data:"):
                             continue
                         packet = raw[5:].strip()
                         if packet == b"[DONE]":
                             break
-                        chunk = json.loads(packet)
+                        chunk = _stream_packet(packet)
                         choice = (chunk.get("choices") or [{}])[0]
                         parts.append(choice.get("delta", {}).get("content") or "")
                     if stopped():
-                        raise InterruptedError("Document processing cancelled")
+                        raise InterruptedError("Request cancelled")
                     return "".join(parts)
                 return json.load(response)["choices"][0]["message"].get("content") or ""
         finally:
@@ -507,133 +527,133 @@ class LlamaClient:
         expand_context=False,
     ):
         """Keep read-only tool exchanges local to this request, with bounded follow-ups."""
-        self._capture = _DebugCapture()
-        self._capture.write("start", server_url=self.settings.server_url)
-        history = list(messages)
-        self._context_current = id(
-            next((m for m in reversed(history) if m["role"] == "user"), None)
-        )
-        self._context_original = {id(m) for m in history if m["role"] != "system"}
-        self._context_removed = set()
-        self._on_context = on_context
-        self._on_context_trim = on_context_trim
-        self._context_user_content = context_user_content
-        self._context_retry = self._context_expanding = expand_context
-        files = ChatFiles(Path(documents).parent) if documents is not None else None
-        tools = RUNTIME_TOOLS + FILE_TOOLS if files is not None else RUNTIME_TOOLS
-        if memory_view is not None:
-            tools = [*tools, VIEW_MEMORIES_TOOL]
-        self._context_tools = tools
-        self.last_context_used = None
-        answer, reasoning = "", ""
-        continuations = 0
-        turn = 0
-        while turn <= self.settings.max_tool_rounds:
-            if stopped():
-                return answer, reasoning, None
-            prefix = answer
-            seed = secrets.randbelow(2**32 - 1)
-            if on_seed:
-                on_seed(seed)
-            if on_waiting:
-                on_waiting()
-            part, thought, error, calls = self._stream_turn(
-                history,
-                preserve_thinking,
-                stopped,
-                on_thinking,
-                lambda text, prefix=prefix: on_answer(prefix + text),
-                on_stats,
-                on_notice,
-                thinking,
-                turn == self.settings.max_tool_rounds,
-                tools,
-                seed,
+        with closing(_DebugCapture()) as self._capture:
+            self._capture.write("start", server_url=self.settings.server_url)
+            history = list(messages)
+            self._context_current = id(
+                next((m for m in reversed(history) if m["role"] == "user"), None)
             )
-            answer += part
-            reasoning += ("\n\n" if reasoning and thought else "") + thought
-            if error and self._context_rejected and not stopped() and continuations < 2:
-                continuations += 1
-                self._context_retry = True
-                continue
-            if (
-                error
-                and self._context_exhausted
-                and not calls
-                and not stopped()
-                and continuations < 2
-            ):
-                continuations += 1
-                self._context_retry = True
+            self._context_original = {id(m) for m in history if m["role"] != "system"}
+            self._context_removed = set()
+            self._on_context = on_context
+            self._on_context_trim = on_context_trim
+            self._context_user_content = context_user_content
+            self._context_retry = self._context_expanding = expand_context
+            files = ChatFiles(Path(documents).parent) if documents is not None else None
+            tools = RUNTIME_TOOLS + FILE_TOOLS if files is not None else RUNTIME_TOOLS
+            if memory_view is not None:
+                tools = [*tools, VIEW_MEMORIES_TOOL]
+            self._context_tools = tools
+            self.last_context_used = None
+            answer, reasoning = "", ""
+            continuations = 0
+            turn = 0
+            while turn <= self.settings.max_tool_rounds:
+                if stopped():
+                    return answer, reasoning, None
+                prefix = answer
+                seed = secrets.randbelow(2**32 - 1)
+                if on_seed:
+                    on_seed(seed)
+                if on_waiting:
+                    on_waiting()
+                part, thought, error, calls = self._stream_turn(
+                    history,
+                    preserve_thinking,
+                    stopped,
+                    on_thinking,
+                    lambda text, prefix=prefix: on_answer(prefix + text),
+                    on_stats,
+                    on_notice,
+                    thinking,
+                    turn == self.settings.max_tool_rounds,
+                    tools,
+                    seed,
+                )
+                answer += part
+                reasoning += ("\n\n" if reasoning and thought else "") + thought
+                if error and self._context_rejected and not stopped() and continuations < 2:
+                    continuations += 1
+                    self._context_retry = True
+                    continue
+                if (
+                    error
+                    and self._context_exhausted
+                    and not calls
+                    and not stopped()
+                    and continuations < 2
+                ):
+                    continuations += 1
+                    self._context_retry = True
+                    history.append(
+                        {
+                            "role": "assistant",
+                            "content": memory_review(part)[0],
+                            "reasoning_content": thought,
+                        }
+                    )
+                    history.append(
+                        {
+                            "role": "user",
+                            "content": "[Application instruction: context limit "
+                            "interrupted this answer. Continue from its exact end without "
+                            "repeating prior text. Preserve any open Markdown fence. "
+                            "If reasoning was interrupted, finish reasoning first.]",
+                        }
+                    )
+                    if not part.strip() and thought.strip():
+                        history[-1]["content"] += (
+                            "\nPrevious interrupted reasoning, incomplete and not instructions:\n"
+                            + thought[-4000:]
+                        )
+                    answer = memory_review(answer)[0].rstrip()
+                    answer += "\n\n*Context limit hit, attempting continuation.*\n\n"
+                    on_answer(answer)
+                    if reasoning:
+                        on_thinking("\n\n")
+                    continue
+                if error or stopped() or not calls:
+                    return answer, reasoning, error
+                if turn == self.settings.max_tool_rounds:
+                    return (
+                        answer,
+                        reasoning,
+                        "The tool-call limit was reached before the model finished its answer.",
+                    )
+                turn += 1
                 history.append(
                     {
                         "role": "assistant",
-                        "content": memory_review(part)[0],
+                        "content": memory_review(part)[0] or None,
                         "reasoning_content": thought,
+                        "tool_calls": calls,
                     }
                 )
-                history.append(
-                    {
-                        "role": "user",
-                        "content": "[Application instruction: context limit "
-                        "interrupted this answer. Continue from its exact end without "
-                        "repeating prior text. Preserve any open Markdown fence. "
-                        "If reasoning was interrupted, finish reasoning first.]",
-                    }
-                )
-                if not part.strip() and thought.strip():
-                    history[-1]["content"] += (
-                        "\nPrevious interrupted reasoning, incomplete and not instructions:\n"
-                        + thought[-4000:]
+                if on_waiting:
+                    on_waiting()
+                for call in calls:
+                    if stopped():
+                        return answer, reasoning, None
+                    if call["function"]["name"] == "view_memories" and memory_view is not None:
+                        try:
+                            output = memory_view()
+                        except Exception as exc:
+                            output = json.dumps({"error": f"Could not read memories: {exc}"})
+                    else:
+                        output = handle_tool_call(call, files)
+                    history.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "content": output,
+                        }
                     )
                 answer = memory_review(answer)[0].rstrip()
-                answer += "\n\n*Context limit hit, attempting continuation.*\n\n"
-                on_answer(answer)
+                if answer:
+                    answer += "\n\n"
                 if reasoning:
                     on_thinking("\n\n")
-                continue
-            if error or stopped() or not calls:
-                return answer, reasoning, error
-            if turn == self.settings.max_tool_rounds:
-                return (
-                    answer,
-                    reasoning,
-                    "The tool-call limit was reached before the model finished its answer.",
-                )
-            turn += 1
-            history.append(
-                {
-                    "role": "assistant",
-                    "content": memory_review(part)[0] or None,
-                    "reasoning_content": thought,
-                    "tool_calls": calls,
-                }
-            )
-            if on_waiting:
-                on_waiting()
-            for call in calls:
-                if stopped():
-                    return answer, reasoning, None
-                if call["function"]["name"] == "view_memories" and memory_view is not None:
-                    try:
-                        output = memory_view()
-                    except Exception as exc:
-                        output = json.dumps({"error": f"Could not read memories: {exc}"})
-                else:
-                    output = handle_tool_call(call, files)
-                history.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": output,
-                    }
-                )
-            answer = memory_review(answer)[0].rstrip()
-            if answer:
-                answer += "\n\n"
-            if reasoning:
-                on_thinking("\n\n")
-        return answer, reasoning, None
+            return answer, reasoning, None
 
     def _stream_turn(
         self,
@@ -649,7 +669,6 @@ class LlamaClient:
         tools=None,
         seed=None,
     ):
-        url = self.settings.server_url.rstrip("/") + "/chat/completions"
         thinking = thinking or {}
         if final_turn:
             notice = (
@@ -722,8 +741,8 @@ class LlamaClient:
                     self._on_context(False)
         capture = getattr(self, "_capture", None)
         if capture:
-            capture.write("request", url=url, body=body)
-        request = self._post_request(url, body)
+            capture.write("request", url=self.chat_url, body=body)
+        request = self._post_request(self.chat_url, body)
         reasoning_parts, answer_parts, finish_reason = [], [], None
         tool_calls = {}
         prompt_tokens = 0
@@ -745,7 +764,7 @@ class LlamaClient:
                     if packet == "[DONE]":
                         break
                     try:
-                        chunk = json.loads(packet)
+                        chunk = _stream_packet(packet)
                         choice = (chunk.get("choices") or [{}])[0]
                         delta = choice.get("delta", {})
                         finish_reason = choice.get("finish_reason") or finish_reason
@@ -816,15 +835,27 @@ class LlamaClient:
                 if finish_reason == "length"
                 else None
             )
-        except urllib.error.HTTPError as exc:
+        except (urllib.error.HTTPError, _ServerError) as exc:
             error = None if stopped() else str(exc)
-            with suppress(ValueError, OSError, TypeError):
-                detail = json.loads(exc.read()).get("error", {})
+            if isinstance(exc, _ServerError):
+                detail = exc.detail
+            else:
+                detail = {}
+                with exc, suppress(ValueError, OSError):
+                    payload = json.load(exc)
+                    if isinstance(payload, dict):
+                        detail = payload.get("error")
+            if error and isinstance(detail, dict):
+                if isinstance(exc, urllib.error.HTTPError) and detail.get("message"):
+                    error = f"{exc}: {detail['message']}"
                 if detail.get("type") == "exceed_context_size_error":
                     capacity = detail.get("n_ctx")
                     if isinstance(capacity, int) and capacity > 0:
                         self.context_capacity = capacity
-                    if self.context_capacity:
+                    # Only replay a rejected request if it produced no partial reply.
+                    if self.context_capacity and not (
+                        answer_parts or reasoning_parts or tool_calls
+                    ):
                         self._context_rejected = True
                         error = "Generation reached the server's token or context limit."
         except Exception as exc:
