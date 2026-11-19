@@ -14,7 +14,7 @@ from itertools import accumulate
 from pathlib import Path
 
 from agentic import FILE_TOOLS, RUNTIME_TOOLS, ChatFiles, handle_tool_call
-from memory import VIEW_MEMORIES_TOOL, memory_review
+from memory import VIEW_MEMORIES_TOOL, _fence_after, memory_review
 from rag import (
     DOCUMENT_QUESTIONS_INSTRUCTION,
     QUERY_EXPANSION_GRAMMAR,
@@ -23,6 +23,44 @@ from rag import (
     parse_document_questions,
 )
 from settings import APP_DIR
+
+_MALFORMED_TOOL_NOTE = "*Model made a malformed tool call.*"
+
+
+def _tool_call_text(text):
+    """Hide leaked tool syntax, including partial openers, outside Markdown fences."""
+    markers = ("<tool_call>", "<function=", "<|tool_call|>")
+    fence = None
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        candidate = line.lstrip(" ").rstrip()
+        if fence is None and len(line) - len(line.lstrip(" ")) <= 3:
+            if any(candidate.startswith(marker) for marker in markers):
+                return memory_review(text[:offset])[0] + "\n\n" + _MALFORMED_TOOL_NOTE, True
+            if candidate and any(marker.startswith(candidate) for marker in markers):
+                return text[:offset].rstrip(), False
+        fence = _fence_after(line, fence)
+        offset += len(line)
+    return text, False
+
+
+def _valid_tool_calls(calls, tools):
+    schemas = {tool["function"]["name"]: tool["function"]["parameters"] for tool in tools}
+    for call in calls:
+        try:
+            function = call["function"]
+            schema = schemas[function["name"]]
+            arguments = json.loads(function["arguments"] or "{}")
+            if (
+                not call["id"]
+                or not isinstance(arguments, dict)
+                or not set(schema.get("required", ())) <= arguments.keys()
+                or not arguments.keys() <= schema.get("properties", {}).keys()
+            ):
+                return False
+        except (KeyError, TypeError, ValueError):
+            return False
+    return True
 
 
 # Temporary diagnostics: delete this class and its capture hooks to remove capture.
@@ -615,7 +653,7 @@ class LlamaClient:
                     preserve_thinking,
                     stopped,
                     on_thinking,
-                    lambda text, prefix=prefix: on_answer(prefix + text),
+                    lambda text, prefix=prefix: on_answer(prefix + _tool_call_text(text)[0]),
                     on_stats,
                     on_notice,
                     thinking,
@@ -623,8 +661,15 @@ class LlamaClient:
                     tools,
                     seed,
                 )
+                part, malformed = _tool_call_text(part)
                 answer += part
                 reasoning += ("\n\n" if reasoning and thought else "") + thought
+                if malformed:
+                    return answer, reasoning, error
+                if not error and not stopped() and not _valid_tool_calls(calls, tools):
+                    answer = memory_review(answer)[0].rstrip() + "\n\n" + _MALFORMED_TOOL_NOTE
+                    on_answer(answer)
+                    return answer, reasoning, None
                 if error and self._context_rejected and not stopped() and continuations < 2:
                     continuations += 1
                     self._context_retry = True

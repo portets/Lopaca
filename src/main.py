@@ -1116,7 +1116,7 @@ class ChatController:
         steering = self._steering_pending
         self._steering_pending = False
         interrupted = not getattr(self, "_generation_answer_complete", False)
-        if steering and interrupted:
+        if (steering or self.stop_requested) and interrupted:
             phase = "Response" if answer.strip() else "Thinking" if reasoning.strip() else "Request"
             answer = answer.rstrip() + f"\n\n*{phase} interrupted by user.*"
             error = None
