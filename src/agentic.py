@@ -19,7 +19,7 @@ from functools import cache
 from pathlib import Path, PurePosixPath
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from rag import read_document_stream
+from rag import numbered_excerpt, read_document_stream
 
 _COMMAND_BLOCK_PATTERN = re.compile(r"```(?:bash|sh|shell)\s*\n(.*?)```", re.IGNORECASE | re.DOTALL)
 
@@ -101,8 +101,7 @@ def get_datetime():
     if "TZ" not in os.environ:
         with suppress(OSError, ValueError):
             zone = str(Path("/etc/localtime").resolve().relative_to("/usr/share/zoneinfo"))
-    if zone.startswith("/usr/share/zoneinfo/"):
-        zone = zone.removeprefix("/usr/share/zoneinfo/")
+    zone = zone.removeprefix("/usr/share/zoneinfo/")
     if zone:
         try:
             now = now.astimezone(ZoneInfo(zone))
@@ -119,8 +118,8 @@ def get_datetime():
 FILE_TOOLS = [
     _tool(
         "read_file",
-        "Read source lines in the current chat's documents/ and projects/ folders, or "
-        "a knowledge/... article path, or archived earlier chat messages at "
+        "Read source lines in the current chat's documents/ and projects/ folders, "
+        "or a knowledge/... article path, or archived earlier chat messages at "
         "history/transcript.txt and history/message-N.txt (N is a 1-based message number). "
         "Use documents/py65/memory.py or projects/example.py. Unprefixed paths use projects/. "
         "Returns numbered lines and truncation/continuation information. No writes.",
@@ -133,19 +132,17 @@ FILE_TOOLS = [
     ),
     _tool(
         "search_files",
-        "Search the current chat's documents/ and projects/, and installed knowledge packs. "
-        "Knowledge search uses lexical ranking and requires a nonempty query; "
-        "use pattern knowledge/** to search only packs. "
-        "Knowledge results are article paths and excerpts usable with read_file. "
-        "Search all sources unless a known path identifies one. Returned paths "
-        "include that prefix and can be passed directly to read_file. "
-        "Search both folders unless the request or a known file path identifies the relevant "
-        "folder; do not narrow the search based on a guess. "
-        "pattern is an optional relative file glob: **/*.py searches all subfolders, "
-        "folder/** lists files recursively under folder; folder/*.py searches only that level. "
-        "An empty query lists paths. "
-        "Otherwise searches filenames and text, returning numbered matches. No shell or regex. "
-        "Read a known path directly instead of searching again.",
+        "Search the current chat's documents/ and projects/, and installed knowledge "
+        "packs. Knowledge search uses lexical ranking and requires a nonempty query; "
+        "use pattern knowledge/** to search only packs. Knowledge results are article "
+        "paths and excerpts usable with read_file. Search all sources unless a known "
+        "path identifies one. Returned paths include that prefix and can be passed "
+        "directly to read_file. Search both folders unless the request or a known file "
+        "path identifies the relevant folder; do not narrow the search based on a guess. "
+        "pattern is an optional relative file glob: **/*.py searches all subfolders, folder/** "
+        "lists files recursively under folder; folder/*.py searches only that level. An "
+        "empty query lists paths. Otherwise searches filenames and text, returning numbered "
+        "matches. No shell or regex. Read a known path directly instead of searching again.",
         {
             "query": {"type": "string"},
             "pattern": {"type": "string"},
@@ -166,25 +163,7 @@ def _line_excerpt(path, lines, start_line, line_count):
         raise ValueError("Line numbers/counts must be positive integers.")
     if start_line > len(lines) + 1:
         raise ValueError(f"File has {len(lines)} lines.")
-    selected, chars = [], 0
-    for number in range(start_line, min(len(lines) + 1, start_line + min(line_count, 160))):
-        line = f"{number}: {lines[number - 1]}"
-        if chars + len(line) > 10000:
-            if not selected:
-                raise ValueError("Source line exceeds the 10,000-character output limit.")
-            break
-        selected.append(line)
-        chars += len(line)
-    end = start_line + len(selected) - 1
-    return {
-        "path": path,
-        "start_line": start_line,
-        "end_line": end,
-        "total_lines": len(lines),
-        "text": "\n".join(selected),
-        "truncated": end < len(lines),
-        "next_line": end + 1 if end < len(lines) else None,
-    }
+    return numbered_excerpt(path, lines, start_line, line_count)
 
 
 class DocumentFiles:
@@ -278,10 +257,10 @@ class DocumentFiles:
         }
         if not matches:
             result["hint"] = (
-                "No matches for this query/pattern combination. "
-                "Patterns match files, not directories. "
-                "Use **/* to discover paths, or folder/** to include a folder's subdirectories. "
-                "For text searches, try a shorter literal query or a broader pattern."
+                "No matches for this query/pattern combination. Patterns "
+                "match files, not directories. Use **/* to discover paths, "
+                "or folder/** to include a folder's subdirectories. For text "
+                "searches, try a shorter literal query or a broader pattern."
             )
         return result
 
@@ -292,7 +271,7 @@ class ChatFiles:
     def __init__(self, chat_folder):
         self.chat_folder = Path(chat_folder)
         self.roots = {
-            name: DocumentFiles(Path(chat_folder) / name) for name in ("projects", "documents")
+            name: DocumentFiles(self.chat_folder / name) for name in ("projects", "documents")
         }
 
     def read_file(self, path, start_line=1, line_count=100):
@@ -387,9 +366,9 @@ class ChatFiles:
         result = {"matches": matches[:20], "truncated": truncated, "files_scanned": scanned}
         if not matches:
             result["hint"] = (
-                "Use **/* to discover files in documents/ and projects/, or restrict the "
-                "pattern to documents/**, projects/** or knowledge/**. "
-                "Patterns match files, not directories."
+                "Use **/* to discover files in documents/ and projects/, "
+                "or restrict the pattern to documents/**, projects/** "
+                "or knowledge/**. Patterns match files, not directories."
             )
         return result
 

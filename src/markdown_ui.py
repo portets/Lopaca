@@ -17,7 +17,8 @@ CODE_BLOCK_PATTERN = re.compile(
 
 
 _INLINE = re.compile(
-    r"(?P<math>\\\(.{1,500}?\\\)|\\\[.{1,500}?\\\]|\$\$(?!\s).{1,500}?\$\$|(?<!\$)\$(?![\s$])[^$\n]{1,500}?(?<!\s)\$(?!\$))"
+    r"(?P<math>\\\(.{1,500}?\\\)|\\\[.{1,500}?\\\]"
+    r"|\$\$(?!\s).{1,500}?\$\$|(?<!\$)\$(?![\s$])[^$\n]{1,500}?(?<!\s)\$(?!\$))"
     r"|\\([!\"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])"
     r"|(`+)(.+?)\3"
     r'|!?\[([^\]]+)\]\(([^\s]+?)(?:\s+"[^"\n]*")?\)'
@@ -621,13 +622,17 @@ class MarkdownTable(HorizontalScrollFrame):
 class MarkdownText(Gtk.Box):
     """Share prose/table rendering between stored messages and the streaming tail."""
 
-    def __init__(self, text="", boxed=False):
+    def __init__(self, text=""):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.blocks = []
-        self.boxed = boxed
+        self._source_text = None
         self.set_text(text)
 
     def set_text(self, text):
+        # While a fenced block streams, its preceding prose often stays identical.
+        if text == self._source_text:
+            return
+        self._source_text = text
         self.anchors = {}
         text = model_references(text)
         # Treat the model's nonstandard note wrapper as a Markdown blockquote.
@@ -675,10 +680,6 @@ class MarkdownText(Gtk.Box):
                 self.blocks.append(block)
             else:
                 self.blocks[index] = block
-            if self.boxed and isinstance(child, Gtk.Label):
-                child.set_max_width_chars(500)
-                child.set_size_request(-1, -1)
-                child.set_size_request(child.measure(Gtk.Orientation.HORIZONTAL, -1)[1], -1)
             if kind == "text":
                 for name, offset in child.markdown_anchors:
                     anchor, suffix = name, 1

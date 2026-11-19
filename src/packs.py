@@ -47,7 +47,19 @@ def publishing_metadata(manifest):
 def read_manifest(db):
     row = db.execute("SELECT value FROM index_state WHERE key='pack_manifest'").fetchone()
     if row:
-        return json.loads(row[0])
+        manifest = json.loads(row[0])
+        if (
+            not isinstance(manifest.get("pack_id"), str)
+            or not manifest["pack_id"]
+            or not isinstance(manifest.get("title"), str)
+            or not isinstance(manifest.get("contains", []), list)
+            or any(
+                not isinstance(k, str) or not k or k == manifest["pack_id"]
+                for k in manifest.get("contains", [])
+            )
+        ):
+            raise ValueError("Invalid indexed pack publishing metadata.")
+        return manifest
     rows = db.execute("SELECT manifest FROM packs").fetchall()
     if len(rows) != 1:
         raise ValueError("Merged indexes require explicit pack_manifest metadata.")
@@ -141,8 +153,7 @@ def load_catalog(*, refresh=False, folder=None):
             raw = response.read(4 * 1024 * 1024 + 1)
         if len(raw) > 4 * 1024 * 1024:
             raise ValueError("Knowledge catalog is too large.")
-        data = json.loads(raw)
-        validate_catalog(data)
+        releases = validate_catalog(json.loads(raw))
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f"catalog-{uuid.uuid4().hex}.tmp")
         try:
@@ -150,9 +161,10 @@ def load_catalog(*, refresh=False, folder=None):
             temporary.replace(path)
         finally:
             temporary.unlink(missing_ok=True)
-    if not path.exists():
+    elif path.exists():
+        releases = validate_catalog(json.loads(path.read_text()))
+    else:
         return {}
-    releases = validate_catalog(json.loads(path.read_text()))
     selected = {}
     for row in sorted(releases, key=lambda r: r["release_sequence"]):
         old = selected.get(row["pack_id"])

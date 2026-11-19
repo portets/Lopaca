@@ -1386,12 +1386,12 @@ class ChatWindow(Adw.ApplicationWindow):
         alert.present(self)
 
     def _rename_chat(self, chat_id):
-        chat = self.controller.store.load(chat_id)
+        chat = self.controller.store.load_settings(chat_id)
         dialog = Adw.Dialog(title="Rename Chat", content_width=380)
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
         toolbar.add_top_bar(header)
-        entry = Gtk.Entry(text=chat.get("title", ""))
+        entry = Gtk.Entry(text=chat.get("title", "New chat"))
         entry.set_margin_top(18)
         entry.set_margin_bottom(18)
         entry.set_margin_start(18)
@@ -1834,8 +1834,7 @@ class ChatWindow(Adw.ApplicationWindow):
             "Click the pencil to edit, then the checkmark to save."
         )
         for memory_id, text, core in self.controller.list_memories():
-            row = Adw.ActionRow(title=text)
-            row.set_title_lines(0)
+            row = Adw.ActionRow(title=text, title_lines=0)
             entry = Gtk.Entry(text=text, hexpand=True, visible=False)
             row.add_prefix(entry)
             controls = Gtk.Box(spacing=6)
@@ -1844,7 +1843,7 @@ class ChatWindow(Adw.ApplicationWindow):
             edit = Gtk.Button(icon_name="document-edit-symbolic", tooltip_text="Edit memory")
             edit.add_css_class("flat")
             edit.set_valign(Gtk.Align.CENTER)
-            delete = Gtk.Button(icon_name="window-close-symbolic", tooltip_text="Delete memory")
+            delete = Gtk.Button(tooltip_text="Delete memory")
             delete.set_child(Gtk.Image(icon_name="window-close-symbolic", pixel_size=24))
             delete.add_css_class("flat")
             delete.set_valign(Gtk.Align.CENTER)
@@ -1944,6 +1943,7 @@ class ChatWindow(Adw.ApplicationWindow):
         except OSError, ValueError:
             catalog = {}
         rows = []
+        indicators = {}
         merge = Gtk.Button(
             label="Merge Installed Packs",
             tooltip_text="Reduces disk usage, REQUIRES LONG PROCESSING TIME",
@@ -1964,9 +1964,15 @@ class ChatWindow(Adw.ApplicationWindow):
 
         dialog.connect("closed", closed)
 
-        def refresh():
+        def refresh(job=None):
             if not is_open:
                 return
+            if job is not None:
+                # Percentage ticks don't change pack membership or controls.
+                if label := indicators.get(id(job)):
+                    label.set_text(job["status"])
+                return
+            indicators.clear()
             for row in rows:
                 group.remove(row)
             rows.clear()
@@ -1985,11 +1991,11 @@ class ChatWindow(Adw.ApplicationWindow):
                     continue
                 subtitle = format_size(manifest["size_bytes"])
                 release = catalog.get(key)
-                if (
-                    release
-                    and not compatibility_error(release)
-                    and release["release_sequence"] > manifest.get("release_sequence", 0)
-                ):
+                compatible = release is not None and not compatibility_error(release)
+                newer = compatible and release["release_sequence"] > manifest.get(
+                    "release_sequence", 0
+                )
+                if newer:
                     subtitle += " · Update available"
                 error = manifest.get("compatibility_error")
                 row = Adw.ActionRow(
@@ -2052,11 +2058,7 @@ class ChatWindow(Adw.ApplicationWindow):
                         {"kind": "delete", "key": k, "title": title}
                     ),
                 )
-                if (
-                    release
-                    and not compatibility_error(release)
-                    and (error or release["release_sequence"] > manifest.get("release_sequence", 0))
-                ):
+                if compatible and (error or newer):
                     update = download_button(release, pending, update=True)
                     row.add_suffix(update)
                 row.add_suffix(switch)
@@ -2122,12 +2124,13 @@ class ChatWindow(Adw.ApplicationWindow):
         def add_status(row, job):
             label = Gtk.Label(label=job["status"], valign=Gtk.Align.CENTER)
             spinner = Gtk.Spinner(spinning=job.get("active", False), valign=Gtk.Align.CENTER)
+            indicators[id(job)] = label
             row.add_suffix(label)
             row.add_suffix(spinner)
 
-        def notify():
+        def notify(job=None):
             if self._knowledge_refresh:
-                self._knowledge_refresh()
+                self._knowledge_refresh(job)
 
         def enqueue(job):
             job["status"] = "Waiting…"
@@ -2167,6 +2170,8 @@ class ChatWindow(Adw.ApplicationWindow):
                 last_update = now
 
                 def update():
+                    same_stage = job.get("stage") == stage and (not title or title == job["title"])
+                    job["stage"] = stage
                     if title:
                         job["title"] = title
                     job["status"] = (
@@ -2174,7 +2179,7 @@ class ChatWindow(Adw.ApplicationWindow):
                         if current is not None and total
                         else f"{stage}…"
                     )
-                    notify()
+                    notify(job if same_stage else None)
 
                 self.dispatch(update)
 
@@ -2207,8 +2212,8 @@ class ChatWindow(Adw.ApplicationWindow):
                 heading="Merge Installed Packs?",
                 body=(
                     "Merging packs reduces disk usage. CAN TAKE HOURS TO COMPLETE. "
-                    "Merged packs cannot be unmerged once completed. "
-                    "Lopaca and your existing packs will remain usable during merging."
+                    "Merged packs cannot be unmerged once completed. Lopaca "
+                    "and your existing packs will remain usable during merging."
                 ),
             )
             alert.add_response("cancel", "Cancel")

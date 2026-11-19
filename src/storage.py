@@ -69,10 +69,8 @@ class ChatStore:
     def load_settings(self, chat_id):
         try:
             data = _read_json_object(self.folder(chat_id) / "chat-settings.json")
-        except FileNotFoundError:
-            data = {}
         except OSError, json.JSONDecodeError:
-            return {"created": time.time()}
+            data = {}
         if not isinstance(data.get("created"), (int, float)):
             data["created"] = time.time()
         return data
@@ -244,18 +242,22 @@ class MemoryStore:
         """)
         return connection
 
-    def records(self):
+    def records(self, *, core_only=False):
         with closing(self.connect()) as connection:
+            scope = "WHERE core" if core_only else ""
             return connection.execute(
-                "SELECT id,text,core FROM memories ORDER BY core DESC,updated DESC,id DESC"
+                f"SELECT id,text,core FROM memories {scope} ORDER BY core DESC,updated DESC,id DESC"
             ).fetchall()
 
     def apply(self, proposals, user_text, chat_id, allowed_ids):
         """Apply validated, evidenced proposals atomically."""
-        if not isinstance(proposals, list):
+        if not isinstance(proposals, list) or not proposals:
             return []
+        normalized_user_text = " ".join(user_text.casefold().split())
         accepted = []
         with closing(self.connect()) as connection, connection:
+            # Validate duplicates and capacity against the same snapshot we will write.
+            connection.execute("BEGIN IMMEDIATE")
             for index, proposal in enumerate(proposals[:8]):
                 if not isinstance(proposal, dict):
                     continue
@@ -268,8 +270,7 @@ class MemoryStore:
                 if (
                     not isinstance(evidence, str)
                     or not evidence.strip()
-                    or " ".join(evidence.casefold().split())
-                    not in " ".join(user_text.casefold().split())
+                    or " ".join(evidence.casefold().split()) not in normalized_user_text
                 ):
                     continue
                 if action != "add" and (type(memory_id) is not int or memory_id not in allowed_ids):
@@ -277,77 +278,73 @@ class MemoryStore:
                 text = proposal.get("text", "")
                 if not isinstance(text, str):
                     continue
-                text = " ".join(text.split())
-                if action != "delete" and not 1 <= len(text) <= 500:
+                if action == "delete":
+                    deleted = connection.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+                    if deleted.rowcount:
+                        connection.execute("DELETE FROM memory_search WHERE rowid=?", (memory_id,))
+                        accepted.append(index)
                     continue
+
+                text = " ".join(text.split())
                 kind = proposal.get("kind")
-                if action != "delete" and (
-                    not isinstance(kind, str) or kind not in {"core", "casual"}
-                ):
+                if not 1 <= len(text) <= 500 or kind not in ("core", "casual"):
                     continue
                 normalized = " ".join(re.findall(r"\w+", text.casefold()))
-                if action != "delete" and not normalized:
+                if not normalized:
+                    continue
+                search_terms = proposal.get("search_terms")
+                if action == "update":
+                    existing = connection.execute(
+                        "SELECT search_terms FROM memories WHERE id=?", (memory_id,)
+                    ).fetchone()
+                    if existing is None:
+                        continue
+                    if search_terms is None:
+                        search_terms = existing[0]
+                elif (
+                    connection.execute("SELECT count(*) FROM memories").fetchone()[0]
+                    >= self.settings.memory_records
+                ):
+                    continue
+                if not isinstance(search_terms, str) or not search_terms.strip():
+                    continue
+                search_terms = " ".join(search_terms.split())[:200]
+                duplicate = connection.execute(
+                    "SELECT id FROM memories WHERE normalized=?", (normalized,)
+                ).fetchone()
+                if duplicate and duplicate[0] != memory_id:
                     continue
                 core = kind == "core"
-                rows = connection.execute("SELECT id,text,core FROM memories").fetchall()
-                if action != "add" and not any(row[0] == memory_id for row in rows):
-                    continue
-                if action != "delete":
-                    search_terms = proposal.get("search_terms")
-                    if action == "update" and search_terms is None:
-                        search_terms = connection.execute(
-                            "SELECT search_terms FROM memories WHERE id=?", (memory_id,)
-                        ).fetchone()[0]
-                    if not isinstance(search_terms, str) or not search_terms.strip():
-                        continue
-                    search_terms = " ".join(search_terms.split())[:200]
-                    duplicate = connection.execute(
-                        "SELECT id FROM memories WHERE normalized=?", (normalized,)
-                    ).fetchone()
-                    if duplicate and duplicate[0] != memory_id:
-                        continue
-                    others = [row for row in rows if row[0] != memory_id]
-                    if action == "add" and len(rows) >= self.settings.memory_records:
-                        continue
-                    if core and (
-                        sum(bool(row[2]) for row in others) >= self.settings.memory_core_records
-                        or sum(len(row[1]) for row in others if row[2]) + len(text)
-                        > self.settings.memory_core_chars
-                    ):
-                        core = False
-                if action == "delete":
-                    connection.execute("DELETE FROM memories WHERE id=?", (memory_id,))
-                    connection.execute("DELETE FROM memory_search WHERE rowid=?", (memory_id,))
-                else:
-                    now = time.time()
-                    if action == "add":
-                        memory_id = connection.execute(
-                            "INSERT INTO memories "
-                            "(text,normalized,core,source_chat,evidence,created,updated,"
-                            "search_terms) "
-                            "VALUES (?,?,?,?,?,?,?,?)",
-                            (text, normalized, core, chat_id, evidence, now, now, search_terms),
-                        ).lastrowid
-                    else:
-                        connection.execute(
-                            "UPDATE memories SET text=?,normalized=?,core=?,source_chat=?,"
-                            "evidence=?,updated=?,search_terms=? WHERE id=?",
-                            (
-                                text,
-                                normalized,
-                                core,
-                                chat_id,
-                                evidence,
-                                now,
-                                search_terms,
-                                memory_id,
-                            ),
+                if core:
+                    others = [
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT text FROM memories WHERE core AND id IS NOT ?", (memory_id,)
                         )
-                    connection.execute("DELETE FROM memory_search WHERE rowid=?", (memory_id,))
-                    connection.execute(
-                        "INSERT INTO memory_search(rowid,text,keywords) VALUES (?,?,?)",
-                        (memory_id, text, re.sub(r"[_-]", " ", text + " " + search_terms)),
+                    ]
+                    core = (
+                        len(others) < self.settings.memory_core_records
+                        and sum(map(len, others)) + len(text) <= self.settings.memory_core_chars
                     )
+                now = time.time()
+                if action == "add":
+                    memory_id = connection.execute(
+                        "INSERT INTO memories "
+                        "(text,normalized,core,source_chat,evidence,created,updated,search_terms) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (text, normalized, core, chat_id, evidence, now, now, search_terms),
+                    ).lastrowid
+                else:
+                    connection.execute(
+                        "UPDATE memories SET text=?,normalized=?,core=?,source_chat=?,"
+                        "evidence=?,updated=?,search_terms=? WHERE id=?",
+                        (text, normalized, core, chat_id, evidence, now, search_terms, memory_id),
+                    )
+                    connection.execute("DELETE FROM memory_search WHERE rowid=?", (memory_id,))
+                connection.execute(
+                    "INSERT INTO memory_search(rowid,text,keywords) VALUES (?,?,?)",
+                    (memory_id, text, re.sub(r"[_-]", " ", text + " " + search_terms)),
+                )
                 accepted.append(index)
         return accepted
 
