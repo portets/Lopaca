@@ -187,12 +187,12 @@ window.lopaca-main, .transcript-scroll, .transcript {
 """
 
 
-def message_time(timestamp, now=None):
+def message_time(timestamp, now=None, clock_format=None):
     date = datetime.fromtimestamp(timestamp)
     days = ((now or datetime.now()).date() - date.date()).days
     clock = (
         f"{date.hour:02d}:{date.minute:02d}"
-        if get_clock_format() == "24h"
+        if (clock_format or get_clock_format()) == "24h"
         else f"{date.hour % 12 or 12}:{date.minute:02d} {'AM' if date.hour < 12 else 'PM'}"
     )
     if days == 0:
@@ -254,7 +254,9 @@ class ChatWindow(Adw.ApplicationWindow):
         self.context_capacity = self.context_used = self.tokens_per_second = None
         self._review_pending = False
         self._stream_updates = {}
+        self._date_display = None
         self._stream_update_id = None
+        self._first_answer_shown = self._first_thinking_shown = False
         self._thinking_pending = []
         self._thinking_flush_id = None
         self._inband_thinking = ""
@@ -281,12 +283,17 @@ class ChatWindow(Adw.ApplicationWindow):
         self._apply_css()
         self._build_ui()
         controller.attach(self)
-        GLib.timeout_add_seconds(60, self._refresh_message_dates)
+        self.connect("map", self._start_date_timer)
+        self.connect("unmap", lambda *_: GLib.source_remove(self._date_timer))
         self.chat_list.add_tick_callback(self._scroll_initial_chat)
+
+    def _start_date_timer(self, *_):
+        self._refresh_message_dates()
+        self._date_timer = GLib.timeout_add_seconds(60, self._refresh_message_dates)
 
     def _apply_css(self):
         provider = Gtk.CssProvider()
-        provider.load_from_data(CSS.encode())
+        provider.load_from_string(CSS)
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
@@ -562,6 +569,14 @@ class ChatWindow(Adw.ApplicationWindow):
             GLib.idle_add(callback, *args)
 
     def _queue_stream_update(self, callback, args):
+        if callback == self.update_answer and not self._first_answer_shown:
+            visible, reasoning, _ = self.controller.split_thinking(args[0])
+            self._first_answer_shown = bool(visible.strip())
+            if self._first_answer_shown or (
+                not self._first_thinking_shown and reasoning and reasoning.strip()
+            ):
+                self._stream_updates.pop(callback, None)
+                return callback(*args)
         if callback == self.controller._update_inference_stats and callback in self._stream_updates:
             args = tuple(
                 new if new is not None else old
@@ -569,7 +584,7 @@ class ChatWindow(Adw.ApplicationWindow):
             )
         self._stream_updates[callback] = args
         if self._stream_update_id is None:
-            self._stream_update_id = GLib.timeout_add(50, self._flush_stream_updates)
+            self._stream_update_id = GLib.timeout_add(20, self._flush_stream_updates)
         return False
 
     def _flush_stream_updates(self):
@@ -1079,15 +1094,22 @@ class ChatWindow(Adw.ApplicationWindow):
         self._history_reveal_id = self.transcript_scroll.add_tick_callback(reveal)
 
     def _refresh_message_dates(self):
-        child = self.transcript.get_first_child()
         now = datetime.now()
+        clock_format = get_clock_format()
+        display = (now.date(), now.astimezone().tzinfo, clock_format)
+        # Each row already has its label. Revisit the transcript only when the
+        # local day, time zone or desktop clock preference changes.
+        if display == self._date_display:
+            return True
+        self._date_display = display
+        child = self.transcript.get_first_child()
         while child is not None:
             if hasattr(child, "message_date"):
                 child.set_text(message_day(child.message_date, now))
                 if child.message_date != now.date():
                     child.set_opacity(1)
             elif hasattr(child, "timestamp"):
-                child.time_label.set_text(message_time(child.timestamp, now))
+                child.time_label.set_text(message_time(child.timestamp, now, clock_format))
             child = child.get_next_sibling()
         return True
 
@@ -1226,6 +1248,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.current_content.append(self.current_answer)
         self.current_wrapper.append(self.current_content)
         self._answer_committed = 0
+        self._first_answer_shown = self._first_thinking_shown = False
         self._stream_code = None
         self._thinking_collapsed = False
         self.current_thinking = None
@@ -1241,8 +1264,13 @@ class ChatWindow(Adw.ApplicationWindow):
         if self.current_thinking is None:
             self.current_thinking = self._create_thinking_widget(self.current_wrapper, "", False)
         self._thinking_pending.append(text)
+        if not self._first_thinking_shown and text.strip():
+            self._first_thinking_shown = True
+            if self._thinking_flush_id is not None:
+                GLib.source_remove(self._thinking_flush_id)
+            return self._flush_thinking()
         if self._thinking_flush_id is None:
-            self._thinking_flush_id = GLib.timeout_add(100, self._flush_thinking)
+            self._thinking_flush_id = GLib.timeout_add(40, self._flush_thinking)
         return False
 
     def _flush_thinking(self):
@@ -2551,6 +2579,7 @@ class Lopaca(Adw.Application):
         GLib.set_application_name("Lopaca")
 
     def do_shutdown(self):
+        self.controller.cancel_chat_warm()
         self.controller.model_server.close()
         Adw.Application.do_shutdown(self)
 

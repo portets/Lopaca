@@ -23,7 +23,13 @@ from agentic import (
 )
 from history import HistoryIndex
 from knowledge import KnowledgeStore
-from llama_client import LlamaClient, auto_thinking_options, recent_messages, thinking_parameters
+from llama_client import (
+    LlamaClient,
+    auto_thinking_options,
+    chat_tools,
+    recent_messages,
+    thinking_parameters,
+)
 from memory import edit_memories, memory_context, memory_review, recall_memories, view_memories
 from model_server import ModelServer
 from rag import DocumentIndexer, format_document_context, read_document, retrieve
@@ -113,6 +119,7 @@ class ChatController:
         self.memories = MemoryStore(self.store.root.parent / "memories.sqlite", settings)
         self.knowledge = KnowledgeStore()
         self._model_lock = threading.Lock()
+        self._chat_warm_stop = threading.Event()
         indexing_client = LlamaClient(settings)
         self.document_indexer = DocumentIndexer(
             settings,
@@ -176,6 +183,7 @@ class ChatController:
         self.store.save_app_settings(settings)
 
     def connect_model_server(self):
+        self.cancel_chat_warm()
         if self.busy or self._model_lock.locked():
             self.view._show_alert("Model is busy", "Wait for the current model request to finish.")
             return
@@ -200,6 +208,8 @@ class ChatController:
             self.view.set_status(self.idle_status())
         if connected and not self.busy:
             self._drain_messages()
+        if changed:
+            self._schedule_chat_warm()
         return False
 
     def _monitor_connection(self):
@@ -292,6 +302,7 @@ class ChatController:
         self.open_chat(self.store.create()["id"])
 
     def open_chat(self, chat_id):
+        self.cancel_chat_warm()
         if self.chat:
             self._drafts[self.chat["id"]] = self.view.prompt_text(strip=False)
         self.chat = self.store.load(chat_id)
@@ -315,6 +326,54 @@ class ChatController:
                 self.store.save_app_settings(app_settings)
             except OSError as exc:
                 self.view.notify(f"Could not save active chat: {exc}")
+        self._schedule_chat_warm()
+
+    def cancel_chat_warm(self):
+        self._chat_warm_stop.set()
+
+    def _schedule_chat_warm(self):
+        self.cancel_chat_warm()
+        if not self.chat or not self.connected or self.busy or self.model_server.busy:
+            return
+        chat = self.chat
+        stop = self._chat_warm_stop = threading.Event()
+        threading.Thread(target=self._warm_open_chat, args=(chat, stop), daemon=True).start()
+
+    def _warm_open_chat(self, chat, stop):
+        if stop.wait(0.75) or self.busy or self.model_server.busy:
+            return
+        capacity = self.client.context_capacity
+        if not capacity:
+            return
+        try:
+            chat_id = chat["id"]
+            settings = self.get_chat_settings(chat_id)
+            start, expanding = self._context_window(settings, len(chat["messages"]), capacity)
+            if expanding:
+                # The next send will restore and size the active window itself.
+                return
+            history = chat["messages"][start:]
+            if sum(len(message.get("content", "")) for message in history) < 2000:
+                return
+            memories = settings["global_memories"] is True
+            messages = [
+                self._system_message(
+                    self.settings.enable_command_approval, settings["conversation_style"], memories
+                ),
+                *self._history_messages(history, settings),
+            ]
+            LlamaClient(self.settings).warm_chat(
+                messages,
+                settings["preserve_reasoning"] is True,
+                self.thinking_parameters(chat_id, settings=settings),
+                chat_tools(files=True, memories=memories),
+                capacity,
+                self._model_lock,
+                lambda: stop.is_set() or self.busy or self.model_server.busy or not self.connected,
+            )
+        except OSError, ValueError, KeyError, RuntimeError, sqlite3.Error:
+            # Warming is opportunistic. Normal generation handles connection errors.
+            return
 
     def rename_chat(self, chat_id, title):
         title = title.strip()
@@ -542,6 +601,7 @@ class ChatController:
         if not self.connected:
             self.view.notify("Not connected")
             return False
+        self.cancel_chat_warm()
         if self.busy:
             self._pending_messages.append((chat_id, text, False))
             if (
@@ -575,35 +635,12 @@ class ChatController:
         if chat_id == self.chat["id"]:
             self.view.set_chat_title(chat["title"])
             self.view.append_message("user", text, timestamp=timestamp)
-        start = settings.get("context_start", 0)
-        if type(start) is not int or not 0 <= start < len(chat["messages"]):
-            start = 0
-        capacity = self.client.context_capacity
-        self._generation_context_capacity = capacity
-        previous_capacity = settings.get("context_capacity", 0)
-        if type(previous_capacity) is not int:
-            previous_capacity = 0
-        self._generation_expanding = bool(start and capacity and capacity > previous_capacity)
-        if self._generation_expanding:
-            start = 0  # Reconsider older exchanges against the new capacity on the worker.
+        capacity = self._generation_context_capacity = self.client.context_capacity
+        start, self._generation_expanding = self._context_window(
+            settings, len(chat["messages"]) - 1, capacity
+        )
         self._generation_context_start = start
-        messages = []
-        for message in chat["messages"][start:]:
-            content = message.get("content", "")
-            if message["role"] == "assistant":
-                content = self.visible_answer(content)
-                review = message.get("memory_review")
-                if settings["global_memories"] is True and review in (
-                    "yes",
-                    "no",
-                    "clarify",
-                    "yes_clarify",
-                ):
-                    content += f"\n<memory-review>{review}</memory-review>"
-            item = {"role": message["role"], "content": content}
-            if preserve_thinking and message.get("reasoning_content"):
-                item["reasoning_content"] = message["reasoning_content"]
-            messages.append(item)
+        messages = self._history_messages(chat["messages"][start:], settings)
         if steering:
             messages[-1]["content"] += (
                 "\n\n[Application context: the preceding assistant turn was interrupted by the "
@@ -636,6 +673,45 @@ class ChatController:
         ).start()
 
         return True
+
+    @staticmethod
+    def _context_window(settings, completed_messages, capacity):
+        start = settings.get("context_start", 0)
+        if type(start) is not int or not 0 <= start <= completed_messages:
+            start = 0
+        previous = settings.get("context_capacity", 0)
+        if type(previous) is not int:
+            previous = 0
+        expanding = bool(start and capacity and capacity > previous)
+        return (0 if expanding else start), expanding
+
+    def _system_message(self, agent_mode, style, memories, core_context=None):
+        content = build_system_prompt(agent_mode, style, memories=memories)
+        if memories:
+            if core_context is None:
+                core_context = memory_context(self.memories.records(core_only=True))[0]
+            content += core_context
+        return {"role": "system", "content": content}
+
+    def _history_messages(self, history, settings):
+        messages = []
+        for message in history:
+            content = message.get("content", "")
+            if message["role"] == "assistant":
+                content = self.visible_answer(content)
+                review = message.get("memory_review")
+                if settings["global_memories"] is True and review in (
+                    "yes",
+                    "no",
+                    "clarify",
+                    "yes_clarify",
+                ):
+                    content += f"\n<memory-review>{review}</memory-review>"
+            item = {"role": message["role"], "content": content}
+            if settings["preserve_reasoning"] is True and message.get("reasoning_content"):
+                item["reasoning_content"] = message["reasoning_content"]
+            messages.append(item)
+        return messages
 
     def _drain_messages(self):
         while self.connected and not self.busy and self._pending_messages:
@@ -783,15 +859,9 @@ class ChatController:
         core_context, casual_context = memory_context(memory_rows) if memory_enabled else ("", "")
         messages.insert(
             0,
-            {
-                "role": "system",
-                "content": build_system_prompt(
-                    agent_mode,
-                    generation_settings["conversation_style"],
-                    memories=memory_enabled,
-                )
-                + core_context,
-            },
+            self._system_message(
+                agent_mode, generation_settings["conversation_style"], memory_enabled, core_context
+            ),
         )
         context_user_content = messages[-1]["content"]
         # Keep fresh evidence beside the current question, after historical answers/reasoning.
@@ -900,12 +970,8 @@ class ChatController:
             try:
                 stable_system = messages[0]
                 if memory_enabled:
-                    stable_system = dict(
-                        stable_system,
-                        content=build_system_prompt(
-                            agent_mode, generation_settings["conversation_style"], memories=True
-                        )
-                        + memory_context(self.memories.records(core_only=True))[0],
+                    stable_system = self._system_message(
+                        agent_mode, generation_settings["conversation_style"], memories=True
                     )
                 retained = [
                     stable_system,

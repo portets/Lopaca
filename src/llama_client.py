@@ -74,6 +74,11 @@ def _stream_packet(data):
     return chunk
 
 
+def chat_tools(*, files, memories):
+    tools = RUNTIME_TOOLS + FILE_TOOLS if files else RUNTIME_TOOLS
+    return [*tools, VIEW_MEMORIES_TOOL] if memories else tools
+
+
 def recent_messages(history, limit=3):
     """Bound auxiliary-request history, excluding reasoning and injected references."""
     recent, counts = [], {"user": 0, "assistant": 0}
@@ -188,7 +193,7 @@ class LlamaClient:
         ) as response:
             return json.load(response)["prompt"]
 
-    def _token_count(self, prompt):
+    def _tokenize(self, prompt, *, timeout=15):
         with urllib.request.urlopen(
             self._post_request(
                 self.base_url + "/tokenize",
@@ -198,9 +203,12 @@ class LlamaClient:
                     "parse_special": True,
                 },
             ),
-            timeout=15,
+            timeout=timeout,
         ) as response:
-            return len(json.load(response)["tokens"])
+            return json.load(response)["tokens"]
+
+    def _token_count(self, prompt):
+        return len(self._tokenize(prompt))
 
     @staticmethod
     def _context_headroom(capacity):
@@ -212,6 +220,50 @@ class LlamaClient:
             return False
         return capacity - self.last_context_used < self._context_headroom(capacity)
 
+    def _prefix_request(self, messages, preserve_thinking, thinking, tools):
+        # An empty next-user turn gives the same history rendering as a real request.
+        return {
+            "model": self.settings.model,
+            "messages": [*messages, {"role": "user", "content": ""}],
+            "tools": tools,
+            "add_generation_prompt": False,
+            **(thinking or {}),
+            "chat_template_kwargs": {
+                "preserve_thinking": preserve_thinking,
+                **(thinking or {}).get("chat_template_kwargs", {}),
+            },
+        }
+
+    def warm_chat(
+        self, messages, preserve_thinking, thinking, tools, capacity, model_lock, stopped
+    ):
+        """Warm opportunistically, yielding the server between short prefill requests."""
+        if stopped() or not model_lock.acquire(blocking=False):
+            return
+        try:
+            body = self._prefix_request(messages, preserve_thinking, thinking, tools)
+            prompt = self._context_prompt(body, timeout=3)
+            if stopped():
+                return
+            tokens = self._tokenize(prompt, timeout=3)
+        finally:
+            model_lock.release()
+        if not 2048 <= len(tokens) < capacity - 4:
+            return
+        # Each request extends the cached prefix. Foreground work can stop the sequence
+        # between steps even if the server is slow to notice a dropped HTTP connection.
+        # Start with a smaller request in case Send arrives just after the debounce.
+        first_step, step = 64, 256
+        for end in range(first_step, len(tokens) + step, step):
+            if stopped() or not model_lock.acquire(blocking=False):
+                return
+            try:
+                if stopped():
+                    return
+                self._warm_context(tokens[:end], stopped, timeout=5)
+            finally:
+                model_lock.release()
+
     def condense_context(
         self, messages, preserve_thinking, thinking, stopped, on_context, on_usage=None
     ):
@@ -220,18 +272,8 @@ class LlamaClient:
         if not self.needs_context_roll() or stopped():
             return 0
         target = min(capacity, max(4096, min(65536, capacity // 2)))
-        body = {
-            "model": self.settings.model,
-            "messages": messages,
-            "tools": self._context_tools,
-            "add_generation_prompt": False,
-            "chat_template_kwargs": {"preserve_thinking": preserve_thinking},
-        }
-        body["chat_template_kwargs"].update((thinking or {}).get("chat_template_kwargs", {}))
-        body.update({k: v for k, v in (thinking or {}).items() if k != "chat_template_kwargs"})
-        # The empty next-user marker gives the same history/reasoning template treatment
-        # as the next real request, without knowing or fabricating its question.
-        dummy = {"role": "user", "content": ""}
+        body = self._prefix_request(messages, preserve_thinking, thinking, self._context_tools)
+        dummy = body["messages"][-1]
         on_context(True)
         try:
 
@@ -283,7 +325,7 @@ class LlamaClient:
         finally:
             on_context(False)
 
-    def _warm_context(self, prompt, stopped):
+    def _warm_context(self, prompt, stopped, *, timeout=None):
         """Populate a normal server cache slot; discard one bounded sampled token."""
         request = self._post_request(
             self.base_url + "/completion",
@@ -295,7 +337,9 @@ class LlamaClient:
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.settings.request_timeout) as response:
+            with urllib.request.urlopen(
+                request, timeout=self.settings.request_timeout if timeout is None else timeout
+            ) as response:
                 self.active_response = response
                 for _ in response:
                     if stopped():
@@ -540,9 +584,7 @@ class LlamaClient:
             self._context_user_content = context_user_content
             self._context_retry = self._context_expanding = expand_context
             files = ChatFiles(Path(documents).parent) if documents is not None else None
-            tools = RUNTIME_TOOLS + FILE_TOOLS if files is not None else RUNTIME_TOOLS
-            if memory_view is not None:
-                tools = [*tools, VIEW_MEMORIES_TOOL]
+            tools = chat_tools(files=files is not None, memories=memory_view is not None)
             self._context_tools = tools
             self.last_context_used = None
             answer, reasoning = "", ""
