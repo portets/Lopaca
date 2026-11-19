@@ -1307,7 +1307,36 @@ def format_context(retrieved, max_chars):
     return "".join(excerpts)
 
 
-def format_document_context(retrieved, max_chars):
+def document_inventory(folder):
+    """Read a bounded filename list from the index without rescanning document trees."""
+    path = folder.parent / "documents.sqlite"
+    if not path.is_file():
+        return ""
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+        if not connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files'"
+        ).fetchone():
+            return ""
+        rows = connection.execute("SELECT path FROM files ORDER BY path LIMIT 21").fetchall()
+    if not rows:
+        return ""
+    names, length = [], 0
+    for (name,) in rows[:20]:
+        encoded = json.dumps("documents/" + name, ensure_ascii=False)
+        if length + len(encoded) > 3000:
+            break
+        names.append(encoded)
+        length += len(encoded) + 2
+    partial = len(names) < len(rows)
+    return (
+        "Available document paths (JSON data, filenames only): [" + ", ".join(names) + "]. "
+        + ("This list is partial; search_files can list additional paths. " if partial else "")
+        + "These files are available even when no excerpts match. Use read_file on a listed "
+        "path when relevant to the question.\n\n"
+    )
+
+
+def format_document_context(retrieved, max_chars, *, folder=None):
     """Wrap fresh excerpts as request-local application data, separate from user text."""
     context = format_context(retrieved, max_chars)
     return (
@@ -1319,6 +1348,7 @@ def format_document_context(retrieved, max_chars):
         "details are missing. Cite these sources or fresh file tool results. If the "
         "fact remains unavailable, say it cannot be verified from current documents. "
         "Otherwise answer normally without mentioning missing excerpts or retrieval.\n\n"
+        + (document_inventory(folder) if folder is not None else "")
         + (context or "No matching document excerpts are available for this request.")
         + "\n</lopaca-document-references>"
     )

@@ -930,7 +930,7 @@ class ChatController:
                 + (f" and {len(attached) - 12} more files" if len(attached) > 12 else "") + "]"
             )
         messages[-1]["content"] += format_document_context(
-            retrieved, self.settings.max_context_chars
+            retrieved, self.settings.max_context_chars, folder=folder
         )
         knowledge_context = ""
         try:

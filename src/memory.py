@@ -278,7 +278,8 @@ _REFERENCE_OPENINGS = tuple(
     )
 )
 _REVIEW_DECISIONS = {
-    f"<memory-review>{choice}</memory-review>": choice
+    f"<{tag}>{choice}</{tag}>": choice
+    for tag in ("memory-review", "lopaca-memory-review")
     for choice in ("yes", "no", "clarify", "yes_clarify")
 }
 
@@ -321,21 +322,28 @@ def memory_review(text):
     if "<" not in text:
         return text.rstrip(), None
     trimmed = _without_memory_references(text).rstrip()
-    before, newline, tail = trimmed.rpartition("\n")
-    candidate = tail.lstrip()
-    if (
-        not candidate
-        or len(tail) - len(candidate) > 3
-        or tail.startswith("\t")
-        or not any(ending.startswith(candidate) for ending in _REVIEW_DECISIONS)
-    ):
-        return trimmed, None
     fence = None
-    for line in before.splitlines():
+    for line in trimmed.splitlines():
         fence = _fence_after(line, fence)
     if fence is not None:
         return trimmed, None
-    return (before.rstrip() if newline else ""), _REVIEW_DECISIONS.get(candidate)
+    # Models sometimes copy the lopaca- prefix from reference blocks or repeat the
+    # footer. Consume the whole terminal sequence so it cannot leak into replies
+    # or prime subsequent turns to repeat the malformed ending.
+    decision = None
+    while trimmed:
+        before, newline, tail = trimmed.rpartition("\n")
+        candidate = tail.lstrip()
+        if (
+            not candidate
+            or len(tail) - len(candidate) > 3
+            or tail.startswith("\t")
+            or not any(ending.startswith(candidate) for ending in _REVIEW_DECISIONS)
+        ):
+            break
+        decision = decision or _REVIEW_DECISIONS.get(candidate)
+        trimmed = before.rstrip() if newline else ""
+    return trimmed, decision
 
 
 def edit_memories(
