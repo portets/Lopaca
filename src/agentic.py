@@ -399,9 +399,9 @@ CODING_INSTRUCTION = (
     "or edit files through approved commands. Never claim a command has run until Lopaca "
     "reports its result. Commands may launch terminal or GUI programs. When providing a command "
     "to create a program, also provide a separate command to run it. Use get_osinfo when platform "
-    "details matter, rather than guessing the OS. Commands run in this chat's projects/ folder: "
-    "use relative paths such as example.py, not projects/example.py, when creating or running "
-    "files there. Prefer this workspace unless the user requests another location. "
+    "details matter, rather than guessing the OS. Commands start inside this chat's projects/ "
+    "folder. Run python3 example.py directly, without cd projects or a projects/ path prefix. "
+    "Prefer this workspace unless the user requests another location. "
     "To inspect those files, use read_file with projects/example.py; document references use "
     "documents/... paths. File tools can access only these two folders in the current chat."
 )
@@ -781,6 +781,18 @@ def command_needs_terminal(args, cwd=None):
         except OSError:
             return False
     return False
+
+
+def workspace_command(command, cwd):
+    """Resolve a redundant workspace change before scanning and previewing the command."""
+    pattern = r"""\A([ \t]*cd[ \t]+)(projects/?|'projects/?'|"projects/?")(?=[ \t]*&&[^&])"""
+    match = re.match(pattern, command)
+    if match and Path(cwd).name == "projects":
+        nested = Path(cwd) / "projects"
+        if not nested.exists() and not nested.is_symlink():
+            # Keep the shell's conditional and the rest of the command intact.
+            return command[: match.start(2)] + "." + command[match.end(2) :]
+    return command
 
 
 def prepare_command(command):

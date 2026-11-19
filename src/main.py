@@ -18,6 +18,7 @@ from agentic import (
     prepare_command,
     run_command,
     scan_command,
+    workspace_command,
     write_file,
 )
 from history import HistoryIndex
@@ -1091,12 +1092,13 @@ class ChatController:
 
     def review_command(self, command, cwd=None):
         cwd = self.store.projects(self.chat["id"]) if cwd is None else cwd
+        command = workspace_command(command, cwd)
         risks = scan_command(command, cwd, self.settings)
         file_write = parse_file_heredoc(command)
         if file_write:
-            return "file", file_write, risks
+            return "file", file_write, risks, command
         args, error = prepare_command(command)
-        return ("error", error, risks) if error else ("command", args, risks)
+        return ("error", error, risks, command) if error else ("command", args, risks, command)
 
     def review_command_async(self, command, callback):
         cwd = self.store.projects(self.chat["id"])

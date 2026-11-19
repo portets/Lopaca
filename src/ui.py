@@ -2317,12 +2317,12 @@ class ChatWindow(Adw.ApplicationWindow):
             elif self.chat["id"] != chat_id:
                 self.notify("Chat changed; review the command again.")
             else:
-                self._command_reviewed(command, result)
+                self._command_reviewed(result)
 
         self.controller.review_command_async(command, reviewed)
 
-    def _command_reviewed(self, command, result):
-        kind, payload, risks = result
+    def _command_reviewed(self, result):
+        kind, payload, risks, command = result
         if kind == "file":
             path, contents = payload
             self._show_command_approval(

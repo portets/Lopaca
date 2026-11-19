@@ -726,6 +726,7 @@ class LlamaClient:
         request = self._post_request(url, body)
         reasoning_parts, answer_parts, finish_reason = [], [], None
         tool_calls = {}
+        prompt_tokens = 0
         used_tokens = 0
         budget_tails, budget_notified = ["", ""], False
         try:
@@ -764,14 +765,20 @@ class LlamaClient:
                         for key in ("name", "arguments"):
                             call["function"][key] += function.get(key) or ""
                     usage, timings = chunk.get("usage") or {}, chunk.get("timings") or {}
-                    context_used = None
-                    if any(key in timings for key in ("prompt_n", "cache_n", "predicted_n")):
-                        context_used = sum(
-                            int(timings.get(key, 0) or 0)
-                            for key in ("prompt_n", "cache_n", "predicted_n")
-                        )
-                    elif usage.get("total_tokens") is not None:
-                        context_used = int(usage["total_tokens"])
+                    # Prefill timings count work done so far. The progress total includes
+                    # the entire prompt even on the first packet with a cold cache.
+                    progress = chunk.get("prompt_progress") or {}
+                    prompt_tokens = (
+                        progress.get("total") or usage.get("prompt_tokens") or prompt_tokens
+                    )
+                    generated = usage.get("completion_tokens") or timings.get("predicted_n") or 0
+                    if generated or finish_reason:
+                        processed = (timings.get("cache_n") or 0) + (timings.get("prompt_n") or 0)
+                        prompt_tokens = max(prompt_tokens, processed)
+                    total = usage.get("total_tokens") or max(
+                        used_tokens, prompt_tokens + generated if prompt_tokens else 0
+                    )
+                    context_used = total if total != used_tokens else None
                     tokens_per_second = timings.get("predicted_per_second")
                     if context_used is not None:
                         used_tokens = context_used
