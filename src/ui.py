@@ -25,6 +25,10 @@ gi.require_version("Gsk", "4.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gsk, Gtk, Pango  # noqa: E402
 
 CSS = """
+/* Theme styling. Margins and padding use top, right, bottom, left.
+ * Window geometry, alignment and calculated scroll/text metrics are in layout code. */
+
+/* Window, header and shared text */
 window.lopaca-main {
     color: @theme_fg_color;
 }
@@ -36,10 +40,67 @@ window.lopaca-main, .transcript-scroll, .transcript {
     border-bottom: none;
     box-shadow: 0 1px 1px @headerbar_shade_color;
 }
+.chat-prose {
+    line-height: 1.4em;
+}
+.muted {
+    color: alpha(@window_fg_color,0.62);
+    font-size: 0.9em;
+}
+.chat-list-scroll {
+    margin-bottom: 0px;
+}
+.chat-header {
+    border-spacing: 8px;
+    margin-left: 20px;
+    margin-right: 20px;
+    margin-top: 12px;
+    margin-bottom: 10px;
+}
+.chat-header-titles {
+    border-spacing: 3px;
+}
+.transcript {
+    border-spacing: 2px;
+    margin-top: 16px;
+    margin-bottom: 18px;
+    margin-left: 24px;
+    margin-right: 24px;
+}
+.app-toolbar,
+.app-header-bar,
+.app-title,
+.app-layout,
+.chat-list-overlay,
+.disk-usage,
+.chat-disk-usage,
+.total-disk-usage,
+.chat-pane,
+.chat-title,
+.chat-folder-path,
+.main-transcript-scroll,
+.response-status,
+.status-spacer,
+.context-usage,
+.generation-speed,
+.main-frame,
+.prompt-scroll,
+.send-stop {
+    /* Theme defaults; add overrides here when needed. */
+}
+
+/* Sidebar and chat list */
+.chat-list-divider {
+    margin: 6px 0;
+}
 .sidebar {
-    margin: 4px;
     padding: 4px 0;
     min-width: 286px;
+    border-spacing: 8px;
+    margin-top: 13px;
+    margin-bottom: 12px;
+    margin-left: 12px;
+    margin-right: 12px;
 }
 .sidebar, .composer-frame, .document-drop-box {
     background-color: alpha(@headerbar_shade_color,0.4);
@@ -66,6 +127,7 @@ window.lopaca-main, .transcript-scroll, .transcript {
 .chat-row {
     padding: 1px 5px;
     border-radius: 9px;
+    border-spacing: 4px;
 }
 .chat-options-button {
     opacity: 0;
@@ -83,20 +145,58 @@ window.lopaca-main, .transcript-scroll, .transcript {
     min-height: 3px;
     border-radius: 2px;
     background-color: alpha(@window_fg_color,0.28);
+    margin-left: 22px;
+    margin-right: 20px;
 }
+.chat-drop-indicator:dir(rtl) {
+    margin-left: 20px;
+    margin-right: 22px;
+}
+.sidebar-header {
+    border-spacing: 8px;
+    margin-top: 4px;
+    margin-left: 8px;
+    margin-right: 6px;
+}
+.sidebar-header:dir(rtl) {
+    margin-left: 6px;
+    margin-right: 8px;
+}
+.main-chat-list {
+    margin-left: 14px;
+    margin-right: 12px;
+}
+.main-chat-list:dir(rtl) {
+    margin-left: 12px;
+    margin-right: 14px;
+}
+.sidebar-footer {
+    border-spacing: 8px;
+    margin-left: 10px;
+    margin-right: 10px;
+    margin-bottom: 4px;
+}
+.chats-heading,
+.new-chat-button,
+.app-settings-button,
+.chat-list-row,
+.chat-list-label,
+.chat-list-options-button {
+    /* Theme defaults; add overrides here when needed. */
+}
+
+/* Messages and reasoning */
 .message-row {
     padding: 5px 0;
 }
 .message {
     padding: 10px 13px;
     border-radius: 14px;
+    border-spacing: 6px;
 }
 .message label {
     caret-color: transparent;
     -gtk-secondary-caret-color: transparent;
-}
-.chat-prose {
-    line-height: 1.4em;
 }
 .user-message {
     background-color: alpha(@accent_bg_color,0.4);
@@ -114,6 +214,58 @@ window.lopaca-main, .transcript-scroll, .transcript {
 }
 .message:hover + .message-time {
     opacity: 1;
+}
+.thinking {
+    background-color: alpha(@theme_fg_color,0.065);
+    border-left: 3px solid @accent_color;
+    padding: 3px 10px;
+    margin-bottom: 8px;
+    border-radius: 5px;
+    border-spacing: 4px;
+}
+.thinking button {
+    min-height: 28px;
+    padding: 2px 4px;
+}
+.thinking, .thinking button, .thinking label {
+    font-weight: normal;
+}
+.message-date-separator {
+    margin-bottom: 2px;
+    margin-top: 12px;
+}
+.message-column {
+    border-spacing: 3px;
+}
+.reasoning-content {
+    border-spacing: 6px;
+}
+.reasoning-body {
+    border-spacing: 0px;
+}
+.streaming-response-current-content {
+    border-spacing: 6px;
+}
+.message-time-label,
+.message-label,
+.reasoning-header-button,
+.reasoning-arrow,
+.model-settings-reasoning {
+    /* Theme defaults; add overrides here when needed. */
+}
+
+/* Markdown, tables and code */
+.markdown-text {
+    border-spacing: 6px;
+}
+.markdown-text.markdown-fragmented {
+    border-spacing: 0;
+}
+.markdown-block-gap {
+    margin-top: 6px;
+}
+.markdown-quote-content {
+    border-spacing: 4px;
 }
 .code-block-frame {
     background-color: alpha(@theme_fg_color,0.035);
@@ -144,38 +296,20 @@ window.lopaca-main, .transcript-scroll, .transcript {
     border-left: 3px solid @accent_color;
     background-color: alpha(@theme_fg_color,0.035);
 }
-.thinking {
-    background-color: alpha(@theme_fg_color,0.065);
-    border-left: 3px solid @accent_color;
-    padding: 3px 10px;
-    margin-bottom: 8px;
-    border-radius: 5px;
+
+/* Prompt and response controls */
+.thinking-dropdown {
+    margin-right: 8px;
 }
-.thinking button {
-    min-height: 28px;
-    padding: 2px 4px;
-}
-.thinking, .thinking button, .thinking label {
-    font-weight: normal;
+.thinking-dropdown:dir(rtl) {
+    margin-left: 8px;
+    margin-right: 0;
 }
 .thinking-dropdown label {
     font-weight: normal;
 }
-.muted {
-    color: alpha(@window_fg_color,0.62);
-    font-size: 0.9em;
-}
 .prompt-view, .prompt-view text {
     background-color: transparent;
-}
-.model-advanced image.expander-row-arrow {
-    -gtk-icon-transform: rotate(0turn);
-}
-.model-advanced:checked image.expander-row-arrow {
-    -gtk-icon-transform: rotate(0.5turn);
-}
-.command-preview {
-    border-radius: 6px;
 }
 .send-stop.suggested-action:not(:disabled) {
     background-image: none;
@@ -186,6 +320,174 @@ window.lopaca-main, .transcript-scroll, .transcript {
     background-image: none;
     background-color: @destructive_bg_color;
     color: @destructive_fg_color;
+}
+.composer {
+    border-spacing: 7px;
+    margin-top: 12px;
+    margin-bottom: 12px;
+    margin-left: 12px;
+    margin-right: 12px;
+}
+.composer-status {
+    border-spacing: 14px;
+}
+.composer-frame-row {
+    border-spacing: 10px;
+}
+.composer-content {
+    border-spacing: 3px;
+    margin-top: 8px;
+    margin-bottom: 8px;
+    margin-left: 10px;
+    margin-right: 10px;
+}
+.composer-actions {
+    border-spacing: 8px;
+}
+.prompt-hint,
+.thinking-label,
+.attach-documents-button {
+    /* Theme defaults; add overrides here when needed. */
+}
+
+/* Settings pages and shared settings controls */
+.delete-icon {
+    -gtk-icon-size: 24px;
+}
+.model-settings-text {
+    padding: 10px;
+}
+.model-advanced image.expander-row-arrow {
+    -gtk-icon-transform: rotate(0turn);
+}
+.model-advanced:checked image.expander-row-arrow {
+    -gtk-icon-transform: rotate(0.5turn);
+}
+.settings-control-group {
+    border-spacing: 8px;
+}
+.model-settings-advanced-content {
+    border-spacing: 18px;
+    margin-top: 12px;
+    margin-bottom: 12px;
+    margin-left: 12px;
+    margin-right: 12px;
+}
+.knowledge-packs-actions {
+    border-spacing: 6px;
+}
+.memories-controls {
+    border-spacing: 6px;
+}
+.settings-page,
+.settings-group,
+.settings-row,
+.settings-button,
+.settings-memories-row,
+.settings-choice-group,
+.override-delete-button,
+.about-page,
+.about-project,
+.about-licenses,
+.about-donations,
+.model-settings-page,
+.model-settings-paths,
+.model-settings-advanced-group,
+.model-settings-advanced,
+.model-settings-preserve,
+.model-settings-options,
+.model-settings-extra,
+.model-settings-scroll,
+.model-settings-frame,
+.model-settings-actions,
+.model-server-status,
+.model-connect-button,
+.model-settings-row,
+.model-settings-browse,
+.model-settings-check,
+.settings-subpage-toolbar,
+.settings-subpage-header,
+.settings-subpage-back,
+.settings-subpage-page,
+.settings-subpage-group,
+.knowledge-page,
+.knowledge-group,
+.knowledge-packs-merge,
+.knowledge-packs-button,
+.knowledge-packs-label,
+.knowledge-packs-spinner,
+.knowledge-packs-row,
+.knowledge-packs-switch,
+.knowledge-packs-remove,
+.knowledge-packs-info,
+.memories-row,
+.memories-entry,
+.memories-core-button,
+.memories-edit,
+.memories-delete {
+    /* Theme defaults; add overrides here when needed. */
+}
+
+/* Dialogs and document attachments */
+.command-review-preview {
+    padding: 0 4px;
+    font-family: monospace;
+}
+.document-drop-icon {
+    -gtk-icon-size: 32px;
+}
+.command-preview {
+    border-radius: 6px;
+}
+.rename-chat-entry {
+    margin-top: 18px;
+    margin-bottom: 18px;
+    margin-left: 18px;
+    margin-right: 18px;
+}
+.rename-chat-content {
+    border-spacing: 12px;
+}
+.rename-chat-buttons {
+    border-spacing: 8px;
+    margin-bottom: 18px;
+    margin-left: 18px;
+    margin-right: 18px;
+}
+.document-drop-box {
+    margin-left: 12px;
+    margin-right: 12px;
+    margin-top: 8px;
+    margin-bottom: 12px;
+}
+.document-drop-center {
+    border-spacing: 10px;
+}
+.command-review-box {
+    border-spacing: 10px;
+    margin-top: 18px;
+    margin-bottom: 18px;
+    margin-left: 18px;
+    margin-right: 18px;
+}
+.command-review-buttons {
+    border-spacing: 8px;
+}
+.rename-chat-toolbar,
+.rename-chat-header,
+.rename-chat-cancel-button,
+.rename-chat-save-button,
+.document-drop-toolbar,
+.command-review-toolbar,
+.command-review-scroll,
+.command-review-frame,
+.command-review-cancel-button,
+.command-review-approve-button,
+.command-review-label,
+.command-review-legend,
+.command-review-notice,
+.command-review-warnings {
+    /* Theme defaults; add overrides here when needed. */
 }
 """
 
@@ -338,47 +640,45 @@ class ChatWindow(Adw.ApplicationWindow):
         clicks.connect("pressed", self._clear_message_selection)
         self.add_controller(clicks)
         toolbar = Adw.ToolbarView()
+        toolbar.add_css_class("app-toolbar")
         header_bar = Adw.HeaderBar()
+        header_bar.add_css_class("app-header-bar")
         header_bar.add_css_class("app-titlebar")
         title = Gtk.Label(label="Lopaca")
+        title.add_css_class("app-title")
         title.add_css_class("title")
         header_bar.set_title_widget(title)
         toolbar.add_top_bar(header_bar)
         root = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        root.add_css_class("app-layout")
         toolbar.set_content(root)
         self.set_content(toolbar)
-        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         sidebar.add_css_class("sidebar")
-        sidebar.set_size_request(252, -1)
         sidebar.set_hexpand(False)
-        sidebar.set_margin_top(10)
-        sidebar.set_margin_bottom(9)
-        sidebar.set_margin_start(8)
-        sidebar.set_margin_end(8)
         root.append(sidebar)
-        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        top.set_margin_top(4)
-        top.set_margin_start(8)
-        top.set_margin_end(6)
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        top.add_css_class("sidebar-header")
         heading = Gtk.Label(label="Chats", xalign=0)
+        heading.add_css_class("chats-heading")
         heading.set_hexpand(True)
         heading.add_css_class("title-2")
         top.append(heading)
         new_chat_button = Gtk.Button(label="New chat", icon_name="list-add-symbolic")
+        new_chat_button.add_css_class("new-chat-button")
         new_chat_button.add_css_class("suggested-action")
         new_chat_button.set_tooltip_text("New Chat")
         new_chat_button.connect("clicked", lambda *_: self.controller.new_chat())
         top.append(new_chat_button)
         sidebar.append(top)
         self.chat_list = Gtk.ListBox()
+        self.chat_list.add_css_class("main-chat-list")
         self.chat_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self.chat_list.set_activate_on_single_click(True)
         self.chat_list.add_css_class("workspace-list")
         self.chat_list.connect(
             "row-activated", lambda _list, row: self.controller.open_chat(row.chat_id)
         )
-        self.chat_list.set_margin_start(14)
-        self.chat_list.set_margin_end(12)
         self.chat_list.set_header_func(self._set_chat_header)
         drop_target = Gtk.DropTarget.new(str, Gdk.DragAction.MOVE)
         drop_target.connect("enter", self._chat_drag_motion)
@@ -387,32 +687,32 @@ class ChatWindow(Adw.ApplicationWindow):
         drop_target.connect("drop", self._chat_drop)
         self.chat_list.add_controller(drop_target)
         list_overlay = Gtk.Overlay()
+        list_overlay.add_css_class("chat-list-overlay")
         list_overlay.set_child(self.chat_list)
         self._drop_indicator = Gtk.Box()
         self._drop_indicator.add_css_class("chat-drop-indicator")
         self._drop_indicator.set_valign(Gtk.Align.START)
         self._drop_indicator.set_can_target(False)
         self._drop_indicator.set_visible(False)
-        self._drop_indicator.set_margin_start(22)
-        self._drop_indicator.set_margin_end(20)
         list_overlay.add_overlay(self._drop_indicator)
         self.chat_scroll = Gtk.ScrolledWindow()
+        self.chat_scroll.add_css_class("chat-list-scroll")
         self.chat_scroll.add_css_class("undershoot-top")
         self.chat_scroll.add_css_class("undershoot-bottom")
         self.chat_scroll.set_child(list_overlay)
         self.chat_scroll.set_vexpand(True)
-        self.chat_scroll.set_margin_bottom(0)
         sidebar.append(self.chat_scroll)
-        footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        footer.set_margin_start(10)
-        footer.set_margin_end(10)
-        footer.set_margin_bottom(4)  # Smaller values move disk usage and settings downward.
+        footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        footer.add_css_class("sidebar-footer")
         usage = Gtk.CenterBox()
+        usage.add_css_class("disk-usage")
         usage.add_css_class("muted")
         usage.set_hexpand(True)
         self.chat_usage = Gtk.Label(label="Chat: —", xalign=1)
+        self.chat_usage.add_css_class("chat-disk-usage")
         self.chat_usage.set_hexpand(True)
         self.total_usage = Gtk.Label(label="Total: —", xalign=0)
+        self.total_usage.add_css_class("total-disk-usage")
         self.total_usage.set_hexpand(True)
         usage.set_start_widget(self.chat_usage)
         usage.set_center_widget(Gtk.Label(label=" | "))
@@ -421,37 +721,35 @@ class ChatWindow(Adw.ApplicationWindow):
         settings_button = Gtk.Button(
             icon_name="emblem-system-symbolic", tooltip_text="App Settings"
         )
-        settings_button.add_css_class("flat")
+        settings_button.add_css_class("app-settings-button")
         settings_button.connect("clicked", lambda *_: self._show_settings())
         footer.append(settings_button)
         sidebar.append(footer)
         root.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
         main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        main.add_css_class("chat-pane")
         main.set_hexpand(True)
         root.append(main)
-        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        header.set_margin_start(20)
-        header.set_margin_end(20)
-        header.set_margin_top(12)
-        header.set_margin_bottom(10)
-        column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        header.add_css_class("chat-header")
+        column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        column.add_css_class("chat-header-titles")
         column.set_hexpand(True)
         self.chat_title = Gtk.Label(label="New chat", xalign=0)
+        self.chat_title.add_css_class("chat-title")
         self.chat_title.add_css_class("title-3")
         column.append(self.chat_title)
         self.folder_label = Gtk.Label(label="No documents folder", xalign=0)
+        self.folder_label.add_css_class("chat-folder-path")
         self.folder_label.set_ellipsize(Pango.EllipsizeMode.END)
         self.folder_label.add_css_class("muted")
         column.append(self.folder_label)
         header.append(column)
         main.append(header)
-        self.transcript = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.transcript = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.transcript.add_css_class("transcript")
-        self.transcript.set_margin_top(16)
-        self.transcript.set_margin_bottom(18)
-        self.transcript.set_margin_start(24)
-        self.transcript.set_margin_end(24)
         self.transcript_scroll = Gtk.ScrolledWindow()
+        self.transcript_scroll.add_css_class("main-transcript-scroll")
         self.transcript_scroll.add_css_class("transcript-scroll")
         self.transcript_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.transcript_scroll.set_child(self.transcript)
@@ -462,46 +760,48 @@ class ChatWindow(Adw.ApplicationWindow):
         adjustment.connect("value-changed", self._adjustment_value_changed)
         adjustment.connect("changed", self._adjustment_changed)
         self._sync_native_scroll(self.transcript_scroll)
-        compose = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
-        compose.set_margin_top(12)
-        compose.set_margin_bottom(13)
-        compose.set_margin_start(12)
-        compose.set_margin_end(12)
-        status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        compose = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        compose.add_css_class("composer")
+        status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        status_row.add_css_class("composer-status")
         self.status = Gtk.Label(label=" Not Connected", xalign=0)
+        self.status.add_css_class("response-status")
         self.status.add_css_class("muted")
         self.status.set_ellipsize(Pango.EllipsizeMode.END)
         self.status.set_width_chars(1)
         status_row.append(self.status)
         status_spacer = Gtk.Box()
+        status_spacer.add_css_class("status-spacer")
         status_spacer.set_hexpand(True)
         status_row.append(status_spacer)
         self.context_status = Gtk.Label(label="Context: —/—", xalign=1)
+        self.context_status.add_css_class("context-usage")
         self.context_status.add_css_class("muted")
         status_row.append(self.context_status)
         self.speed_status = Gtk.Label(label="— t/s", xalign=1)
+        self.speed_status.add_css_class("generation-speed")
         self.speed_status.add_css_class("muted")
         status_row.append(self.speed_status)
+        # Match one rendered space at the current font size.
         self.speed_status.set_margin_end(
             self.speed_status.create_pango_layout(" ").get_pixel_size()[0]
         )
         compose.append(status_row)
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        row.add_css_class("composer-frame-row")
         compose.append(row)
         frame = Gtk.Frame()
+        frame.add_css_class("main-frame")
         frame.add_css_class("composer-frame")
         frame.set_hexpand(True)
         row.append(frame)
-        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
-        inner.set_margin_top(8)
-        inner.set_margin_bottom(8)
-        inner.set_margin_start(10)
-        inner.set_margin_end(10)
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        inner.add_css_class("composer-content")
         frame.set_child(inner)
         self.prompt = Gtk.TextView()
+        self.prompt.add_css_class("prompt-view")
         self.prompt.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self.prompt.set_accepts_tab(False)
-        self.prompt.add_css_class("prompt-view")
         _, line_height = self.prompt.create_pango_layout("Ag").get_pixel_size()
         prompt_height = max(1, line_height) * 4
         self.prompt.set_size_request(-1, prompt_height)
@@ -510,12 +810,14 @@ class ChatWindow(Adw.ApplicationWindow):
         key_controller.connect("key-pressed", self._key_pressed)
         self.prompt.add_controller(key_controller)
         prompt_scroll = Gtk.ScrolledWindow()
+        prompt_scroll.add_css_class("prompt-scroll")
         prompt_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         prompt_scroll.set_child(self.prompt)
         prompt_scroll.set_min_content_height(prompt_height)
         prompt_scroll.set_max_content_height(1160)
         inner.append(prompt_scroll)
         self.send_button = Gtk.Button(icon_name="go-up-symbolic", tooltip_text="Send")
+        self.send_button.add_css_class("send-stop")
         self.send_button.add_css_class("suggested-action")
         self.send_button.set_valign(Gtk.Align.END)
         self.send_button.connect(
@@ -524,30 +826,32 @@ class ChatWindow(Adw.ApplicationWindow):
                 self.controller.stop() if self.busy and not self.prompt_text() else self._send()
             ),
         )
-        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        actions.add_css_class("composer-actions")
         hint = Gtk.Label(label="Shift+Enter for new line · Enter to send", xalign=0)
+        hint.add_css_class("prompt-hint")
         hint.set_hexpand(True)
         hint.add_css_class("muted")
         actions.append(hint)
         self.thinking_label = Gtk.Label(label="Thinking budget")
+        self.thinking_label.add_css_class("thinking-label")
         self.thinking_label.add_css_class("muted")
         actions.append(self.thinking_label)
         self.thinking_dropdown = Gtk.DropDown.new_from_strings(["auto"])
         self.thinking_dropdown.add_css_class("thinking-dropdown")
         self.thinking_dropdown.set_valign(Gtk.Align.CENTER)
-        self.thinking_dropdown.set_margin_end(8)
         self._thinking_values = [None]
         self._thinking_handler = self.thinking_dropdown.connect(
             "notify::selected", self._thinking_selected
         )
         actions.append(self.thinking_dropdown)
         attach = Gtk.Button(icon_name="mail-attachment-symbolic", tooltip_text="Attach documents")
+        attach.add_css_class("attach-documents-button")
         attach.connect("clicked", lambda *_: self._show_document_drop(self.chat["id"], attach=True))
         actions.append(attach)
         actions.append(self.send_button)
         inner.append(actions)
         main.append(compose)
-        self.send_button.add_css_class("send-stop")
         self._prompt_changed()
 
     def update_thinking_options(self):
@@ -926,8 +1230,9 @@ class ChatWindow(Adw.ApplicationWindow):
         active = None
         for chat in chats:
             row = Gtk.ListBoxRow()
+            row.add_css_class("chat-list-row")
             row.chat_id = chat["id"]
-            line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
             line.add_css_class("chat-row")
             pinned = chat.get("pinned", False)
             row.pinned = pinned
@@ -935,11 +1240,13 @@ class ChatWindow(Adw.ApplicationWindow):
                 row.add_css_class("active-chat")
                 active = row
             label = Gtk.Label(label=chat.get("title", "New chat"), xalign=0)
+            label.add_css_class("chat-list-label")
             label.set_ellipsize(Pango.EllipsizeMode.END)
             label.set_hexpand(True)
             line.append(label)
             label.set_max_width_chars(28)
             options_button = Gtk.MenuButton(icon_name="view-more-symbolic")
+            options_button.add_css_class("chat-list-options-button")
             options_button.add_css_class("chat-options-button")
             options_button.set_tooltip_text("Chat Options")
             menu = Gio.Menu()
@@ -1033,8 +1340,7 @@ class ChatWindow(Adw.ApplicationWindow):
         divider = None
         if previous is not None and previous.pinned and not row.pinned:
             divider = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-            divider.set_margin_top(6)
-            divider.set_margin_bottom(6)
+            divider.add_css_class("chat-list-divider")
         row.set_header(divider)
 
     def _prepare_chat_drag(self, _source, _x, _y, row):
@@ -1263,10 +1569,11 @@ class ChatWindow(Adw.ApplicationWindow):
     @staticmethod
     def _message_day_label(day):
         separator = Gtk.Label(label=message_day(day))
+        separator.add_css_class("message-date-separator")
         separator.message_date = day
         separator.add_css_class("muted")
-        separator.set_margin_top(12)
-        separator.set_margin_bottom(2 + separator.get_layout().get_pixel_size()[1])
+        # Add one measured text line to the fixed date spacing declared in CSS.
+        separator.set_margin_bottom(separator.get_layout().get_pixel_size()[1])
         return separator
 
     def append_message(self, role, text, reasoning="", timestamp=None, *, live=True, attach=True):
@@ -1278,16 +1585,18 @@ class ChatWindow(Adw.ApplicationWindow):
         if live and attach:
             self._refresh_message_dates()
         row = Gtk.Box()
-        row.set_layout_manager(BubbleLayout(role == "user"))
         row.add_css_class("message-row")
+        row.set_layout_manager(BubbleLayout(role == "user"))
         row.set_hexpand(True)
-        wrapper = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        wrapper.set_valign(Gtk.Align.START)
+        wrapper = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         wrapper.add_css_class("message")
+        wrapper.set_valign(Gtk.Align.START)
         wrapper.add_css_class("user-message" if role == "user" else "assistant-message")
-        column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        column.add_css_class("message-column")
         column.append(wrapper)
         time_label = Gtk.Label(label=message_time(timestamp))
+        time_label.add_css_class("message-time-label")
         time_label.add_css_class("muted")
         time_label.add_css_class("message-time")
         time_label.set_halign(Gtk.Align.END if role == "user" else Gtk.Align.START)
@@ -1297,6 +1606,7 @@ class ChatWindow(Adw.ApplicationWindow):
         row.time_label = time_label
         wrapper.message_row = row
         label = Gtk.Label(label="You" if role == "user" else "Assistant", xalign=0)
+        label.add_css_class("message-label")
         label.add_css_class("message-role")
         wrapper.append(label)
         if reasoning:
@@ -1311,17 +1621,21 @@ class ChatWindow(Adw.ApplicationWindow):
         return wrapper
 
     def _create_thinking_widget(self, wrapper, text, completed):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         box.add_css_class("thinking")
         header_button = Gtk.Button()
+        header_button.add_css_class("reasoning-header-button")
         header_button.set_has_frame(False)
         header_button.set_halign(Gtk.Align.START)
-        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        content.add_css_class("reasoning-content")
         arrow = Gtk.Label(label="▸" if completed else "▾")
+        arrow.add_css_class("reasoning-arrow")
         content.append(arrow)
         content.append(Gtk.Label(label="Thinking", xalign=0))
         header_button.set_child(content)
-        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        body.add_css_class("reasoning-body")
         body.thinking_arrow = arrow
         body.saved_text = text if completed else None
         if not completed:
@@ -1390,7 +1704,8 @@ class ChatWindow(Adw.ApplicationWindow):
             "assistant", "", timestamp=timestamp, attach=chat_id == self.chat["id"]
         )
         self.current_answer = MarkdownText(streaming=True)
-        self.current_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.current_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.current_content.add_css_class("streaming-response-current-content")
         self.current_content.append(self.current_answer)
         self.current_wrapper.append(self.current_content)
         self._answer_committed = 0
@@ -1566,26 +1881,26 @@ class ChatWindow(Adw.ApplicationWindow):
         chat = self.controller.store.load_settings(chat_id)
         dialog = Adw.Dialog(title="Rename Chat", content_width=380)
         toolbar = Adw.ToolbarView()
+        toolbar.add_css_class("rename-chat-toolbar")
         header = Adw.HeaderBar()
+        header.add_css_class("rename-chat-header")
         toolbar.add_top_bar(header)
         entry = Gtk.Entry(text=chat.get("title", "New chat"))
-        entry.set_margin_top(18)
-        entry.set_margin_bottom(18)
-        entry.set_margin_start(18)
-        entry.set_margin_end(18)
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        entry.add_css_class("rename-chat-entry")
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        content.add_css_class("rename-chat-content")
         content.append(entry)
-        buttons = Gtk.Box(spacing=8, halign=Gtk.Align.END)
-        buttons.set_margin_bottom(18)
-        buttons.set_margin_start(18)
-        buttons.set_margin_end(18)
+        buttons = Gtk.Box(halign=Gtk.Align.END)
+        buttons.add_css_class("rename-chat-buttons")
         cancel_button = Gtk.Button(label="Cancel")
+        cancel_button.add_css_class("rename-chat-cancel-button")
         cancel_button.connect("clicked", lambda *_: dialog.close())
         buttons.append(cancel_button)
         content.append(buttons)
         toolbar.set_content(content)
         dialog.set_child(toolbar)
         save_button = Gtk.Button(label="Save")
+        save_button.add_css_class("rename-chat-save-button")
         save_button.add_css_class("suggested-action")
 
         def save(*_):
@@ -1609,9 +1924,11 @@ class ChatWindow(Adw.ApplicationWindow):
             title="General" if chat_id is None else "Chat Settings",
             icon_name="user-available-symbolic",
         )
+        page.add_css_class("settings-page")
         page.connect("map", self._sync_native_scroll)
         dialog.add(page)
         group = Adw.PreferencesGroup()
+        group.add_css_class("settings-group")
         page.add(group)
         settings = self.controller.get_chat_settings(chat_id)
         group.set_title("Default Chat Settings" if chat_id is None else "Chat Settings")
@@ -1649,9 +1966,13 @@ class ChatWindow(Adw.ApplicationWindow):
             if chat_id is None:
                 row.add_suffix(button)
             else:
-                box = Gtk.Box(spacing=8)
+                box = Gtk.Box()
+                box.add_css_class("settings-control-group")
                 marker = Gtk.Button(tooltip_text="Delete override", valign=Gtk.Align.CENTER)
-                marker.set_child(Gtk.Image(icon_name="window-close-symbolic", pixel_size=24))
+                marker.add_css_class("override-delete-button")
+                marker.set_child(
+                    Gtk.Image(icon_name="window-close-symbolic", css_classes=["delete-icon"])
+                )
                 marker.add_css_class("flat")
                 marker.connect("clicked", delete_override, key)
                 box.append(marker)
@@ -1663,7 +1984,9 @@ class ChatWindow(Adw.ApplicationWindow):
 
         def add_switch(key, title, tooltip, *, inverted=False):
             row = Adw.ActionRow(title=title)
+            row.add_css_class("settings-row")
             button = Gtk.Switch(active=(settings[key] is True) != inverted, valign=Gtk.Align.CENTER)
+            button.add_css_class("settings-button")
             add_control(row, button, key)
             row.set_tooltip_text(tooltip)
 
@@ -1688,6 +2011,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 "global_memories", "Global Memories", "Recall and learn memories across chats."
             )
             memories_row = Adw.ActionRow(title="Manage Memories", activatable=True)
+            memories_row.add_css_class("settings-memories-row")
             memories_row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
             memories_row.connect("activated", lambda *_: self._show_memories(dialog))
             group.add(memories_row)
@@ -1728,6 +2052,7 @@ class ChatWindow(Adw.ApplicationWindow):
 
         def add_choices(title, options, key, setter):
             choice_group = Adw.PreferencesGroup(title=title)
+            choice_group.add_css_class("settings-choice-group")
             page.add(choice_group)
             controls = {}
 
@@ -1748,6 +2073,7 @@ class ChatWindow(Adw.ApplicationWindow):
             radio_group = None
             for value, label in options:
                 button = Gtk.CheckButton(valign=Gtk.Align.CENTER)
+                button.add_css_class("settings-button")
                 if radio_group is None:
                     radio_group = button
                 else:
@@ -1756,6 +2082,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 handler = button.connect("toggled", choice_changed, value)
                 controls[value] = button, handler
                 row = Adw.ActionRow(title=label)
+                row.add_css_class("settings-row")
                 add_control(row, button, key)
                 choice_group.add(row)
             setting_controls[key] = [
@@ -1782,7 +2109,9 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def _about_settings_page(self):
         page = Adw.PreferencesPage(title="About", icon_name="preferences-system-details-symbolic")
+        page.add_css_class("about-page")
         about = Adw.PreferencesGroup(title="Lopaca")
+        about.add_css_class("about-project")
         about.add(
             Adw.ActionRow(
                 title='Created by <a href="https://github.com/portets">Timothy Porter</a>',
@@ -1793,6 +2122,7 @@ class ChatWindow(Adw.ApplicationWindow):
         page.add(about)
 
         licenses = Adw.PreferencesGroup(title="Licenses")
+        licenses.add_css_class("about-licenses")
         page.add(licenses)
         for title, notice in (
             (
@@ -1817,6 +2147,7 @@ class ChatWindow(Adw.ApplicationWindow):
             licenses.add(Adw.ActionRow(title=title, subtitle=notice, use_markup=True))
 
         donations = Adw.PreferencesGroup(title="Donate")
+        donations.add_css_class("about-donations")
         donations.add(
             Adw.ActionRow(
                 title='<a href="https://buymeacoffee.com/portets">Buy Me a Coffee</a>',
@@ -1840,6 +2171,7 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def _model_settings_page(self):
         page = Adw.PreferencesPage(title="Model", icon_name="network-server-symbolic")
+        page.add_css_class("model-settings-page")
         page.connect("map", self._sync_native_scroll)
         config = dict(self.controller.store.load_app_settings().get("model_server", {}))
 
@@ -1851,14 +2183,16 @@ class ChatWindow(Adw.ApplicationWindow):
                 self._show_alert("Could not save settings", str(exc))
 
         paths = Adw.PreferencesGroup(
-            title="Local Model Server",
-            description="Leave blank to use a server on port 9931. ",
+            title="Local Model Server", description="Leave blank to use a server on port 9931. "
         )
+        paths.add_css_class("model-settings-paths")
         page.add(paths)
         for key, title in (("executable", "llama-server executable"), ("model", "Model file")):
             row = Adw.EntryRow(title=title, text=config.get(key, ""))
+            row.add_css_class("model-settings-row")
             row.connect("notify::text", lambda entry, _pspec, key=key: save(key, entry.get_text()))
             browse = Gtk.Button(icon_name="folder-open-symbolic", valign=Gtk.Align.CENTER)
+            browse.add_css_class("model-settings-browse")
             browse.add_css_class("flat")
             browse.set_tooltip_text("Choose " + title)
 
@@ -1881,26 +2215,24 @@ class ChatWindow(Adw.ApplicationWindow):
             paths.add(row)
 
         advanced_group = Adw.PreferencesGroup()
+        advanced_group.add_css_class("model-settings-advanced-group")
         advanced = Adw.ExpanderRow(title="Advanced", expanded=False)
+        advanced.add_css_class("model-settings-advanced")
         advanced.add_css_class("model-advanced")
         advanced_group.add(advanced)
         page.add(advanced_group)
-        advanced_content = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            spacing=18,
-            margin_top=12,
-            margin_bottom=12,
-            margin_start=12,
-            margin_end=12,
-        )
+        advanced_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        advanced_content.add_css_class("model-settings-advanced-content")
         advanced.add_row(advanced_content)
         reasoning = Adw.PreferencesGroup()
+        reasoning.add_css_class("model-settings-reasoning")
         advanced_content.append(reasoning)
         preserve = Adw.SwitchRow(
             title="Preserve Reasoning",
             subtitle="Include earlier thinking in future replies when the model supports it.",
             active=self.controller.get_chat_settings()["preserve_reasoning"] is True,
         )
+        preserve.add_css_class("model-settings-preserve")
 
         def save_reasoning(row, _pspec):
             active = row.get_active()
@@ -1915,12 +2247,14 @@ class ChatWindow(Adw.ApplicationWindow):
         reasoning.add(preserve)
         options = Adw.PreferencesGroup(
             title="Launch Parameters",
-            description="Leave fields blank to use Lopaca and llama-server defaults. Press connect "
-            "to apply new settings.",
+            description="Leave fields blank to use Lopaca and llama-server defaults. "
+            "Press connect to apply new settings.",
         )
+        options.add_css_class("model-settings-options")
         advanced_content.append(options)
         for key, title, hint in SERVER_FIELDS:
             row = Adw.EntryRow(title=title, text=str(config.get(key, "")))
+            row.add_css_class("model-settings-row")
             row.set_tooltip_text(f"--{key}: {hint}")
             row.connect("notify::text", lambda entry, _pspec, key=key: save(key, entry.get_text()))
             options.add(row)
@@ -1931,7 +2265,9 @@ class ChatWindow(Adw.ApplicationWindow):
             row = Adw.ActionRow(
                 title=title, subtitle=f"Pass --{key} on; unchecked uses server defaults"
             )
+            row.add_css_class("model-settings-row")
             check = Gtk.CheckButton(active=bool(config.get(key, False)), valign=Gtk.Align.CENTER)
+            check.add_css_class("model-settings-check")
             check.connect("toggled", lambda button, key=key: save(key, button.get_active()))
             row.add_suffix(check)
             row.set_activatable_widget(check)
@@ -1942,14 +2278,12 @@ class ChatWindow(Adw.ApplicationWindow):
             description="For example: --reasoning on --reasoning-budget 8192. "
             "Quote paths containing spaces.",
         )
+        extra.add_css_class("model-settings-extra")
         advanced_content.append(extra)
         text = Gtk.TextView(
             wrap_mode=Gtk.WrapMode.WORD_CHAR,
-            top_margin=10,
-            bottom_margin=10,
-            left_margin=10,
-            right_margin=10,
         )
+        text.add_css_class("model-settings-text")
         text.add_css_class("prompt-view")
         text.get_buffer().set_text(config.get("extra", ""))
         text.get_buffer().connect(
@@ -1958,19 +2292,24 @@ class ChatWindow(Adw.ApplicationWindow):
         scroll = Gtk.ScrolledWindow(
             min_content_height=95, max_content_height=200, propagate_natural_height=True, child=text
         )
+        scroll.add_css_class("model-settings-scroll")
         frame = Gtk.Frame(child=scroll)
+        frame.add_css_class("model-settings-frame")
         frame.add_css_class("composer-frame")
         extra.add(frame)
         actions = Adw.PreferencesGroup()
+        actions.add_css_class("model-settings-actions")
         page.add(actions)
         self._model_server_status = Gtk.Label(
             label=self.controller.model_server.status, wrap=True, xalign=0
         )
+        self._model_server_status.add_css_class("model-server-status")
         self._model_server_status.add_css_class("dim-label")
         actions.add(self._model_server_status)
         self._model_connect_button = Gtk.Button(
             label="Connect", halign=Gtk.Align.END, sensitive=not self.controller.model_server.busy
         )
+        self._model_connect_button.add_css_class("model-connect-button")
         self._model_connect_button.add_css_class("suggested-action")
         self._model_connect_button.connect(
             "clicked", lambda *_: self.controller.connect_model_server()
@@ -1981,14 +2320,19 @@ class ChatWindow(Adw.ApplicationWindow):
     def _settings_subpage(self, title, settings_dialog):
         dialog = Adw.Dialog(title=title, content_width=660, content_height=540)
         toolbar = Adw.ToolbarView()
+        toolbar.add_css_class("settings-subpage-toolbar")
         header = Adw.HeaderBar()
+        header.add_css_class("settings-subpage-header")
         back = Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="Back to App Settings")
+        back.add_css_class("settings-subpage-back")
         back.add_css_class("flat")
         header.pack_start(back)
         toolbar.add_top_bar(header)
         page = Adw.PreferencesPage()
+        page.add_css_class("settings-subpage-page")
         page.connect("map", self._sync_native_scroll)
         group = Adw.PreferencesGroup()
+        group.add_css_class("settings-subpage-group")
         page.add(group)
         toolbar.set_content(page)
         dialog.set_child(toolbar)
@@ -2012,16 +2356,24 @@ class ChatWindow(Adw.ApplicationWindow):
         )
         for memory_id, text, core in self.controller.list_memories():
             row = Adw.ActionRow(title=text, title_lines=0)
+            row.add_css_class("memories-row")
             entry = Gtk.Entry(text=text, hexpand=True, visible=False)
+            entry.add_css_class("memories-entry")
             row.add_prefix(entry)
-            controls = Gtk.Box(spacing=6)
+            controls = Gtk.Box()
+            controls.add_css_class("memories-controls")
             core_button = Gtk.CheckButton(label="Core", active=bool(core))
+            core_button.add_css_class("memories-core-button")
             controls.append(core_button)
             edit = Gtk.Button(icon_name="document-edit-symbolic", tooltip_text="Edit memory")
+            edit.add_css_class("memories-edit")
             edit.add_css_class("flat")
             edit.set_valign(Gtk.Align.CENTER)
             delete = Gtk.Button(tooltip_text="Delete memory")
-            delete.set_child(Gtk.Image(icon_name="window-close-symbolic", pixel_size=24))
+            delete.add_css_class("memories-delete")
+            delete.set_child(
+                Gtk.Image(icon_name="window-close-symbolic", css_classes=["delete-icon"])
+            )
             delete.add_css_class("flat")
             delete.set_valign(Gtk.Align.CENTER)
 
@@ -2100,8 +2452,10 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def _knowledge_settings_page(self, dialog):
         page = Adw.PreferencesPage(title="Knowledge", icon_name="application-x-addon-symbolic")
+        page.add_css_class("knowledge-page")
         page.connect("map", self._sync_native_scroll)
         group = Adw.PreferencesGroup(title="Knowledge Packs")
+        group.add_css_class("knowledge-group")
         page.add(group)
 
         def load(page):
@@ -2125,7 +2479,9 @@ class ChatWindow(Adw.ApplicationWindow):
             label="Merge Installed Packs",
             tooltip_text="Reduces disk usage, REQUIRES LONG PROCESSING TIME",
         )
-        actions = Gtk.Box(spacing=6)
+        merge.add_css_class("knowledge-packs-merge")
+        actions = Gtk.Box()
+        actions.add_css_class("knowledge-packs-actions")
         actions.append(merge)
         group.set_header_suffix(actions)
         if not hasattr(self, "_knowledge_jobs"):
@@ -2178,8 +2534,10 @@ class ChatWindow(Adw.ApplicationWindow):
                 row = Adw.ActionRow(
                     title=manifest["title"], subtitle=error or subtitle, use_markup=False
                 )
+                row.add_css_class("knowledge-packs-row")
                 if manifest.get("contains"):
                     info = Gtk.Label(label="Hover for pack information", valign=Gtk.Align.CENTER)
+                    info.add_css_class("knowledge-packs-info")
                     titles = manifest.get("constituent_titles", {})
                     info.set_tooltip_text(
                         "\n".join(
@@ -2190,6 +2548,7 @@ class ChatWindow(Adw.ApplicationWindow):
                     row.add_suffix(info)
                 pending = next((job for job in jobs if job.get("key") == key), None)
                 switch = Gtk.Switch(active=enabled, valign=Gtk.Align.CENTER)
+                switch.add_css_class("knowledge-packs-switch")
                 if error:
                     switch.set_sensitive(False)
                 if manifest.get("unused_by"):
@@ -2203,6 +2562,7 @@ class ChatWindow(Adw.ApplicationWindow):
                     valign=Gtk.Align.CENTER,
                     tooltip_text="Remove Pack",
                 )
+                remove.add_css_class("knowledge-packs-remove")
                 if pending:
                     add_status(row, pending)
                     switch.set_sensitive(False)
@@ -2252,6 +2612,7 @@ class ChatWindow(Adw.ApplicationWindow):
                     subtitle=error or format_size(release["size_bytes"]),
                     use_markup=False,
                 )
+                row.add_css_class("knowledge-packs-row")
                 row.add_css_class("dim-label")
                 pending = next((job for job in jobs if job.get("key") == key), None)
                 if pending:
@@ -2267,6 +2628,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 if job["kind"] != "merge":
                     continue
                 row = Adw.ActionRow(title=job["title"], use_markup=False)
+                row.add_css_class("knowledge-packs-row")
                 add_status(row, job)
                 group.add(row)
                 rows.append(row)
@@ -2283,8 +2645,9 @@ class ChatWindow(Adw.ApplicationWindow):
                 icon_name="software-update-available-symbolic" if update else "list-add-symbolic",
                 tooltip_text="Update Pack" if update else "Download Pack",
                 valign=Gtk.Align.CENTER,
-                sensitive=not pending and not compatibility_error(release),
+                sensitive=not pending and (not compatibility_error(release)),
             )
+            button.add_css_class("knowledge-packs-button")
             button.connect(
                 "clicked",
                 lambda *_: enqueue(
@@ -2300,7 +2663,9 @@ class ChatWindow(Adw.ApplicationWindow):
 
         def add_status(row, job):
             label = Gtk.Label(label=job["status"], valign=Gtk.Align.CENTER)
+            label.add_css_class("knowledge-packs-label")
             spinner = Gtk.Spinner(spinning=job.get("active", False), valign=Gtk.Align.CENTER)
+            spinner.add_css_class("knowledge-packs-spinner")
             indicators[id(job)] = label
             row.add_suffix(label)
             row.add_suffix(spinner)
@@ -2445,21 +2810,19 @@ class ChatWindow(Adw.ApplicationWindow):
     def _show_document_drop(self, chat_id, *, attach=False):
         dialog = Adw.Dialog(title="Add Documents", content_width=520)
         toolbar = Adw.ToolbarView()
+        toolbar.add_css_class("document-drop-toolbar")
         toolbar.add_top_bar(Adw.HeaderBar())
         box = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            valign=Gtk.Align.FILL,
-            margin_start=12,
-            margin_end=12,
-            margin_top=8,
-            margin_bottom=12,
-            height_request=160,
+            orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.FILL, height_request=160
         )
         box.add_css_class("document-drop-box")
         center = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL, spacing=10, valign=Gtk.Align.CENTER, vexpand=True
+            orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, vexpand=True
         )
-        center.append(Gtk.Image(icon_name="folder-download-symbolic", pixel_size=32))
+        center.add_css_class("document-drop-center")
+        center.append(
+            Gtk.Image(icon_name="folder-download-symbolic", css_classes=["document-drop-icon"])
+        )
         center.append(
             Gtk.Label(
                 label="Drag and drop files and folders here to add to this chat",
@@ -2543,6 +2906,7 @@ class ChatWindow(Adw.ApplicationWindow):
         # Use a normal transient window and block parent interaction explicitly.
         dialog = Adw.Window(title=title, transient_for=self, modal=False, destroy_with_parent=True)
         toolbar = Adw.ToolbarView()
+        toolbar.add_css_class("command-review-toolbar")
         toolbar.add_top_bar(Adw.HeaderBar())
         dialog.set_content(toolbar)
 
@@ -2555,17 +2919,15 @@ class ChatWindow(Adw.ApplicationWindow):
             return False
 
         dialog.connect("close-request", close_requested)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        box.set_margin_top(18)
-        box.set_margin_bottom(18)
-        box.set_margin_start(18)
-        box.set_margin_end(18)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.add_css_class("command-review-box")
         toolbar.set_content(box)
         for text in (
             description,
             f"Working directory: {self.controller.store.projects(self.chat['id'])}",
         ):
             label = Gtk.Label(label=text, xalign=0)
+            label.add_css_class("command-review-label")
             label.set_wrap(True)
             label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
             label.set_selectable(True)
@@ -2578,6 +2940,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 "Basic scan only; unhighlighted code can still be dangerous.",
                 xalign=0,
             )
+            legend.add_css_class("command-review-legend")
             legend.set_wrap(True)
             box.append(legend)
         lines = command.count("\n") + 1
@@ -2586,12 +2949,12 @@ class ChatWindow(Adw.ApplicationWindow):
                 label=f"↕ {lines} lines, scroll inside the preview to review the full command.",
                 xalign=0,
             )
+            notice.add_css_class("command-review-notice")
             notice.set_wrap(True)
             notice.add_css_class("heading")
             box.append(notice)
-        preview = Gtk.TextView(editable=False, cursor_visible=False, monospace=True)
-        preview.set_left_margin(4)
-        preview.set_right_margin(4)
+        preview = Gtk.TextView(editable=False, cursor_visible=False)
+        preview.add_css_class("command-review-preview")
         preview.set_wrap_mode(Gtk.WrapMode.NONE)
         buffer = preview.get_buffer()
         buffer.set_text(command)
@@ -2626,6 +2989,7 @@ class ChatWindow(Adw.ApplicationWindow):
         # Include dialog margins, frame, and a vertical scrollbar in the initial width.
         dialog_width = max(440, min(1000, command_width + 64))
         scroll = Gtk.ScrolledWindow()
+        scroll.add_css_class("command-review-scroll")
         # AUTOMATIC reserves a vertical scrollbar's minimum length even when
         # hidden. EXTERNAL keeps short previews at their actual text height;
         # wheel scrolling still works if a two-line preview is manually shrunk.
@@ -2643,16 +3007,20 @@ class ChatWindow(Adw.ApplicationWindow):
         scroll.set_vexpand(True)
         scroll.set_child(preview)
         frame = Gtk.Frame()
+        frame.add_css_class("command-review-frame")
         frame.add_css_class("command-preview")
         frame.set_vexpand(True)
         frame.set_child(scroll)
         box.append(frame)
-        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        buttons.add_css_class("command-review-buttons")
         buttons.set_halign(Gtk.Align.END)
         cancel_button = Gtk.Button(label="Cancel")
+        cancel_button.add_css_class("command-review-cancel-button")
         cancel_button.connect("clicked", close_preview)
         buttons.append(cancel_button)
         approve_button = Gtk.Button(label=action_label)
+        approve_button.add_css_class("command-review-approve-button")
         approve_button.add_css_class(
             "destructive-action"
             if any(risk.level == "danger" for risk in risks)
@@ -2679,6 +3047,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 body="Warning: potentially dangerous commands detected. Are you sure?",
             )
             warnings = Gtk.Label(label=risk_summary, xalign=0, wrap=True, selectable=True)
+            warnings.add_css_class("command-review-warnings")
             warnings.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
             alert.set_extra_child(warnings)
             alert.set_content_width(460)

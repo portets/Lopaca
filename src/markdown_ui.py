@@ -663,7 +663,8 @@ class MarkdownText(Gtk.Box):
     """Share prose/table rendering between stored messages and the streaming tail."""
 
     def __init__(self, text="", *, streaming=False):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.add_css_class("markdown-text")
         self._wrap_width = 680
         self._wrap_breaks = {}
         self._rewrap_id = 0
@@ -713,7 +714,7 @@ class MarkdownText(Gtk.Box):
             fragments.append(piece)
             yield False
 
-        self.set_spacing(0)
+        self.add_css_class("markdown-fragmented")
         for start, value in reversed(fragments):
             if self._wrap_width != width:
                 # A resize invalidated the old line starts.
@@ -756,7 +757,10 @@ class MarkdownText(Gtk.Box):
         blocks.extend(notes)
         grouped = []
         fragmented = self.streaming or len(text) > 8192
-        self.set_spacing(0 if fragmented else 6)
+        if fragmented:
+            self.add_css_class("markdown-fragmented")
+        else:
+            self.remove_css_class("markdown-fragmented")
         for kind, value in (
             _stream_text_blocks(blocks, self._wrap_boundary) if fragmented else blocks
         ):
@@ -782,9 +786,10 @@ class MarkdownText(Gtk.Box):
                 and kind == "fragment"
                 and blocks[index - 1][0] in ("fragment", "paragraph-start")
             )
-            margin = 6 if fragmented and index and not continuation else 0
-            if child.get_margin_top() != margin:
-                child.set_margin_top(margin)
+            if fragmented and index and not continuation:
+                child.add_css_class("markdown-block-gap")
+            else:
+                child.remove_css_class("markdown-block-gap")
             block = (kind, child, value)
             if index == len(self.blocks):
                 self.blocks.append(block)
@@ -857,7 +862,8 @@ def render_markdown_block(kind, value, widget=None):
     elif kind in ("quote", "note"):
         if widget is None:
             widget = Gtk.Frame()
-            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            content.add_css_class("markdown-quote-content")
             title = Gtk.Label(label="Note:" if kind == "note" else "Quote:", xalign=0)
             title.add_css_class("dim-label")
             content.append(title)
