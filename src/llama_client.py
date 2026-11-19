@@ -239,9 +239,16 @@ class LlamaClient:
         self, messages, preserve_thinking, thinking, tools, capacity, model_lock, stopped
     ):
         """Warm opportunistically, yielding the server between short prefill requests."""
-        if stopped() or not model_lock.acquire(blocking=False):
+        # A cancelled warm may still be finishing its last server request when
+        # the next debounce expires. Give the newest selection its turn.
+        while not stopped():
+            if model_lock.acquire(timeout=0.1):
+                break
+        else:
             return
         try:
+            if stopped():
+                return
             body = self._prefix_request(messages, preserve_thinking, thinking, tools)
             prompt = self._context_prompt(body, timeout=3)
             if stopped():

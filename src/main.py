@@ -272,7 +272,25 @@ class ChatController:
 
     def set_thinking(self, value):
         key, _, _ = self.thinking_choices()
+        settings = self.get_chat_settings(self.chat["id"])
+        previous = self._warm_thinking(self.chat, settings)
         self.set_setting(key, value, self.chat["id"])
+        current = self._warm_thinking(self.chat, {**settings, key: value})
+        # Positive budgets affect decoding only. Restart only for template changes.
+        if (previous or {}).get("chat_template_kwargs") != (current or {}).get(
+            "chat_template_kwargs"
+        ):
+            self._schedule_chat_warm()
+
+    def _warm_thinking(self, chat, settings):
+        thinking = self.thinking_parameters(chat["id"], settings=settings)
+        if thinking is None:
+            # Predict only the warm prefix. Auto still classifies the question at Send.
+            hint = chat.get("inference_stats", {}).get("last_auto_choice")
+            options = auto_thinking_options(self._thinking_levels)
+            if isinstance(hint, str) and hint in options:
+                return thinking_parameters(options[hint])
+        return thinking
 
     def thinking_parameters(self, chat_id=None, *, settings=None):
         key, _, choices = self.thinking_choices()
@@ -362,18 +380,10 @@ class ChatController:
                 ),
                 *self._history_messages(history, settings),
             ]
-            thinking = self.thinking_parameters(chat_id, settings=settings)
-            if thinking is None:
-                # Effort can change the very first template tokens. Use the last
-                # Auto choice only for warming; classify the actual question at Send.
-                hint = chat.get("inference_stats", {}).get("last_auto_choice")
-                options = auto_thinking_options(self._thinking_levels)
-                if isinstance(hint, str) and hint in options:
-                    thinking = thinking_parameters(options[hint])
             LlamaClient(self.settings).warm_chat(
                 messages,
                 settings["preserve_reasoning"] is True,
-                thinking,
+                self._warm_thinking(chat, settings),
                 chat_tools(files=True, memories=memories),
                 capacity,
                 self._model_lock,
