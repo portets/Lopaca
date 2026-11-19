@@ -154,20 +154,20 @@ class ChatStore:
         path = self.folder(chat_id) / "context.sqlite"
         if history and path.exists():
             with closing(sqlite3.connect(path)) as connection:
-                start = 0
                 if recent_only:
-                    size = connection.execute(
-                        "SELECT IFNULL(MAX(position) + 1, 0) FROM messages"
-                    ).fetchone()[0]
-                    start = max(0, size - 32)
-                recent = [
-                    json.loads(message)
-                    for (message,) in connection.execute(
-                        "SELECT message FROM messages WHERE position >= ? ORDER BY position",
-                        (start,),
-                    )
-                ]
-                data["messages"] = _PagedMessages(path, start, recent) if start else recent
+                    rows = connection.execute(
+                        "SELECT position, message FROM messages ORDER BY position DESC LIMIT 32"
+                    ).fetchall()
+                    recent = [json.loads(message) for _, message in reversed(rows)]
+                    start = rows[-1][0] if rows else 0
+                    data["messages"] = _PagedMessages(path, start, recent) if start else recent
+                else:
+                    data["messages"] = [
+                        json.loads(message)
+                        for (message,) in connection.execute(
+                            "SELECT message FROM messages ORDER BY position"
+                        )
+                    ]
         return data
 
     def save(self, data, *, message_start=0):
@@ -251,6 +251,7 @@ class ChatStore:
     def add_documents(self, chat_id, paths):
         folder = self.documents(chat_id)
         folder.mkdir(exist_ok=True)
+        copied = []
         for path, relative in paths:
             path = Path(path)
             if not path.is_file() or path.is_symlink():
@@ -260,6 +261,8 @@ class ChatStore:
             if target.exists():
                 target = folder / f"{path.stem}-{uuid.uuid4().hex[:6]}{path.suffix}"
             shutil.copyfile(path, target)
+            copied.append("documents/" + target.relative_to(folder).as_posix())
+        return copied
 
     def delete(self, chat_id):
         shutil.rmtree(self.folder(chat_id))

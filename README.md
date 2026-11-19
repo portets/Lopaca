@@ -26,7 +26,7 @@ Then just run it using your menu shortcut.
 To uninstall, run `./uninstall.sh`. You can keep your chats and settings or delete all Lopaca data.
 
 # Local documents
-Add readable text documents through a chat's menu, or place them in that chat's `documents/` folder. Before each prompt, a background worker checks for new, changed, and deleted files and updates `documents.sqlite` incrementally.
+Choose **Add Documents** from a chat’s menu and drag files or folders into the drop box. The folder button beside **Send** opens the same box and tells the model about the documents for your next message in that chat. Lopaca copies supported documents into that chat's `documents/` folder. You can also place files there directly. Before each prompt, a background worker checks for new, changed, and deleted files and updates `documents.sqlite` incrementally.
 
 Retrieval uses SQLite FTS5/BM25, phrase and identifier matching, and filename/section searches combined with Reciprocal Rank Fusion (RRF). Relevant excerpts are injected into the current request as document reference data, not saved in chat history.
 
@@ -37,7 +37,6 @@ Retrieval uses SQLite FTS5/BM25, phrase and identifier matching, and filename/se
 # TO-DO
 - Add embedding model support?
 - Add PDF and other docs support
-- Combine add folder and add documents? gtk doesn't normally allow it
 - Make features list
 - More advanced agentic mode with more tools, web searching, etc
 

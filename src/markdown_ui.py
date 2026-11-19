@@ -261,8 +261,10 @@ def reference_links(text):
 
 
 def markdown_footnotes(text):
+    if "[^" not in text:
+        return text, []
     definitions, order = {}, []
-    fences = [(match.start(), match.end()) for match in CODE_BLOCK_PATTERN.finditer(text)]
+    fences = [match.span() for match in CODE_BLOCK_PATTERN.finditer(text)]
 
     def definition(match):
         if any(start <= match.start() < end for start, end in fences):
@@ -271,7 +273,7 @@ def markdown_footnotes(text):
         return ""
 
     text = re.sub(r"(?m)^ {0,3}\[\^([^\]\n]+)\]:[ \t]*(.*(?:\n[ \t]{4}.*)*)$", definition, text)
-    fences = [(match.start(), match.end()) for match in CODE_BLOCK_PATTERN.finditer(text)]
+    fences = [match.span() for match in CODE_BLOCK_PATTERN.finditer(text)]
 
     def reference(match):
         key = match[3]
@@ -622,6 +624,16 @@ class MarkdownTable(HorizontalScrollFrame):
 _INLINE_PROSE_MARKUP = re.compile(r"[\\`*_~=^$<&@\[]|https?://|www\.")
 
 
+def _wrapped_fragments(text, wrap_boundary):
+    """Yield source offsets and display text at natural line breaks."""
+    start = 0
+    while len(text) - start > 2048:
+        end = start + wrap_boundary(text[start : start + 2048])
+        yield start, text[start:end].removesuffix("\n").rstrip(" ")
+        start = end
+    yield start, text[start:]
+
+
 def _stream_text_blocks(blocks, wrap_boundary):
     """Bound plain-text layouts while streaming. Keep inline Markdown spans intact."""
     for kind, value in blocks:
@@ -634,13 +646,8 @@ def _stream_text_blocks(blocks, wrap_boundary):
             if len(paragraph) < 2048 or _INLINE_PROSE_MARKUP.search(paragraph):
                 yield "prose", paragraph
                 continue
-            start = 0
-            while len(paragraph) - start > 2048:
-                end = start + wrap_boundary(paragraph[start : start + 2048])
-                kind = "paragraph-start" if i and not start else "fragment"
-                yield kind, paragraph[start:end].removesuffix("\n").rstrip(" ")
-                start = end
-            yield "paragraph-start" if i and not start else "fragment", paragraph[start:]
+            for start, fragment in _wrapped_fragments(paragraph, wrap_boundary):
+                yield "paragraph-start" if i and not start else "fragment", fragment
 
 
 class _WrappedBoxLayout(Gtk.BoxLayout):
@@ -701,27 +708,23 @@ class MarkdownText(Gtk.Box):
         # Find real wrap boundaries from the start, then reveal from the end.
         # Keep the same MarkdownText so resize rewraps the visible text together.
         self._wrap_width = width
-        starts = [0]
-        while len(text) - starts[-1] > 2048:
-            start = starts[-1]
-            starts.append(start + self._wrap_boundary(text[start : start + 2048]))
+        fragments = []
+        for piece in _wrapped_fragments(text, self._wrap_boundary):
+            fragments.append(piece)
             yield False
 
         self.set_spacing(0)
-        end = len(text)
-        for start in reversed(starts):
+        for start, value in reversed(fragments):
             if self._wrap_width != width:
                 # A resize invalidated the old line starts.
                 self.set_text(text)
                 yield True
                 return
-            value = text[start:end].removesuffix("\n").rstrip(" ")
             label = render_markdown_block("fragment", value)
             self.prepend(label)
             self.blocks.insert(0, ("fragment", label, value))
             self._source_text = text[start:]
             yield True
-            end = start
 
     def set_text(self, text):
         # While a fenced block streams, its preceding prose often stays identical.
@@ -799,7 +802,8 @@ class MarkdownText(Gtk.Box):
 
 def selectable_markdown(label, blocks):
     """Use one label for adjacent headings, paragraphs and lists so selection spans them."""
-    parts, plain, previous = [], "", None
+    parts, offset, previous = [], 0, None
+    has_anchors = any(kind in ("heading", "footnote") for kind, _ in blocks)
     label.markdown_anchors = []
     for kind, value in blocks:
         if kind == "prose" and not value:
@@ -809,24 +813,25 @@ def selectable_markdown(label, blocks):
         separator = "\n" if kind == previous == "item" else "\n\n"
         if parts:
             parts.append(separator)
-            plain += separator
+            offset += len(separator)
         if kind == "heading":
             level, text = value
             size = ("xx-large", "x-large", "large", "medium", "medium", "small")[level - 1]
             markup = f'<span size="{size}" weight="bold">{inline_markdown(text)}</span>'
             anchor = re.sub(r"[^\w\s-]", "", text.casefold()).replace(" ", "-")
-            label.markdown_anchors.append((anchor, len(plain.encode("utf-8"))))
+            label.markdown_anchors.append((anchor, offset))
         elif kind in ("item", "footnote"):
             indent, marker, text = value if kind == "item" else (0, f"{value[0]}.", value[1])
             markup = (
                 "\u2003" * min(indent // 2, 20) + html.escape(marker) + " " + inline_markdown(text)
             )
             if kind == "footnote":
-                label.markdown_anchors.append((f"fn-{value[0]}", len(plain.encode("utf-8"))))
+                label.markdown_anchors.append((f"fn-{value[0]}", offset))
         else:
             markup = inline_markdown(value)
         parts.append(markup)
-        plain += html.unescape(re.sub(r"<[^>]*>", "", markup))
+        if has_anchors:
+            offset += len(html.unescape(re.sub(r"<[^>]*>", "", markup)).encode("utf-8"))
         previous = kind
     if any(kind == "heading" for kind, _ in blocks):
         label.remove_css_class("chat-prose")

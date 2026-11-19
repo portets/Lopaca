@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Application controller, request coordination and Lopaca entry point."""
 
+import json
 import re
 import sqlite3
 import subprocess
@@ -8,6 +9,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from concurrent.futures import Future, wait
 from contextlib import suppress
 from pathlib import Path
 
@@ -69,6 +71,8 @@ def build_system_prompt(agent_mode, style="neutral", *, memories=False):
         "tool results over historical claims about file availability or tool errors. Answer "
         "directly when excerpts suffice. Use file tools only when missing details materially "
         "affect correctness; read a known path directly and avoid redundant searches. "
+        "If the user refers to an attachment without a known path, list documents/** with "
+        "search_files before reporting it missing. "
         "When a supplied personal memory names an unfamiliar specialized subject and pack "
         "excerpts do not explain it, search knowledge packs before making factual claims. "
         "For specific models, versions or variants, use matching source details rather "
@@ -147,6 +151,7 @@ class ChatController:
         self._chat_speeds = {}
         self._drafts = {}
         self._document_imports = {}
+        self._draft_attachments = {}
         self._thinking_levels = []
         self._disk_sizes, self._disk_total = {}, None
         self.connected = None
@@ -455,20 +460,24 @@ class ChatController:
         else:
             self.refresh()
         self._drafts.pop(chat_id, None)
+        self._draft_attachments.pop(chat_id, None)
 
-    def add_documents(self, paths, chat_id=None):
+    def add_documents(self, paths, chat_id=None, *, attach=False):
         chat_id = chat_id or self.chat["id"]
-        ready = threading.Event()
+        ready = Future()
+        if attach:
+            self._draft_attachments.setdefault(chat_id, []).append(ready)
         self._document_imports[chat_id] = (*self._document_imports.get(chat_id, ()), ready)
         threading.Thread(
             target=self._import_documents, args=(list(paths), chat_id, ready), daemon=True
         ).start()
 
     def _import_documents(self, paths, chat_id, ready):
+        copied = []
         try:
-            self._add_documents(paths, chat_id)
+            copied = self._add_documents(paths, chat_id)
         finally:
-            ready.set()
+            ready.set_result(copied)
             self.view.dispatch(self._import_finished, chat_id, ready)
 
     def _import_finished(self, chat_id, ready):
@@ -506,15 +515,17 @@ class ChatController:
                     skipped.append(item)
                 else:
                     supported.append((item, relative))
+        copied = []
         if supported:
             try:
-                self.store.add_documents(chat_id, supported)
+                copied = self.store.add_documents(chat_id, supported)
                 self.document_indexer.schedule(self.store.documents(chat_id))
                 self.view.dispatch(self.view.notify, "Documents added to this chat's folder")
             except OSError as exc:
                 self.view.dispatch(self.view.notify, f"Could not add documents: {exc}")
         if skipped:
             self.view.dispatch(self.view.show_document_warning, skipped)
+        return copied
 
     def open_folder(self, chat_id):
         try:
@@ -609,7 +620,7 @@ class ChatController:
     def set_memory_core(self, memory_id, core):
         self.memories.set_core(memory_id, core)
 
-    def send(self, text, chat_id=None, *, steering=False):
+    def send(self, text, chat_id=None, *, steering=False, attachments=None):
         if not self.chat:
             return False
         text = text.strip()
@@ -620,8 +631,10 @@ class ChatController:
             self.view.notify("Not connected")
             return False
         self.cancel_chat_warm()
+        if attachments is None:
+            attachments = self._draft_attachments.pop(chat_id, ())
         if self.busy:
-            self._pending_messages.append((chat_id, text, False))
+            self._pending_messages.append((chat_id, text, False, attachments))
             if (
                 chat_id == self._generation_chat_id
                 and self._generation_streaming
@@ -686,6 +699,7 @@ class ChatController:
                 self.settings.enable_command_approval,
                 settings["rag_query_expansion"] is True,
                 self._document_imports.get(chat_id, ()),
+                attachments,
             ),
             daemon=True,
         ).start()
@@ -733,19 +747,28 @@ class ChatController:
 
     def _drain_messages(self):
         while self.connected and not self.busy and self._pending_messages:
-            chat_id, text, steering = self._pending_messages.popleft()
+            chat_id, text, steering, attachments = self._pending_messages.popleft()
             if self.store.folder(chat_id).exists():
-                self.send(text, chat_id, steering=steering)
+                self.send(text, chat_id, steering=steering, attachments=attachments)
 
     def _stream(
-        self, messages, preserve_thinking, query, folder, agent_mode, query_expansion, imports=()
+        self,
+        messages,
+        preserve_thinking,
+        query,
+        folder,
+        agent_mode,
+        query_expansion,
+        imports=(),
+        attachments=(),
     ):
         # A prompt submitted during copying waits off the GTK thread for those files.
-        for ready in imports:
-            while not ready.wait(0.1):
-                if self.stop_requested:
-                    self.view.dispatch(self.finish_response, "", "", None)
-                    return
+        pending = imports
+        while pending:
+            _, pending = wait(pending, timeout=0.1)
+            if self.stop_requested:
+                self.view.dispatch(self.finish_response, "", "", None)
+                return
         self.document_indexer.schedule(folder, priority=True)
         self.document_indexer.wait(folder, lambda: self.stop_requested)
         # Usually already indexed in the background; finish a just-rolled archive before
@@ -760,14 +783,30 @@ class ChatController:
             if self._model_lock.acquire(timeout=0.1):
                 try:
                     self._respond(
-                        messages, preserve_thinking, query, folder, agent_mode, query_expansion
+                        messages,
+                        preserve_thinking,
+                        query,
+                        folder,
+                        agent_mode,
+                        query_expansion,
+                        attached=[path for batch in attachments for path in batch.result()],
                     )
                 finally:
                     self._model_lock.release()
                 return
         self.view.dispatch(self.finish_response, "", "", None)
 
-    def _respond(self, messages, preserve_thinking, query, folder, agent_mode, query_expansion):
+    def _respond(
+        self,
+        messages,
+        preserve_thinking,
+        query,
+        folder,
+        agent_mode,
+        query_expansion,
+        *,
+        attached=(),
+    ):
         pending = self._generation_clarification
         self._generation_clarification = None
         retrieved = []
@@ -884,6 +923,12 @@ class ChatController:
         context_user_content = messages[-1]["content"]
         # Keep fresh evidence beside the current question, after historical answers/reasoning.
         # These are request-local copies; the user's stored message remains unchanged.
+        if attached:
+            messages[-1]["content"] += (
+                "\n\n[Application context: the user attached documents to this message. "
+                "Use them if relevant. Attached paths (JSON data): " + json.dumps(attached[:12])
+                + (f" and {len(attached) - 12} more files" if len(attached) > 12 else "") + "]"
+            )
         messages[-1]["content"] += format_document_context(
             retrieved, self.settings.max_context_chars
         )
@@ -1173,9 +1218,9 @@ class ChatController:
         else:
             self.view.end_response()
         if steering:
-            for index, (queued_chat, text, _) in enumerate(self._pending_messages):
+            for index, (queued_chat, text, _, attachments) in enumerate(self._pending_messages):
                 if queued_chat == chat["id"]:
-                    self._pending_messages[index] = (queued_chat, text, interrupted)
+                    self._pending_messages[index] = (queued_chat, text, interrupted, attachments)
                     break
         self._drain_messages()
 

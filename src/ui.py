@@ -41,7 +41,7 @@ window.lopaca-main, .transcript-scroll, .transcript {
     padding: 4px 0;
     min-width: 286px;
 }
-.sidebar, .composer-frame {
+.sidebar, .composer-frame, .document-drop-box {
     background-color: alpha(@headerbar_shade_color,0.4);
     border: 1px solid @borders;
     border-radius: 10px;
@@ -351,10 +351,10 @@ class ChatWindow(Adw.ApplicationWindow):
         sidebar.add_css_class("sidebar")
         sidebar.set_size_request(252, -1)
         sidebar.set_hexpand(False)
-        sidebar.set_margin_top(12)
-        sidebar.set_margin_bottom(11)
-        sidebar.set_margin_start(10)
-        sidebar.set_margin_end(10)
+        sidebar.set_margin_top(10)
+        sidebar.set_margin_bottom(9)
+        sidebar.set_margin_start(8)
+        sidebar.set_margin_end(8)
         root.append(sidebar)
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         top.set_margin_top(4)
@@ -463,10 +463,10 @@ class ChatWindow(Adw.ApplicationWindow):
         adjustment.connect("changed", self._adjustment_changed)
         self._sync_native_scroll(self.transcript_scroll)
         compose = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
-        compose.set_margin_top(14)
-        compose.set_margin_bottom(15)
-        compose.set_margin_start(14)
-        compose.set_margin_end(14)
+        compose.set_margin_top(12)
+        compose.set_margin_bottom(13)
+        compose.set_margin_start(12)
+        compose.set_margin_end(12)
         status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
         self.status = Gtk.Label(label=" Not Connected", xalign=0)
         self.status.add_css_class("muted")
@@ -541,6 +541,9 @@ class ChatWindow(Adw.ApplicationWindow):
             "notify::selected", self._thinking_selected
         )
         actions.append(self.thinking_dropdown)
+        attach = Gtk.Button(icon_name="mail-attachment-symbolic", tooltip_text="Attach documents")
+        attach.connect("clicked", lambda *_: self._show_document_drop(self.chat["id"], attach=True))
+        actions.append(attach)
         actions.append(self.send_button)
         inner.append(actions)
         main.append(compose)
@@ -573,6 +576,14 @@ class ChatWindow(Adw.ApplicationWindow):
             self.update_thinking_options()
             self._show_alert("Could not save thinking setting", str(exc))
 
+    def _store_stream_update(self, pending, callback, args):
+        if callback == self.controller._update_inference_stats and callback in pending:
+            args = tuple(
+                new if new is not None else old
+                for new, old in zip(args, pending[callback], strict=True)
+            )
+        pending[callback] = args
+
     def dispatch(self, callback, *args):
         if callback in (
             self.update_answer,
@@ -584,16 +595,10 @@ class ChatWindow(Adw.ApplicationWindow):
             with self._stream_lock:
                 if not self._incoming_stream:
                     GLib.idle_add(self._drain_stream)
-                previous = self._incoming_stream.get(callback)
                 if callback == self.update_thinking:
                     self._incoming_stream.setdefault(callback, []).append(args[0])
-                elif callback == self.controller._update_inference_stats and previous:
-                    self._incoming_stream[callback] = tuple(
-                        new if new is not None else old
-                        for new, old in zip(args, previous, strict=True)
-                    )
                 else:
-                    self._incoming_stream[callback] = args
+                    self._store_stream_update(self._incoming_stream, callback, args)
         elif callback == self.controller.finish_response:
             GLib.idle_add(self._finish_stream_update, callback, args)
         else:
@@ -618,12 +623,7 @@ class ChatWindow(Adw.ApplicationWindow):
             ):
                 self._stream_updates.pop(callback, None)
                 return callback(*args)
-        if callback == self.controller._update_inference_stats and callback in self._stream_updates:
-            args = tuple(
-                new if new is not None else old
-                for new, old in zip(args, self._stream_updates[callback], strict=True)
-            )
-        self._stream_updates[callback] = args
+        self._store_stream_update(self._stream_updates, callback, args)
         if self._stream_update_id is None:
             self._stream_update_id = GLib.timeout_add(20, self._flush_stream_updates)
         return False
@@ -953,16 +953,12 @@ class ChatWindow(Adw.ApplicationWindow):
                     ),
                 ),
                 ("Open Folder", lambda chat_id=chat["id"]: self.controller.open_folder(chat_id)),
-                ("Add Documents", lambda chat_id=chat["id"]: self._choose_documents(chat_id)),
-                (
-                    "Add Folder",
-                    lambda chat_id=chat["id"]: self._choose_documents(chat_id, folder=True),
-                ),
+                ("Add Documents", lambda chat_id=chat["id"]: self._show_document_drop(chat_id)),
                 ("Chat Settings", lambda chat_id=chat["id"]: self._show_settings(chat_id)),
                 ("Delete Chat", lambda chat_id=chat["id"]: self._confirm_delete_chat(chat_id)),
             )
             for index, (title, callback) in enumerate(choices):
-                if index in (0, 2, 5):
+                if index in (0, 2, 4):
                     section = Gio.Menu()
                     menu.append_section(None, section)
                 action = Gio.SimpleAction.new(f"option{index}", None)
@@ -1210,7 +1206,7 @@ class ChatWindow(Adw.ApplicationWindow):
             text,
             message.get("reasoning_content", ""),
             message["timestamp"],
-            refresh_dates=False,
+            live=False,
             attach=attach,
         )
         if earlier:
@@ -1273,15 +1269,13 @@ class ChatWindow(Adw.ApplicationWindow):
         separator.set_margin_bottom(2 + separator.get_layout().get_pixel_size()[1])
         return separator
 
-    def append_message(
-        self, role, text, reasoning="", timestamp=None, *, refresh_dates=True, attach=True
-    ):
+    def append_message(self, role, text, reasoning="", timestamp=None, *, live=True, attach=True):
         if role == "assistant":
             text = self.controller.visible_answer(text)
         timestamp = datetime.now().timestamp() if timestamp is None else timestamp
         if attach:
             self._append_message_day(timestamp)
-        if refresh_dates and attach:
+        if live and attach:
             self._refresh_message_dates()
         row = Gtk.Box()
         row.set_layout_manager(BubbleLayout(role == "user"))
@@ -1312,7 +1306,7 @@ class ChatWindow(Adw.ApplicationWindow):
             append_markdown(wrapper, text, extractor, self._review_command)
         if attach:
             self.transcript.append(row)
-        if role == "user" and attach:
+        if role == "user" and attach and live:
             self.scroll_bottom(force=True)
         return wrapper
 
@@ -2448,33 +2442,47 @@ class ChatWindow(Adw.ApplicationWindow):
 
         threading.Thread(target=fetch_catalog, daemon=True).start()
 
-    def _choose_documents(self, chat_id, *, folder=False):
-        if self.chat and self.chat["id"] != chat_id:
-            self.controller.open_chat(chat_id)
-        chooser = Gtk.FileDialog.new()
-        chooser.set_accept_label("Add")
-        if folder:
-            chooser.set_title("Add a document folder")
-            chooser.select_folder(self, None, self._folder_chosen, chat_id)
-        else:
-            chooser.set_title("Add documents to this chat")
-            chooser.open_multiple(self, None, self._documents_chosen, chat_id)
+    def _show_document_drop(self, chat_id, *, attach=False):
+        dialog = Adw.Dialog(title="Add Documents", content_width=520)
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(Adw.HeaderBar())
+        box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            valign=Gtk.Align.FILL,
+            margin_start=12,
+            margin_end=12,
+            margin_top=8,
+            margin_bottom=12,
+            height_request=160,
+        )
+        box.add_css_class("document-drop-box")
+        center = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=10, valign=Gtk.Align.CENTER, vexpand=True
+        )
+        center.append(Gtk.Image(icon_name="folder-download-symbolic", pixel_size=32))
+        center.append(
+            Gtk.Label(
+                label="Drag and drop files and folders here to add to this chat",
+                wrap=True,
+                justify=Gtk.Justification.CENTER,
+            )
+        )
+        box.append(center)
+        target = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
 
-    def _documents_chosen(self, chooser, result, chat_id):
-        try:
-            files = chooser.open_multiple_finish(result)
-        except GLib.Error:
-            return
-        paths = (files.get_item(i).get_path() for i in range(files.get_n_items()))
-        self.controller.add_documents([path for path in paths if path], chat_id)
+        def dropped(_target, files, _x, _y):
+            paths = [path for file in files.get_files() if (path := file.get_path())]
+            if not paths:
+                return False
+            self.controller.add_documents(paths, chat_id, attach=attach)
+            dialog.close()
+            return True
 
-    def _folder_chosen(self, chooser, result, chat_id):
-        try:
-            folder = chooser.select_folder_finish(result)
-        except GLib.Error:
-            return
-        if path := folder.get_path():
-            self.controller.add_documents([path], chat_id)
+        target.connect("drop", dropped)
+        box.add_controller(target)
+        toolbar.set_content(box)
+        dialog.set_child(toolbar)
+        dialog.present(self)
 
     def show_document_warning(self, paths):
         detail = (
