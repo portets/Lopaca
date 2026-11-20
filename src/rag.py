@@ -3,6 +3,7 @@
 import ast
 import codecs
 import hashlib
+import importlib
 import itertools
 import json
 import logging
@@ -93,7 +94,7 @@ def parse_document_questions(text, passages):
 class DocumentIndexer:
     """Serialize background indexing, with at most one queued check per folder."""
 
-    def __init__(self, settings, generate_questions, model_lock, on_processing):
+    def __init__(self, settings, generate_questions, model_lock, on_processing, on_missing=None):
         self.settings = settings
         self.enabled = settings.rag_model_indexing
         self.active_folder = None
@@ -101,6 +102,8 @@ class DocumentIndexer:
         self._generate_questions = generate_questions
         self._model_lock = model_lock
         self._on_processing = on_processing
+        self._on_missing = on_missing
+        self._missing_libraries = set()
         self._retry_after = 0
         self._hint_version = (
             "questions-v1:"
@@ -139,6 +142,13 @@ class DocumentIndexer:
             if stopped():
                 break
 
+    def _missing_document(self, path, error):
+        key = (path.parent, str(error))
+        if key not in self._missing_libraries:
+            self._missing_libraries.add(key)
+            if self._on_missing:
+                self._on_missing(str(error))
+
     def _run(self):
         while True:
             _priority, _sequence, folder, ready = self._queue.get()
@@ -152,7 +162,9 @@ class DocumentIndexer:
             try:
                 if folder.is_dir():
                     with closing(_connect_index(folder.parent / "documents.sqlite")) as connection:
-                        changed = _index(connection, folder, self.settings, lambda: False)
+                        changed = _index(
+                            connection, folder, self.settings, lambda: False, self._missing_document
+                        )
                         version = self._hint_version if self.enabled else "off"
                         state = connection.execute(
                             "SELECT value FROM index_state WHERE key = 'model_indexing'"
@@ -351,17 +363,86 @@ def numbered_excerpt(path, lines, start_line, line_count, *, text_key="text"):
     }
 
 
+# Optional document readers. Module names differ from their installable packages.
+DOCUMENT_LIBRARIES = {
+    ".docx": ("docx", "python-docx"),
+    ".pptx": ("pptx", "python-pptx"),
+    ".xlsx": ("openpyxl", "openpyxl"),
+}
+
+
+class MissingDocumentLibraryError(ValueError):
+    def __init__(self, suffix, package):
+        super().__init__(
+            f"Warning: {suffix} files require the {package} library. "
+            "Install it and restart Lopaca to process these files."
+        )
+
+
+def _office_text(source, suffix):
+    module_name, package = DOCUMENT_LIBRARIES[suffix]
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name == module_name:
+            raise MissingDocumentLibraryError(suffix, package) from exc
+        raise
+    lines = ["Extracted document text; line numbers refer to this extraction."]
+    if suffix == ".docx":
+        document = module.Document(source)
+        for block in document.iter_inner_content():
+            if hasattr(block, "rows"):
+                lines.extend("\t".join(cell.text for cell in row.cells) for row in block.rows)
+            else:
+                lines.append(block.text)
+    elif suffix == ".pptx":
+        document = module.Presentation(source)
+        for number, slide in enumerate(document.slides, 1):
+            lines.append(f"# Slide {number}")
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    lines.append(shape.text_frame.text)
+                if shape.has_table:
+                    lines.extend(
+                        "\t".join(cell.text for cell in row.cells) for row in shape.table.rows
+                    )
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame is not None:
+                lines.extend(("## Speaker notes", slide.notes_slide.notes_text_frame.text))
+    else:
+        document = module.load_workbook(source, read_only=True, data_only=False)
+        try:
+            for sheet in document:
+                lines.append(f"# Sheet: {sheet.title}")
+                for row in sheet.iter_rows():
+                    cells = [
+                        f"{cell.coordinate}: {cell.value}" for cell in row if cell.value is not None
+                    ]
+                    if cells:
+                        lines.append(" | ".join(cells))
+        finally:
+            document.close()
+    return "\n".join(lines)
+
+
 def read_document(path):
     """Read common text encodings, skipping likely binary and unsupported documents."""
     try:
         with path.open("rb") as source:
-            return read_document_stream(source)
+            return read_document_stream(source, suffix=path.suffix.lower())
     except OSError:
         return None
 
 
-def read_document_stream(source):
+def read_document_stream(source, *, suffix=""):
     """Decode a binary stream using the same text checks for RAG and file tools."""
+    if suffix in DOCUMENT_LIBRARIES:
+        try:
+            return _office_text(source, suffix)
+        except MissingDocumentLibraryError:
+            raise
+        except Exception as exc:
+            logging.warning("Could not extract %s document: %s", suffix, exc)
+            return None
     sample = source.read(8192)
     if sample.startswith(b"%PDF-"):
         return None
@@ -676,7 +757,7 @@ def _create_chunks(connection):
         connection.execute("PRAGMA user_version = 2")
 
 
-def _index(connection, folder, settings, stopped):
+def _index(connection, folder, settings, stopped, on_missing=None):
     connection.executescript("""
         CREATE TABLE IF NOT EXISTS files (
             path TEXT PRIMARY KEY, mtime_ns INTEGER, ctime_ns INTEGER, size INTEGER
@@ -686,7 +767,7 @@ def _index(connection, folder, settings, stopped):
 
     """)
     _create_chunks(connection)
-    signature = f"5:{settings.chunk_chars}:{settings.chunk_overlap}"
+    signature = f"6:{settings.chunk_chars}:{settings.chunk_overlap}"
     state = connection.execute("SELECT value FROM index_state WHERE key = 'chunking'").fetchone()
     changed = state != (signature,)
     if changed:
@@ -720,6 +801,10 @@ def _index(connection, folder, settings, stopped):
             after = path.stat()
             if stamp != (after.st_mtime_ns, after.st_ctime_ns, after.st_size):
                 continue  # Retry a file being edited on the next request.
+        except MissingDocumentLibraryError as exc:
+            if on_missing:
+                on_missing(path, exc)
+            continue  # Leave it uncached so installing its reader permits a retry.
         except OSError:
             continue
         with connection:
@@ -1329,7 +1414,9 @@ def document_inventory(folder):
         length += len(encoded) + 2
     partial = len(names) < len(rows)
     return (
-        "Available document paths (JSON data, filenames only): [" + ", ".join(names) + "]. "
+        "Available document paths (JSON data, filenames only): ["
+        + ", ".join(names)
+        + "]. "
         + ("This list is partial; search_files can list additional paths. " if partial else "")
         + "These files are available even when no excerpts match. Use read_file on a listed "
         "path when relevant to the question.\n\n"

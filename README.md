@@ -30,6 +30,10 @@ Choose **Add Documents** from a chat’s menu and drag files or folders into the
 
 Retrieval uses SQLite FTS5/BM25, phrase and identifier matching, and filename/section searches combined with Reciprocal Rank Fusion (RRF). Relevant excerpts are injected into the current request as document reference data, not saved in chat history.
 
+DOCX, PPTX, and XLSX documents require optional Python libraries `python-docx`, `python-pptx`, and `openpyxl`, respectively. Lopaca warns when a required library is missing. Install it in the Python environment that runs Lopaca, then restart Lopaca. Files already in `documents/` will be retried. These libraries are optional and are not installed by the installer.
+
+RAG and file tools share the same text extraction. DOCX paragraphs and tables, PPTX slide text and speaker notes, and XLSX sheet names and cell coordinates are preserved in extracted text. Spreadsheet formulas are retained without calculation. File tools extract Office documents on demand; indexed passages are cached in `documents.sqlite`. Original Office files stay intact, and citation line numbers refer to extracted text.
+
 **Expand Document Searches** in App Settings optionally asks the same llama-server model for related search terms. It's off by default because it adds response latency.
 
 **Model-Assisted Document Indexing** in App settings optionally allows the LLM to help process documents for better info retrieval. Very slow and depends on your model speed. Modest quality improvement. Recommended for t/s greater than 80.

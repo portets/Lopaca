@@ -34,7 +34,13 @@ from llama_client import (
 )
 from memory import edit_memories, memory_context, memory_review, recall_memories, view_memories
 from model_server import ModelServer
-from rag import DocumentIndexer, format_document_context, read_document, retrieve
+from rag import (
+    DocumentIndexer,
+    MissingDocumentLibraryError,
+    format_document_context,
+    read_document,
+    retrieve,
+)
 from settings import CHAT_SETTING_DEFAULTS, Settings
 from storage import ChatStore, MemoryStore
 
@@ -130,6 +136,9 @@ class ChatController:
             indexing_client.document_questions,
             self._model_lock,
             lambda active: self.view.dispatch(self.view.set_document_processing, active),
+            lambda message: self.view.dispatch(
+                self.view._show_alert, "Document library required", message
+            ),
         )
         self.history_index = HistoryIndex(
             self.store,
@@ -492,6 +501,7 @@ class ChatController:
 
     def _add_documents(self, paths, chat_id):
         supported, skipped = [], []
+        missing = set()
         destination = self.store.documents(chat_id)
         reserved = set()
         for path in map(Path, paths):
@@ -511,10 +521,13 @@ class ChatController:
             for item, relative in candidates:
                 if item.is_dir() or item.is_symlink():
                     continue
-                if read_document(item) is None:
-                    skipped.append(item)
-                else:
-                    supported.append((item, relative))
+                try:
+                    if read_document(item) is None:
+                        skipped.append(item)
+                    else:
+                        supported.append((item, relative))
+                except MissingDocumentLibraryError as exc:
+                    missing.add(str(exc))
         copied = []
         if supported:
             try:
@@ -523,6 +536,10 @@ class ChatController:
                 self.view.dispatch(self.view.notify, "Documents added to this chat's folder")
             except OSError as exc:
                 self.view.dispatch(self.view.notify, f"Could not add documents: {exc}")
+        if missing:
+            self.view.dispatch(
+                self.view._show_alert, "Document libraries required", "\n\n".join(sorted(missing))
+            )
         if skipped:
             self.view.dispatch(self.view.show_document_warning, skipped)
         return copied
@@ -926,8 +943,10 @@ class ChatController:
         if attached:
             messages[-1]["content"] += (
                 "\n\n[Application context: the user attached documents to this message. "
-                "Use them if relevant. Attached paths (JSON data): " + json.dumps(attached[:12])
-                + (f" and {len(attached) - 12} more files" if len(attached) > 12 else "") + "]"
+                "Use them if relevant. Attached paths (JSON data): "
+                + json.dumps(attached[:12])
+                + (f" and {len(attached) - 12} more files" if len(attached) > 12 else "")
+                + "]"
             )
         messages[-1]["content"] += format_document_context(
             retrieved, self.settings.max_context_chars, folder=folder

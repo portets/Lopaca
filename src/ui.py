@@ -551,9 +551,6 @@ window.lopaca-main, .transcript-scroll, .transcript {
 .settings-subpage-header {
     /* Theme defaults; add overrides here when needed. */
 }
-.settings-subpage-back {
-    /* Theme defaults; add overrides here when needed. */
-}
 .settings-subpage-page {
     /* Theme defaults; add overrides here when needed. */
 }
@@ -2521,16 +2518,11 @@ class ChatWindow(Adw.ApplicationWindow):
         actions.add(self._model_connect_button)
         return page
 
-    def _settings_subpage(self, title, settings_dialog):
-        dialog = Adw.Dialog(title=title, content_width=660, content_height=540)
+    def _show_memories(self, settings_dialog):
         toolbar = Adw.ToolbarView()
         toolbar.add_css_class("settings-subpage-toolbar")
         header = Adw.HeaderBar()
         header.add_css_class("settings-subpage-header")
-        back = Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="Back to App Settings")
-        back.add_css_class("settings-subpage-back")
-        back.add_css_class("flat")
-        header.pack_start(back)
         toolbar.add_top_bar(header)
         page = Adw.PreferencesPage()
         page.add_css_class("settings-subpage-page")
@@ -2539,21 +2531,6 @@ class ChatWindow(Adw.ApplicationWindow):
         group.add_css_class("settings-subpage-group")
         page.add(group)
         toolbar.set_content(page)
-        dialog.set_child(toolbar)
-        dialog.return_to_settings = False
-
-        def go_back(*_):
-            dialog.return_to_settings = True
-            dialog.close()
-
-        back.connect("clicked", go_back)
-        dialog.connect(
-            "closed", lambda *_: None if dialog.return_to_settings else settings_dialog.close()
-        )
-        return dialog, group
-
-    def _show_memories(self, settings_dialog):
-        dialog, group = self._settings_subpage("Global Memories", settings_dialog)
         group.set_description(
             "Edit facts, select Core for always-present memories, or delete them. "
             "Click the pencil to edit, then the checkmark to save."
@@ -2635,7 +2612,7 @@ class ChatWindow(Adw.ApplicationWindow):
             row.add_suffix(edit)
             row.add_suffix(controls)
             group.add(row)
-        dialog.present(self)
+        settings_dialog.push_subpage(Adw.NavigationPage.new(toolbar, "Global Memories"))
 
     def _confirm_delete_chat(self, chat_id):
         alert = Adw.AlertDialog(
@@ -3053,7 +3030,7 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def show_document_warning(self, paths):
         detail = (
-            "Only readable text documents are currently supported. "
+            "Readable text and supported Office documents can be added. "
             "These files are unsupported or could not be read and were not copied:\n\n"
             + "\n".join(str(path) for path in paths)
         )

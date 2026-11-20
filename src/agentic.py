@@ -189,7 +189,7 @@ class DocumentFiles:
                 data = stream.read(2_097_153)
             if len(data) > 2_097_152:
                 raise ValueError("File exceeds the 2 MiB limit.")
-            result = read_document_stream(io.BytesIO(data))
+            result = read_document_stream(io.BytesIO(data), suffix=path.suffix.lower())
             if result is None:
                 raise ValueError("Unsupported/binary document.")
             return result
