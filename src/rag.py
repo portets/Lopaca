@@ -400,6 +400,15 @@ class MissingDocumentLibraryError(ValueError):
 class _DocumentHtmlText(HTMLParser):
     """Convert embedded book/email HTML only; standalone HTML retains its source."""
 
+    _BLOCK_TAGS = ("p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6")
+
+    @classmethod
+    def extract(cls, html):
+        parser = cls()
+        parser.feed(html)
+        parser.close()
+        return "".join(parser.parts).strip()
+
     def __init__(self):
         super().__init__()
         self.parts = []
@@ -410,28 +419,17 @@ class _DocumentHtmlText(HTMLParser):
             self.hidden += 1
         if self.hidden:
             return
-        if tag in ("p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6"):
+        if tag == "br" or tag in self._BLOCK_TAGS:
             self.parts.append("\n")
         elif tag in ("td", "th"):
             self.parts.append("\t")
         elif tag == "img":
-            self.parts.append(dict(attrs).get("alt", ""))
+            self.parts.append(dict(attrs).get("alt") or "")
 
     def handle_endtag(self, tag):
         if tag in ("head", "script", "style"):
             self.hidden = max(0, self.hidden - 1)
-        elif not self.hidden and tag in (
-            "p",
-            "div",
-            "li",
-            "tr",
-            "h1",
-            "h2",
-            "h3",
-            "h4",
-            "h5",
-            "h6",
-        ):
+        elif not self.hidden and tag in self._BLOCK_TAGS:
             self.parts.append("\n")
 
     def handle_data(self, data):
@@ -509,10 +507,7 @@ def _email_text(source, suffix):
             except LookupError:
                 text = body.get_payload(decode=True).decode("utf-8", errors="replace")
             if body.get_content_type() == "text/html":
-                parser = _DocumentHtmlText()
-                parser.feed(text)
-                parser.close()
-                text = "".join(parser.parts)
+                text = _DocumentHtmlText.extract(text)
             lines.extend(("", text.strip()))
         lines.extend(
             f"Attachment filename (contents not extracted): {name}"
@@ -583,10 +578,8 @@ def _formatted_document_text(source, suffix):
             item = document.get_item_with_id(item_id)
             if not isinstance(item, module.EpubHtml):
                 continue
-            parser = _DocumentHtmlText()
-            parser.feed(item.get_content().decode("utf-8"))
-            parser.close()
-            lines.extend((f"# Chapter: {item.get_name()}", "".join(parser.parts).strip()))
+            text = _DocumentHtmlText.extract(item.get_content().decode("utf-8"))
+            lines.extend((f"# Chapter: {item.get_name()}", text))
     else:
         document = module.load_workbook(source, read_only=True, data_only=False)
         try:
@@ -763,13 +756,15 @@ def _archive_text(source, suffix):
                 continue
             with open_member() as member:
                 sample = member.read(min(size, 8192))
-                if _plain_document_text(io.BytesIO(sample)) is None:
+                text = _plain_document_text(io.BytesIO(sample), partial=len(sample) < size)
+                if text is None:
                     continue
-                data = sample + member.read(size + 1 - len(sample))
-            if len(data) != size:
-                continue
+                if len(sample) < size:
+                    data = sample + member.read(size + 1 - len(sample))
+                    if len(data) != size:
+                        continue
+                    text = _plain_document_text(io.BytesIO(data))
             remaining -= size
-            text = _plain_document_text(io.BytesIO(data))
             if text and text.strip():
                 # Quote names so a newline in a member name cannot split its heading.
                 parts.extend((f"# Archive member: {json.dumps(name, ensure_ascii=False)}", text))
@@ -819,7 +814,7 @@ def read_document_stream(source, *, suffix=""):
     return _plain_document_text(source)
 
 
-def _plain_document_text(source):
+def _plain_document_text(source, *, partial=False):
     sample = source.read(8192)
     if sample.startswith(b"%PDF-"):
         return None
@@ -835,7 +830,11 @@ def _plain_document_text(source):
     data = sample + source.read()
     for encoding in encodings:
         try:
-            text = data.decode(encoding)
+            # An archive probe can end in the middle of a multibyte character.
+            if partial:
+                text = codecs.getincrementaldecoder(encoding)().decode(data, final=False)
+            else:
+                text = data.decode(encoding)
         except UnicodeDecodeError:
             continue
         sample_text = text[:8192]

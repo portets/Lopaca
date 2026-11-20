@@ -191,7 +191,8 @@ class DocumentFiles:
                 fd = next_fd
             source = os.open(path.parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
             with os.fdopen(source, "rb") as stream:
-                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode):
                     raise ValueError("Only regular text files are supported.")
                 suffix = document_suffix(path)
                 limit = (
@@ -199,7 +200,7 @@ class DocumentFiles:
                 )
                 if suffix == ".pdf":
                     limit = PDF_SIZE_LIMIT
-                if limit is not None and os.fstat(stream.fileno()).st_size > limit:
+                if limit is not None and info.st_size > limit:
                     raise ValueError(f"File exceeds the {limit // (1024 * 1024)} MiB limit.")
                 if suffix in ARCHIVE_SUFFIXES or suffix == ".pdf":
                     # Let seekable readers work without copying the whole file into memory.
