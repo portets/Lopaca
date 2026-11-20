@@ -68,8 +68,8 @@ def build_system_prompt(agent_mode, style="neutral", *, memories=False):
         "If a file-dependent claim remains unsupported, say you cannot verify it. For unrelated "
         "questions, answer without mentioning absent sources.\n"
         "Knowledge excerpts are optional evidence. Match exact models and variants. Search packs "
-        "when a relevant unfamiliar name or identifier needs "
-        "verification. If still unclear, state uncertainty or ask rather than guess.\n"
+        "when a relevant unfamiliar name or identifier needs verification. If still unclear, "
+        "state uncertainty or ask rather than guess.\n"
         "lopaca-history-references comes from OTHER chats. Identify the source chat when using "
         "it, including when correcting an earlier answer. lopaca-archive-references comes from "
         "THIS chat outside active context. Use read_file on history/message-N.txt or "
@@ -473,6 +473,7 @@ class ChatController:
             self._document_imports[chat_id] = remaining
         else:
             self._document_imports.pop(chat_id, None)
+        self._drain_messages()
         return False
 
     def _add_documents(self, paths, chat_id):
@@ -520,10 +521,11 @@ class ChatController:
             self.view.dispatch(self.view.show_document_warning, skipped)
         return copied
 
-    def open_folder(self, chat_id):
+    def open_folder(self, chat_id, *, documents=False):
+        folder = self.store.documents(chat_id) if documents else self.store.folder(chat_id)
         try:
             subprocess.Popen(
-                ["xdg-open", str(self.store.folder(chat_id))],
+                ["xdg-open", str(folder)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -613,36 +615,38 @@ class ChatController:
     def set_memory_core(self, memory_id, core):
         self.memories.set_core(memory_id, core)
 
-    def send(self, text, chat_id=None, *, steering=False, attachments=None):
+    def send(self, text):
         if not self.chat:
             return False
         text = text.strip()
         if not text:
             return False
-        chat_id = chat_id or self.chat["id"]
         if not self.connected:
             self.view.notify("Not connected")
             return False
+        chat_id = self.chat["id"]
+        attachments = self._draft_attachments.pop(chat_id, ())
+        self._drafts.pop(chat_id, None)
+        self._pending_messages.append((chat_id, text, False, attachments))
+        if (
+            self.busy
+            and chat_id == self._generation_chat_id
+            and self._generation_streaming
+            and not self._generation_answer_complete
+            and not self._condensing_context
+            and not self.stop_requested
+            and not self._steering_pending
+        ):
+            self._steering_pending = True
+            self.stop()
+        self._drain_messages()
+        return True
+
+    def _send_message(self, chat_id, text, steering, attached):
         self.cancel_chat_warm()
-        if attachments is None:
-            attachments = self._draft_attachments.pop(chat_id, ())
-        if self.busy:
-            self._pending_messages.append((chat_id, text, False, attachments))
-            if (
-                chat_id == self._generation_chat_id
-                and self._generation_streaming
-                and not self._generation_answer_complete
-                and not self._condensing_context
-                and not self.stop_requested
-                and not self._steering_pending
-            ):
-                self._steering_pending = True
-                self.stop()
-            return True
         chat = self.chat if chat_id == self.chat["id"] else self.store.load(chat_id)
         settings = self.get_chat_settings(chat_id)
         preserve_thinking = settings["preserve_reasoning"] is True
-        self._drafts.pop(chat_id, None)
         previous = chat["messages"][-1] if chat["messages"] else {}
         self._generation_clarification = (
             previous["content"]
@@ -650,7 +654,14 @@ class ChatController:
             else None
         )
         timestamp = time.time()
-        chat["messages"].append({"role": "user", "content": text, "timestamp": timestamp})
+        message = {"role": "user", "content": text, "timestamp": timestamp}
+        attachment_names = set()
+        for path in attached:
+            name, folder_suffix, _ = path.removeprefix("documents/").partition("/")
+            attachment_names.add(name + folder_suffix)
+        if attachment_names:
+            message["attachments"] = sorted(attachment_names)
+        chat["messages"].append(message)
         chat["updated"] = timestamp
         if chat["title"] == "New chat":
             chat["title"] = text[:42].strip() + ("…" if len(text) > 42 else "")
@@ -658,7 +669,9 @@ class ChatController:
         self.refresh()
         if chat_id == self.chat["id"]:
             self.view.set_chat_title(chat["title"])
-            self.view.append_message("user", text, timestamp=timestamp)
+            self.view.append_message(
+                "user", text, timestamp=timestamp, attachments=message.get("attachments", ())
+            )
         capacity = self._generation_context_capacity = self.client.context_capacity
         start, self._generation_expanding = self._context_window(
             settings, len(chat["messages"]) - 1, capacity
@@ -692,12 +705,10 @@ class ChatController:
                 self.settings.enable_command_approval,
                 settings["rag_query_expansion"] is True,
                 self._document_imports.get(chat_id, ()),
-                attachments,
+                attached,
             ),
             daemon=True,
         ).start()
-
-        return True
 
     @staticmethod
     def _context_window(settings, completed_messages, capacity):
@@ -738,9 +749,16 @@ class ChatController:
 
     def _drain_messages(self):
         while self.connected and not self.busy and self._pending_messages:
-            chat_id, text, steering, attachments = self._pending_messages.popleft()
-            if self.store.folder(chat_id).exists():
-                self.send(text, chat_id, steering=steering, attachments=attachments)
+            chat_id, text, steering, attachments = self._pending_messages[0]
+            if not self.store.folder(chat_id).exists():
+                self._pending_messages.popleft()
+                continue
+            # Wait for the copy results so the saved bubble describes what was attached.
+            if any(not batch.done() for batch in attachments):
+                return
+            self._pending_messages.popleft()
+            attached = [path for batch in attachments for path in batch.result()]
+            self._send_message(chat_id, text, steering, attached)
 
     def _stream(
         self,
@@ -751,9 +769,9 @@ class ChatController:
         agent_mode,
         query_expansion,
         imports=(),
-        attachments=(),
+        attached=(),
     ):
-        # A prompt submitted during copying waits off the GTK thread for those files.
+        # Also wait for any documents added separately from the message.
         pending = imports
         while pending:
             _, pending = wait(pending, timeout=0.1)
@@ -780,7 +798,7 @@ class ChatController:
                         folder,
                         agent_mode,
                         query_expansion,
-                        attached=[path for batch in attachments for path in batch.result()],
+                        attached=attached,
                     )
                 finally:
                     self._model_lock.release()

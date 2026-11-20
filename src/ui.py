@@ -4,6 +4,7 @@ import re
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 import gi
 
@@ -23,6 +24,8 @@ gi.require_version("Graphene", "1.0")
 gi.require_version("Gsk", "4.0")
 # GI namespace versions must be selected before importing their bindings.
 from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gsk, Gtk, Pango  # noqa: E402
+
+ATTACH_DOCUMENTS_ICON = "mail-attachment-symbolic"
 
 CSS = """
 /* Theme styling. Margins and padding use top, right, bottom, left.
@@ -248,6 +251,15 @@ window.lopaca-main, .transcript-scroll, .transcript {
 }
 .user-message {
     background-color: alpha(@accent_bg_color,0.4);
+}
+.message-attachment-button {
+    min-width: 0;
+    min-height: 0;
+    padding: 2px 5px;
+    font-size: 0.9em;
+}
+.message-attachment-content {
+    border-spacing: 6px;
 }
 .assistant-message {
     background-color: alpha(@theme_fg_color,0.045);
@@ -714,6 +726,18 @@ def message_day(date, now=None):
     )
 
 
+def attachment_display_name(name, limit):
+    name = " ".join(name.splitlines())
+    if len(name) <= limit:
+        return name
+    suffix = "/" if name.endswith("/") else Path(name).suffix
+    ellipsis = "..."
+    available = limit - len(ellipsis)
+    if len(suffix) >= available:
+        return ellipsis + suffix[-available:]
+    return name[: available - len(suffix)] + ellipsis + suffix
+
+
 class BubbleLayout(Gtk.LayoutManager):
     """Limit one bubble to a fraction of its row, independent of other messages."""
 
@@ -1046,7 +1070,7 @@ class ChatWindow(Adw.ApplicationWindow):
             "notify::selected", self._thinking_selected
         )
         actions.append(self.thinking_dropdown)
-        attach = Gtk.Button(icon_name="mail-attachment-symbolic", tooltip_text="Attach documents")
+        attach = Gtk.Button(icon_name=ATTACH_DOCUMENTS_ICON, tooltip_text="Attach documents")
         attach.add_css_class("attach-documents-button")
         attach.connect("clicked", lambda *_: self._show_document_drop(self.chat["id"], attach=True))
         actions.append(attach)
@@ -1715,6 +1739,7 @@ class ChatWindow(Adw.ApplicationWindow):
             message["timestamp"],
             live=False,
             attach=attach,
+            attachments=message.get("attachments", ()),
         )
         if earlier:
             self._earlier_prose = self._older_prose_sections(wrapper, earlier)
@@ -1777,7 +1802,9 @@ class ChatWindow(Adw.ApplicationWindow):
         separator.set_margin_bottom(separator.get_layout().get_pixel_size()[1])
         return separator
 
-    def append_message(self, role, text, reasoning="", timestamp=None, *, live=True, attach=True):
+    def append_message(
+        self, role, text, reasoning="", timestamp=None, *, live=True, attach=True, attachments=()
+    ):
         if role == "assistant":
             text = self.controller.visible_answer(text)
         timestamp = datetime.now().timestamp() if timestamp is None else timestamp
@@ -1815,11 +1842,37 @@ class ChatWindow(Adw.ApplicationWindow):
         if text:
             extractor = self.controller.commands_in if role == "assistant" else None
             append_markdown(wrapper, text, extractor, self._review_command)
+        if role == "user" and attachments:
+            wrapper.append(self._message_attachment_button(self.chat["id"], attachments))
         if attach:
             self.transcript.append(row)
         if role == "user" and attach and live:
             self.scroll_bottom(force=True)
         return wrapper
+
+    def _message_attachment_button(self, chat_id, attachments):
+        button = Gtk.Button(
+            has_frame=False, halign=Gtk.Align.END, css_classes=["message-attachment-button"]
+        )
+        if len(attachments) == 1:
+            label = attachment_display_name(attachments[0], 32)
+            name = attachment_display_name(attachments[0], 64)
+            tooltip = [name if name != label else "Open documents folder"]
+        else:
+            label = "Multiple documents"
+            ordered = sorted(
+                attachments, key=lambda name: (not name.endswith("/"), name.casefold())
+            )
+            tooltip = [attachment_display_name(name, 64) for name in ordered[:20]]
+            if len(ordered) > 20:
+                tooltip.append("...")
+        button.set_tooltip_text("\n".join(tooltip))
+        content = Gtk.Box(css_classes=["message-attachment-content"])
+        content.append(Gtk.Image(icon_name=ATTACH_DOCUMENTS_ICON))
+        content.append(Gtk.Label(label=label, ellipsize=Pango.EllipsizeMode.MIDDLE))
+        button.set_child(content)
+        button.connect("clicked", lambda _: self.controller.open_folder(chat_id, documents=True))
+        return button
 
     def _create_thinking_widget(self, wrapper, text, completed):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
