@@ -519,14 +519,17 @@ def _email_text(source, suffix):
     return "\n".join(lines)
 
 
-def _formatted_document_text(source, suffix):
-    module_name, package = DOCUMENT_LIBRARIES[suffix]
+def _optional_document_library(suffix, module_name, package):
     try:
-        module = importlib.import_module(module_name)
+        return importlib.import_module(module_name)
     except ModuleNotFoundError as exc:
         if exc.name in (module_name, module_name.split(".")[0]):
             raise MissingDocumentLibraryError(suffix, package) from exc
         raise
+
+
+def _formatted_document_text(source, suffix):
+    module = _optional_document_library(suffix, *DOCUMENT_LIBRARIES[suffix])
     lines = ["Extracted document text; line numbers refer to this extraction."]
     if suffix == ".rtf":
         data = source.read()
@@ -590,6 +593,10 @@ _COMPRESSED_TEXT = {
     ".bz2": bz2.BZ2File,
     ".xz": lzma.LZMAFile,
 }
+_OPTIONAL_COMPRESSION_LIBRARIES = {
+    ".zst": ("zstandard", "zstandard"),
+    ".lz4": ("lz4.frame", "lz4"),
+}
 _TAR_COMPRESSION = {
     ".tgz": ".gz",
     ".tar.gz": ".gz",
@@ -597,8 +604,11 @@ _TAR_COMPRESSION = {
     ".tar.bz2": ".bz2",
     ".txz": ".xz",
     ".tar.xz": ".xz",
+    ".tar.zst": ".zst",
+    ".tar.lz4": ".lz4",
 }
-ARCHIVE_SUFFIXES = frozenset({".zip", ".tar", *_TAR_COMPRESSION, *_COMPRESSED_TEXT})
+_COMPRESSED_TEXT_SUFFIXES = _COMPRESSED_TEXT.keys() | _OPTIONAL_COMPRESSION_LIBRARIES.keys()
+ARCHIVE_SUFFIXES = frozenset({".zip", ".tar", *_TAR_COMPRESSION, *_COMPRESSED_TEXT_SUFFIXES})
 ARCHIVE_SIZE_LIMIT = 32 * 1024 * 1024
 _ARCHIVE_MEMBER_LIMIT = 2 * 1024 * 1024
 _ARCHIVE_TEXT_LIMIT = 8 * 1024 * 1024
@@ -608,6 +618,37 @@ def document_suffix(path):
     suffix = path.suffix.lower()
     compound = "".join(path.suffixes[-2:]).lower()
     return compound if compound in _TAR_COMPRESSION else suffix
+
+
+def _read_compressed(source, suffix, limit):
+    compression = _TAR_COMPRESSION.get(suffix, suffix)
+    if compression in _COMPRESSED_TEXT:
+        with _COMPRESSED_TEXT[compression](source) as stream:
+            return stream.read(limit + 1)
+    if compression == ".zst":
+        try:
+            from compression import zstd
+        except ImportError:
+            zstandard = _optional_document_library(
+                suffix, *_OPTIONAL_COMPRESSION_LIBRARIES[compression]
+            )
+            try:
+                decoder = zstandard.ZstdDecompressor(max_window_size=32 * 1024)
+                with decoder.stream_reader(
+                    source, read_across_frames=True, closefd=False
+                ) as stream:
+                    return stream.read(limit + 1)
+            except zstandard.ZstdError as exc:
+                raise ValueError(str(exc)) from exc
+        try:
+            options = {zstd.DecompressionParameter.window_log_max: 25}
+            with zstd.open(source, options=options) as stream:
+                return stream.read(limit + 1)
+        except zstd.ZstdError as exc:
+            raise ValueError(str(exc)) from exc
+    lz4 = _optional_document_library(suffix, *_OPTIONAL_COMPRESSION_LIBRARIES[compression])
+    with lz4.open(source, mode="rb") as stream:
+        return stream.read(limit + 1)
 
 
 def _archive_entries(source, suffix):
@@ -620,11 +661,9 @@ def _archive_entries(source, suffix):
                     continue
                 yield member.filename, member.file_size, lambda member=member: archive.open(member)
         return
-    compression = _TAR_COMPRESSION.get(suffix)
-    if compression:
+    if suffix in _TAR_COMPRESSION:
         # Bound the decoded TAR itself, including headers and metadata.
-        with _COMPRESSED_TEXT[compression](source) as stream:
-            data = stream.read(ARCHIVE_SIZE_LIMIT + 1)
+        data = _read_compressed(source, suffix, ARCHIVE_SIZE_LIMIT)
     else:
         data = source.read(ARCHIVE_SIZE_LIMIT + 1)
     if len(data) > ARCHIVE_SIZE_LIMIT:
@@ -639,9 +678,8 @@ def _archive_text(source, suffix):
     if source.seek(0, io.SEEK_END) > ARCHIVE_SIZE_LIMIT:
         raise ValueError("Archive exceeds the 32 MiB limit")
     source.seek(0)
-    if suffix in _COMPRESSED_TEXT:
-        with _COMPRESSED_TEXT[suffix](source) as stream:
-            data = stream.read(_ARCHIVE_MEMBER_LIMIT + 1)
+    if suffix in _COMPRESSED_TEXT_SUFFIXES:
+        data = _read_compressed(source, suffix, _ARCHIVE_MEMBER_LIMIT)
         if len(data) > _ARCHIVE_MEMBER_LIMIT:
             raise ValueError("Decoded file exceeds the 2 MiB limit")
         return _plain_document_text(io.BytesIO(data))
@@ -680,6 +718,8 @@ def read_document_stream(source, *, suffix=""):
     if suffix in ARCHIVE_SUFFIXES:
         try:
             return _archive_text(source, suffix)
+        except MissingDocumentLibraryError:
+            raise
         except (
             OSError,
             EOFError,
@@ -1032,7 +1072,7 @@ def _index(connection, folder, settings, stopped, on_missing=None):
 
     """)
     _create_chunks(connection)
-    signature = f"10:{settings.chunk_chars}:{settings.chunk_overlap}"
+    signature = f"11:{settings.chunk_chars}:{settings.chunk_overlap}"
     state = connection.execute("SELECT value FROM index_state WHERE key = 'chunking'").fetchone()
     changed = state != (signature,)
     if changed:
