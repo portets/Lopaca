@@ -3,12 +3,13 @@
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
 import gi
 
-from agentic import get_clock_format
+from agentic import DocumentFiles, get_clock_format, image_mime_type
 from markdown_ui import (
     CODE_BLOCK_PATTERN,
     MarkdownText,
@@ -22,10 +23,13 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Graphene", "1.0")
 gi.require_version("Gsk", "4.0")
+gi.require_version("GdkPixbuf", "2.0")
 # GI namespace versions must be selected before importing their bindings.
-from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gsk, Gtk, Pango  # noqa: E402
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Graphene, Gsk, Gtk, Pango  # noqa: E402
 
 ATTACH_DOCUMENTS_ICON = "mail-attachment-symbolic"
+ATTACHMENT_THUMBNAIL_SIZE = 64
+_thumbnail_loader = ThreadPoolExecutor(max_workers=2, thread_name_prefix="thumbnail")
 
 CSS = """
 /* Theme styling. Margins and padding use top, right, bottom, left.
@@ -260,6 +264,9 @@ window.lopaca-main, .transcript-scroll, .transcript {
 }
 .message-attachment-content {
     border-spacing: 6px;
+}
+.message-attachment-button box, .message-attachment-thumbnail {
+    border-radius: inherit;
 }
 .assistant-message {
     background-color: alpha(@theme_fg_color,0.045);
@@ -1030,7 +1037,7 @@ class ChatWindow(Adw.ApplicationWindow):
         _, line_height = self.prompt.create_pango_layout("Ag").get_pixel_size()
         prompt_height = max(1, line_height) * 4
         self.prompt.set_size_request(-1, prompt_height)
-        self.prompt.get_buffer().connect("changed", lambda *_: self._prompt_changed())
+        self.prompt.get_buffer().connect("changed", lambda *_: self.update_send_button())
         key_controller = Gtk.EventControllerKey.new()
         key_controller.connect("key-pressed", self._key_pressed)
         self.prompt.add_controller(key_controller)
@@ -1045,12 +1052,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.send_button.add_css_class("send-stop")
         self.send_button.add_css_class("suggested-action")
         self.send_button.set_valign(Gtk.Align.END)
-        self.send_button.connect(
-            "clicked",
-            lambda *_: (
-                self.controller.stop() if self.busy and not self.prompt_text() else self._send()
-            ),
-        )
+        self.send_button.connect("clicked", self._send_clicked)
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         actions.add_css_class("composer-actions")
         hint = Gtk.Label(label="Shift+Enter for new line · Enter to send", xalign=0)
@@ -1077,7 +1079,7 @@ class ChatWindow(Adw.ApplicationWindow):
         actions.append(self.send_button)
         inner.append(actions)
         main.append(compose)
-        self._prompt_changed()
+        self.update_send_button()
 
     def update_thinking_options(self):
         key, title, choices = self.controller.thinking_choices()
@@ -1220,7 +1222,7 @@ class ChatWindow(Adw.ApplicationWindow):
         if active:
             self.notify("Condensing context")
         else:
-            self._prompt_changed()
+            self.update_send_button()
 
     def notify(self, text):
         if self._notification_timer is not None:
@@ -1229,7 +1231,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._notification_model_busy = self.controller.busy
         self._notification_deadline = GLib.get_monotonic_time() + 3_000_000
         self._notification_timer = GLib.timeout_add(3000, self._restore_status)
-        self._prompt_changed()
+        self.update_send_button()
 
     def _restore_status(self):
         if self.controller.busy and (
@@ -1315,14 +1317,14 @@ class ChatWindow(Adw.ApplicationWindow):
         self.chat_usage.set_text(f"Chat: {format_size(chat_size)}")
         self.total_usage.set_text(f"Total: {format_size(total_size)}")
 
-    def _prompt_changed(self):
-        text = bool(self.prompt_text())
+    def update_send_button(self):
+        can_send = bool(self.prompt_text()) or self.controller.has_draft_attachments()
         can_stop = (
             self.busy
             and not self.controller._generation_answer_complete
             and not self.controller._condensing_context
         )
-        self.send_button.set_sensitive(text or can_stop)
+        self.send_button.set_sensitive(can_send or can_stop)
         if self.busy:
             steering = (
                 self.controller._generation_streaming
@@ -1330,17 +1332,25 @@ class ChatWindow(Adw.ApplicationWindow):
                 and not self.controller.stop_requested
                 and self.chat["id"] == self._response_chat_id
             )
-            self.send_button.set_icon_name("go-up-symbolic" if text else "window-close-symbolic")
+            self.send_button.set_icon_name(
+                "go-up-symbolic" if can_send else "window-close-symbolic"
+            )
             self.send_button.set_tooltip_text(
                 ("Interrupt and send" if steering else "Queue message")
-                if text
+                if can_send
                 else "Stop generation"
             )
 
+    def _send_clicked(self, _button):
+        if self.busy and not self.prompt_text() and not self.controller.has_draft_attachments():
+            self.controller.stop()
+        else:
+            self._send()
+
     def _send(self):
-        text = self.prompt_text()
-        if text and self.controller.send(text):
-            self.prompt.get_buffer().set_text("")
+        if self.controller.send(self.prompt_text()):
+            self.set_prompt("")
+            self.update_send_button()
 
     def _key_pressed(self, _controller, key, _code, state):
         if key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and not state & Gdk.ModifierType.SHIFT_MASK:
@@ -1854,7 +1864,12 @@ class ChatWindow(Adw.ApplicationWindow):
         button = Gtk.Button(
             has_frame=False, halign=Gtk.Align.END, css_classes=["message-attachment-button"]
         )
-        if len(attachments) == 1:
+        # llama-server accepts several image parts in a single vision request.
+        show_previews = len(attachments) <= 3 and all(map(image_mime_type, attachments))
+        if show_previews:
+            label = "Image" if len(attachments) == 1 else "Images"
+            tooltip = ["Open documents folder"]
+        elif len(attachments) == 1:
             label = attachment_display_name(attachments[0], 32)
             name = attachment_display_name(attachments[0], 64)
             tooltip = [name if name != label else "Open documents folder"]
@@ -1867,12 +1882,63 @@ class ChatWindow(Adw.ApplicationWindow):
             if len(ordered) > 20:
                 tooltip.append("...")
         button.set_tooltip_text("\n".join(tooltip))
-        content = Gtk.Box(css_classes=["message-attachment-content"])
-        content.append(Gtk.Image(icon_name=ATTACH_DOCUMENTS_ICON))
-        content.append(Gtk.Label(label=label, ellipsize=Pango.EllipsizeMode.MIDDLE))
+        header = Gtk.Box(css_classes=["message-attachment-content"])
+        header.append(Gtk.Image(icon_name=ATTACH_DOCUMENTS_ICON))
+        header.append(Gtk.Label(label=label, ellipsize=Pango.EllipsizeMode.MIDDLE))
+        content = header
+        if show_previews:
+            content = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL, css_classes=["message-attachment-content"]
+            )
+            content.append(header)
+            thumbnails = Gtk.Box(css_classes=["message-attachment-content"])
+            folder = self.controller.store.documents(chat_id)
+            for name in attachments:
+                thumbnails.append(self._attachment_thumbnail(folder, name))
+            content.append(thumbnails)
         button.set_child(content)
         button.connect("clicked", lambda _: self.controller.open_folder(chat_id, documents=True))
         return button
+
+    @staticmethod
+    def _attachment_thumbnail(folder, name):
+        size = ATTACHMENT_THUMBNAIL_SIZE
+        picture = Gtk.Picture(
+            content_fit=Gtk.ContentFit.CONTAIN,
+            overflow=Gtk.Overflow.HIDDEN,
+            halign=Gtk.Align.CENTER,
+            valign=Gtk.Align.CENTER,
+            width_request=size,
+            height_request=size,
+            alternative_text=name,
+            tooltip_text=name,
+            css_classes=["message-attachment-thumbnail"],
+        )
+
+        def load():
+            _, data = DocumentFiles(folder).image(name)
+            stream = Gio.MemoryInputStream.new_from_bytes(GLib.Bytes.new(data))
+            return GdkPixbuf.Pixbuf.new_from_stream_at_scale(stream, size, size, True, None)
+
+        def display(texture):
+            # Clip the picture's actual bounds, including for non-square thumbnails.
+            picture.set_size_request(texture.get_width(), texture.get_height())
+            picture.set_paintable(texture)
+
+        def show(result):
+            try:
+                texture = Gdk.Texture.new_for_pixbuf(result.result())
+            except OSError, ValueError, GLib.Error:
+                GLib.idle_add(picture.set_visible, False)
+                return
+            GLib.idle_add(display, texture)
+
+        def mapped(widget):
+            widget.disconnect(handler)
+            _thumbnail_loader.submit(load).add_done_callback(show)
+
+        handler = picture.connect("map", mapped)
+        return picture
 
     def _create_thinking_widget(self, wrapper, text, completed):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -1971,7 +2037,7 @@ class ChatWindow(Adw.ApplicationWindow):
             self.scroll_bottom(True)
         self._response_row = self.current_wrapper.message_row
         self._response_chat_id = chat_id
-        self._prompt_changed()
+        self.update_send_button()
 
     def update_thinking(self, text):
         if text:
@@ -2104,7 +2170,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.send_button.set_tooltip_text("Send")
         self.send_button.remove_css_class("destructive-action")
         self.send_button.add_css_class("suggested-action")
-        self._prompt_changed()
+        self.update_send_button()
         self.set_status(self.controller.idle_status())
         return False
 
@@ -3083,7 +3149,7 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def show_document_warning(self, paths):
         detail = (
-            "Readable text and supported document formats can be added. "
+            "Readable text, supported documents, and PNG or JPEG images can be added. "
             "These files are unsupported or could not be read and were not copied:\n\n"
             + "\n".join(str(path) for path in paths)
         )

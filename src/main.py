@@ -17,6 +17,8 @@ from pathlib import Path
 from agentic import (
     CODING_INSTRUCTION,
     extract_commands,
+    image_attachment_note,
+    image_mime_type,
     parse_file_heredoc,
     prepare_command,
     run_command,
@@ -192,6 +194,8 @@ class ChatController:
     def _connection_changed(self, connected):
         changed = self.connected is None or self.connected != connected
         self.connected = connected
+        if not connected:
+            self.client.vision_enabled = False
         if connected:
             self.was_connected = True
         if changed and not self.busy:
@@ -225,6 +229,7 @@ class ChatController:
             self._connection_wakeup.clear()
 
     def _server_properties_changed(self, props):
+        self.client.vision_enabled = props.get("modalities", {}).get("vision") is True
         capacity = props.get("default_generation_settings", {}).get("n_ctx")
         if isinstance(capacity, int) and capacity > 0:
             self.client.context_capacity = capacity
@@ -374,7 +379,7 @@ class ChatController:
                 messages,
                 settings["preserve_reasoning"] is True,
                 self._warm_thinking(chat, settings),
-                chat_tools(files=True, memories=memories),
+                chat_tools(files=True, memories=memories, vision=self.client.vision_enabled),
                 capacity,
                 self._model_lock,
                 lambda: stop.is_set() or self.busy or self.model_server.busy or not self.connected,
@@ -456,6 +461,8 @@ class ChatController:
         threading.Thread(
             target=self._import_documents, args=(list(paths), chat_id, ready), daemon=True
         ).start()
+        if attach and chat_id == self.chat["id"]:
+            self.view.update_send_button()
 
     def _import_documents(self, paths, chat_id, ready):
         copied = []
@@ -499,7 +506,7 @@ class ChatController:
                 if item.is_dir() or item.is_symlink():
                     continue
                 try:
-                    if read_document(item) is None:
+                    if not image_mime_type(item) and read_document(item) is None:
                         skipped.append(item)
                     else:
                         supported.append((item, relative))
@@ -615,11 +622,14 @@ class ChatController:
     def set_memory_core(self, memory_id, core):
         self.memories.set_core(memory_id, core)
 
+    def has_draft_attachments(self):
+        return bool(self.chat and self._draft_attachments.get(self.chat["id"]))
+
     def send(self, text):
         if not self.chat:
             return False
         text = text.strip()
-        if not text:
+        if not text and not self.has_draft_attachments():
             return False
         if not self.connected:
             self.view.notify("Not connected")
@@ -655,16 +665,25 @@ class ChatController:
         )
         timestamp = time.time()
         message = {"role": "user", "content": text, "timestamp": timestamp}
-        attachment_names = set()
+        attachment_names = {}
+        images, documents = [], []
         for path in attached:
             name, folder_suffix, _ = path.removeprefix("documents/").partition("/")
-            attachment_names.add(name + folder_suffix)
+            attachment_names.setdefault(name + folder_suffix, None)
+            if image_mime_type(path):
+                if not folder_suffix:  # A folder import may contain many unrelated images.
+                    images.append(path)
+            else:
+                documents.append(path)
         if attachment_names:
-            message["attachments"] = sorted(attachment_names)
+            message["attachments"] = list(attachment_names)
+        if images:
+            message["images"] = images
         chat["messages"].append(message)
         chat["updated"] = timestamp
         if chat["title"] == "New chat":
-            chat["title"] = text[:42].strip() + ("…" if len(text) > 42 else "")
+            title = text or next(iter(message.get("attachments", ())), "Attachments")
+            chat["title"] = title[:42].strip() + ("…" if len(title) > 42 else "")
         self.store.save(chat, message_start=len(chat["messages"]) - 1)
         self.refresh()
         if chat_id == self.chat["id"]:
@@ -705,7 +724,8 @@ class ChatController:
                 self.settings.enable_command_approval,
                 settings["rag_query_expansion"] is True,
                 self._document_imports.get(chat_id, ()),
-                attached,
+                documents,
+                images,
             ),
             daemon=True,
         ).start()
@@ -741,6 +761,8 @@ class ChatController:
                     "yes_clarify",
                 ):
                     content += f"\n<memory-review>{review}</memory-review>"
+            elif self.client.vision_enabled and (images := message.get("images")):
+                content += image_attachment_note(images)
             item = {"role": message["role"], "content": content}
             if settings["preserve_reasoning"] is True and message.get("reasoning_content"):
                 item["reasoning_content"] = message["reasoning_content"]
@@ -758,7 +780,8 @@ class ChatController:
                 return
             self._pending_messages.popleft()
             attached = [path for batch in attachments for path in batch.result()]
-            self._send_message(chat_id, text, steering, attached)
+            if text or attached:
+                self._send_message(chat_id, text, steering, attached)
 
     def _stream(
         self,
@@ -770,6 +793,7 @@ class ChatController:
         query_expansion,
         imports=(),
         attached=(),
+        images=(),
     ):
         # Also wait for any documents added separately from the message.
         pending = imports
@@ -799,6 +823,7 @@ class ChatController:
                         agent_mode,
                         query_expansion,
                         attached=attached,
+                        images=images,
                     )
                 finally:
                     self._model_lock.release()
@@ -815,6 +840,7 @@ class ChatController:
         query_expansion,
         *,
         attached=(),
+        images=(),
     ):
         pending = self._generation_clarification
         self._generation_clarification = None
@@ -932,6 +958,11 @@ class ChatController:
             ),
         )
         context_user_content = messages[-1]["content"]
+        if not query:
+            messages[-1]["content"] += (
+                "\n\n[Application context: The user sent attachments without a question. "
+                "Briefly acknowledge the input and ask what they would like help with.]"
+            )
         # Keep fresh evidence beside the current question, after historical answers/reasoning.
         # These are request-local copies; the user's stored message remains unchanged.
         if attached:
@@ -995,6 +1026,7 @@ class ChatController:
             context_user_content=context_user_content,
             on_waiting=lambda: setattr(self, "_generation_streaming", False),
             expand_context=self._generation_expanding,
+            image_paths=images,
         )
         finished_at = time.time()
         self._generation_answer_complete = not error and not self.stop_requested

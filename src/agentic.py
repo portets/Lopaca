@@ -12,7 +12,7 @@ import shutil
 import stat
 import subprocess
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from functools import cache
@@ -54,6 +54,19 @@ GET_DATETIME_TOOL = _tool(
     "Use clock_format when presenting times unless the user requests otherwise.",
 )
 RUNTIME_TOOLS = [GET_OSINFO_TOOL, GET_DATETIME_TOOL]
+
+IMAGE_SIZE_LIMIT = 16 * 1024 * 1024
+_IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
+
+
+def image_mime_type(path):
+    if str(path).endswith("/"):
+        return None
+    return _IMAGE_TYPES.get(Path(path).suffix.lower())
+
+
+def image_attachment_note(paths):
+    return "\n\n[Images attached to this message: " + json.dumps(paths, ensure_ascii=False) + "]"
 
 
 def get_osinfo():
@@ -152,6 +165,15 @@ FILE_TOOLS = [
     ),
 ]
 
+# Lopaca supplies the image bytes as a multimodal tool result.
+VIEW_IMAGE_TOOL = _tool(
+    "view_image",
+    "Inspect a PNG or JPEG in this chat's documents/ folder. Use when you need to see an "
+    "earlier attachment again or inspect an image that was not included in the current input.",
+    {"path": {"type": "string", "description": "Chat-relative path starting with documents/."}},
+    ["path"],
+)
+
 
 def _line_excerpt(path, lines, start_line, line_count):
     if (
@@ -172,7 +194,8 @@ class DocumentFiles:
     def __init__(self, root):
         self.root = Path(root).absolute()
 
-    def _text(self, name):
+    @contextmanager
+    def _open_file(self, name):
         path = PurePosixPath(name)
         if not path.parts or path.is_absolute() or ".." in path.parts or "\\" in name:
             raise ValueError("Use a relative path inside the selected folder without '..'.")
@@ -186,29 +209,43 @@ class DocumentFiles:
             with os.fdopen(source, "rb") as stream:
                 info = os.fstat(stream.fileno())
                 if not stat.S_ISREG(info.st_mode):
-                    raise ValueError("Only regular text files are supported.")
-                suffix = document_suffix(path)
-                limit = (
-                    archive_size_limit(suffix) if suffix in ARCHIVE_SUFFIXES else 2 * 1024 * 1024
-                )
-                if suffix == ".pdf":
-                    limit = PDF_SIZE_LIMIT
-                if limit is not None and info.st_size > limit:
-                    raise ValueError(f"File exceeds the {limit // (1024 * 1024)} MiB limit.")
-                if suffix in ARCHIVE_SUFFIXES or suffix == ".pdf":
-                    # Let seekable readers work without copying the whole file into memory.
-                    result = read_document_stream(stream, suffix=suffix)
-                else:
-                    # Keep the read bounded if the file changes while it is open.
-                    data = stream.read(limit + 1)
-                    if len(data) > limit:
-                        raise ValueError(f"File exceeds the {limit // (1024 * 1024)} MiB limit.")
-                    result = read_document_stream(io.BytesIO(data), suffix=suffix)
-            if result is None:
-                raise ValueError("Unsupported/binary document.")
-            return result
+                    raise ValueError("Only regular files are supported.")
+                yield stream, info.st_size
         finally:
             os.close(fd)
+
+    def _text(self, name):
+        suffix = document_suffix(PurePosixPath(name))
+        limit = archive_size_limit(suffix) if suffix in ARCHIVE_SUFFIXES else 2 * 1024 * 1024
+        if suffix == ".pdf":
+            limit = PDF_SIZE_LIMIT
+        with self._open_file(name) as (stream, size):
+            if limit is not None and size > limit:
+                raise ValueError(f"File exceeds the {limit // (1024 * 1024)} MiB limit.")
+            if suffix in ARCHIVE_SUFFIXES or suffix == ".pdf":
+                # Let seekable readers work without copying the whole file into memory.
+                result = read_document_stream(stream, suffix=suffix)
+            else:
+                data = stream.read(limit + 1)
+                if len(data) > limit:
+                    raise ValueError(f"File exceeds the {limit // (1024 * 1024)} MiB limit.")
+                result = read_document_stream(io.BytesIO(data), suffix=suffix)
+        if result is None:
+            raise ValueError("Unsupported/binary document.")
+        return result
+
+    def image(self, name):
+        mime = image_mime_type(name)
+        if not mime:
+            raise ValueError("Use a PNG or JPEG image.")
+        with self._open_file(name) as (stream, size):
+            data = stream.read(IMAGE_SIZE_LIMIT + 1) if size <= IMAGE_SIZE_LIMIT else None
+        if data is None or len(data) > IMAGE_SIZE_LIMIT:
+            raise ValueError(f"Image exceeds the {IMAGE_SIZE_LIMIT // (1024 * 1024)} MiB limit.")
+        signature = b"\x89PNG\r\n\x1a\n" if mime == "image/png" else b"\xff\xd8\xff"
+        if not data.startswith(signature):
+            raise ValueError("Image data does not match its extension.")
+        return mime, data
 
     def read_file(self, path, start_line=1, line_count=100):
         return _line_excerpt(path, self._text(path).splitlines(), start_line, line_count)
@@ -251,12 +288,20 @@ class DocumentFiles:
                     return {"matches": matches[:20], "truncated": True, "files_scanned": scanned}
                 if not PurePosixPath(relative).full_match(pattern):
                     continue
+                name_matches = not query or needle in (
+                    relative if case_sensitive else relative.casefold()
+                )
+                if image_mime_type(relative):
+                    if name_matches:
+                        with suppress(OSError, ValueError), self._open_file(relative):
+                            matches.append({"path": relative, "kind": "image"})
+                    continue
                 try:
                     text = self._text(relative)
                 except OSError, ValueError:
                     continue
                 size += len(text)
-                if not query or needle in (relative if case_sensitive else relative.casefold()):
+                if name_matches:
                     matches.append({"path": relative})
                 if query:
                     for number, line in enumerate(text.splitlines(), 1):
@@ -287,6 +332,11 @@ class ChatFiles:
         self.roots = {
             name: DocumentFiles(self.chat_folder / name) for name in ("projects", "documents")
         }
+
+    def view_image(self, path):
+        if not isinstance(path, str) or not path.startswith("documents/"):
+            raise ValueError("Use an image path starting with documents/.")
+        return self.roots["documents"].image(path.removeprefix("documents/"))
 
     def read_file(self, path, start_line=1, line_count=100):
         if not isinstance(path, str):
@@ -323,6 +373,8 @@ class ChatFiles:
                     if number is None:
                         lines.append(f"Message {position + 1} ({message['role']}):")
                     lines.extend(message.get("content", "").splitlines())
+                    if images := message.get("images"):
+                        lines.append(image_attachment_note(images).strip())
                     if number is None:
                         lines.append("")
             result = _line_excerpt(path, lines, start_line, line_count)

@@ -1,5 +1,6 @@
 """llama-server HTTP/SSE transport, capabilities, auxiliary requests and tool turns."""
 
+import base64
 import json
 import logging
 import os
@@ -13,7 +14,7 @@ from contextlib import closing, suppress
 from itertools import accumulate
 from pathlib import Path
 
-from agentic import FILE_TOOLS, RUNTIME_TOOLS, ChatFiles, handle_tool_call
+from agentic import FILE_TOOLS, RUNTIME_TOOLS, VIEW_IMAGE_TOOL, ChatFiles, handle_tool_call
 from memory import VIEW_MEMORIES_TOOL, _fence_after, memory_review
 from rag import (
     DOCUMENT_QUESTIONS_INSTRUCTION,
@@ -112,9 +113,31 @@ def _stream_packet(data):
     return chunk
 
 
-def chat_tools(*, files, memories):
+def chat_tools(*, files, memories, vision=False):
     tools = RUNTIME_TOOLS + FILE_TOOLS if files else RUNTIME_TOOLS
+    if files and vision:
+        tools = [*tools, VIEW_IMAGE_TOOL]
     return [*tools, VIEW_MEMORIES_TOOL] if memories else tools
+
+
+def _image_part(mime, data):
+    url = f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+def _text_message(message):
+    if "image_parts" not in message:
+        return message
+    return {key: value for key, value in message.items() if key != "image_parts"}
+
+
+def _multimodal_message(message):
+    if not (images := message.get("image_parts")):
+        return message
+    return {
+        **_text_message(message),
+        "content": [{"type": "text", "text": message["content"]}, *images],
+    }
 
 
 def recent_messages(history, limit=3):
@@ -197,6 +220,7 @@ class LlamaClient:
         self.base_url = settings.server_url.rstrip("/").removesuffix("/v1")
         self.active_response = None
         self.context_capacity = None
+        self.vision_enabled = False
         self.last_context_used = None
         self.last_auto_choice = None
         self._context_exhausted = False
@@ -410,7 +434,10 @@ class LlamaClient:
         def count():
             if stopped():
                 raise InterruptedError("Context preparation cancelled")
-            return self._token_count(self._context_prompt(body))
+            images = sum(len(message.get("image_parts", ())) for message in messages)
+            text_body = {**body, "messages": [_text_message(message) for message in messages]}
+            # /tokenize measures text only. Leave headroom for each image on a retry.
+            return self._token_count(self._context_prompt(text_body)) + 1024 * images
 
         size = count()
         if size <= ceiling:
@@ -426,7 +453,11 @@ class LlamaClient:
             if not boundaries:
                 break
             # Use text weights only to choose a batch, then verify with the real tokenizer.
-            weights = [len(json.dumps(m, ensure_ascii=False)) for m in messages]
+            weights = [
+                len(json.dumps(_text_message(m), ensure_ascii=False))
+                + 4096 * len(m.get("image_parts", ()))
+                for m in messages
+            ]
             goal = sum(weights) * (size - target) / size
             prefix_weights = list(accumulate(weights[1:], initial=0))
             boundary = next(
@@ -618,11 +649,25 @@ class LlamaClient:
         context_user_content=None,
         on_waiting=None,
         expand_context=False,
+        image_paths=(),
     ):
         """Keep read-only tool exchanges local to this request, with bounded follow-ups."""
         with closing(_DebugCapture()) as self._capture:
             self._capture.write("start", server_url=self.settings.server_url)
             history = list(messages)
+            files = ChatFiles(Path(documents).parent) if documents is not None else None
+            vision = files is not None and self.vision_enabled
+            if vision and image_paths:
+                images = []
+                for path in image_paths:
+                    if stopped():
+                        return "", "", None
+                    try:
+                        images.append(_image_part(*files.view_image(path)))
+                    except (ValueError, OSError) as exc:
+                        on_notice(f"Could not attach image {path}: {exc}")
+                if images:
+                    history[-1] = {**history[-1], "image_parts": images}
             self._context_current = id(
                 next((m for m in reversed(history) if m["role"] == "user"), None)
             )
@@ -632,8 +677,9 @@ class LlamaClient:
             self._on_context_trim = on_context_trim
             self._context_user_content = context_user_content
             self._context_retry = self._context_expanding = expand_context
-            files = ChatFiles(Path(documents).parent) if documents is not None else None
-            tools = chat_tools(files=files is not None, memories=memory_view is not None)
+            tools = chat_tools(
+                files=files is not None, memories=memory_view is not None, vision=vision
+            )
             self._context_tools = tools
             self.last_context_used = None
             answer, reasoning = "", ""
@@ -732,20 +778,24 @@ class LlamaClient:
                 for call in calls:
                     if stopped():
                         return answer, reasoning, None
-                    if call["function"]["name"] == "view_memories" and memory_view is not None:
+                    tool_message = {"role": "tool", "tool_call_id": call["id"]}
+                    name = call["function"]["name"]
+                    if name == "view_image" and vision:
+                        try:
+                            path = json.loads(call["function"]["arguments"])["path"]
+                            image = _image_part(*files.view_image(path))
+                            tool_message["image_parts"] = [image]
+                            output = json.dumps({"path": path})
+                        except (KeyError, OSError, ValueError, TypeError) as exc:
+                            output = json.dumps({"error": f"Could not open image: {exc}"})
+                    elif name == "view_memories" and memory_view is not None:
                         try:
                             output = memory_view()
                         except Exception as exc:
                             output = json.dumps({"error": f"Could not read memories: {exc}"})
                     else:
                         output = handle_tool_call(call, files)
-                    history.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call["id"],
-                            "content": output,
-                        }
-                    )
+                    history.append({**tool_message, "content": output})
                 answer = memory_review(answer)[0].rstrip()
                 if answer:
                     answer += "\n\n"
@@ -838,7 +888,19 @@ class LlamaClient:
                 if self._on_context:
                     self._on_context(False)
         capture = getattr(self, "_capture", None)
-        if capture:
+        if any("image_parts" in message for message in body["messages"]):
+            if capture:
+                # Keep attachment references and tool calls in the log without image copies.
+                capture.write(
+                    "request",
+                    url=self.chat_url,
+                    body={
+                        **body,
+                        "messages": [_text_message(message) for message in body["messages"]],
+                    },
+                )
+            body = {**body, "messages": [_multimodal_message(m) for m in body["messages"]]}
+        elif capture:
             capture.write("request", url=self.chat_url, body=body)
         request = self._post_request(self.chat_url, body)
         reasoning_parts, answer_parts, finish_reason = [], [], None
