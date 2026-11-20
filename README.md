@@ -30,9 +30,7 @@ Choose **Add Documents** from a chat’s menu and drag files or folders into the
 
 Retrieval uses SQLite FTS5/BM25, phrase and identifier matching, and filename/section searches combined with Reciprocal Rank Fusion (RRF). Relevant excerpts are injected into the current request as document reference data, not saved in chat history.
 
-DOCX, PPTX, and XLSX documents require optional Python libraries `python-docx`, `python-pptx`, and `openpyxl`, respectively. OpenDocument text (`.odt`), presentations (`.odp`), and spreadsheets (`.ods`) require `odfpy`. EPUB books require `EbookLib`. Lopaca warns when a required library is missing. Install it in the Python environment that runs Lopaca, then restart Lopaca. Files already in `documents/` will be retried. These libraries are optional and are not installed by the installer.
-
-RAG and file tools share the same text extraction. DOCX paragraphs and tables, PPTX slide text and speaker notes, and XLSX sheet names and cell coordinates are preserved in extracted text. Spreadsheet formulas are retained without calculation. File tools extract packaged documents on demand; indexed passages are cached in `documents.sqlite`. OpenDocument extraction preserves text and table rows, including slide/sheet names where supplied. EPUB chapters follow the book’s reading order. Standalone HTML and other text sources remain unmodified. Original files stay intact, and citation line numbers refer to extracted text.
+DOCX, PPTX, and XLSX documents require optional Python libraries `python-docx`, `python-pptx`, and `openpyxl`, respectively. OpenDocument text (`.odt`), presentations (`.odp`), and spreadsheets (`.ods`) require `odfpy`. EPUB books require `EbookLib`; RTF documents require `striprtf`. EML messages and MBOX mailboxes use Python’s standard library. Lopaca warns when a required library is missing. Install it in the Python environment that runs Lopaca, then restart Lopaca. Files already in `documents/` will be retried. These libraries are optional and are not installed by the installer.
 
 **Expand Document Searches** in App Settings optionally asks the same llama-server model for related search terms. It's off by default because it adds response latency.
 
@@ -40,7 +38,6 @@ RAG and file tools share the same text extraction. DOCX paragraphs and tables, P
 
 # TO-DO
 - Add embedding model support?
-- Add PDF and other docs support
 - Make features list
 - More advanced agentic mode with more tools, web searching, etc
 

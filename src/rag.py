@@ -16,6 +16,8 @@ import time
 import zlib
 from collections import defaultdict
 from contextlib import closing, suppress
+from email import policy
+from email.parser import BytesParser
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -373,6 +375,7 @@ DOCUMENT_LIBRARIES = {
     ".odp": ("odf.opendocument", "odfpy"),
     ".ods": ("odf.opendocument", "odfpy"),
     ".epub": ("ebooklib.epub", "EbookLib"),
+    ".rtf": ("striprtf.striprtf", "striprtf"),
 }
 
 
@@ -384,8 +387,8 @@ class MissingDocumentLibraryError(ValueError):
         )
 
 
-class _EpubText(HTMLParser):
-    """Convert packaged book chapters only; ordinary HTML files keep their source."""
+class _DocumentHtmlText(HTMLParser):
+    """Convert embedded book/email HTML only; standalone HTML retains its source."""
 
     def __init__(self):
         super().__init__()
@@ -468,6 +471,47 @@ def _odf_lines(node, extract_text):
         yield from _odf_lines(child, extract_text)
 
 
+def _email_text(source, suffix):
+    data = source.read()
+    if suffix == ".mbox":
+        if not data.startswith(b"From "):
+            raise ValueError("MBOX file has no message separator")
+        messages = re.split(rb"(?m)^From [^\r\n]*\r?\n", data)[1:]
+    else:
+        messages = [data]
+    lines = ["Extracted email text; line numbers refer to this extraction."]
+    for number, data in enumerate(messages, 1):
+        if suffix == ".mbox":
+            data = re.sub(rb"(?m)^>From ", b"From ", data)
+        message = BytesParser(policy=policy.default).parsebytes(data)
+        if not message.keys():
+            raise ValueError("Email has no headers")
+        lines.append(f"# Message {number}")
+        lines.extend(
+            f"{header}: {value}"
+            for header in ("Subject", "From", "To", "Cc", "Date", "Message-ID")
+            if (value := message.get(header))
+        )
+        body = message.get_body(preferencelist=("plain", "html"))
+        if body is not None:
+            try:
+                text = body.get_content()
+            except LookupError:
+                text = body.get_payload(decode=True).decode("utf-8", errors="replace")
+            if body.get_content_type() == "text/html":
+                parser = _DocumentHtmlText()
+                parser.feed(text)
+                parser.close()
+                text = "".join(parser.parts)
+            lines.extend(("", text.strip()))
+        lines.extend(
+            f"Attachment filename (contents not extracted): {name}"
+            for attachment in message.iter_attachments()
+            if (name := attachment.get_filename())
+        )
+    return "\n".join(lines)
+
+
 def _formatted_document_text(source, suffix):
     module_name, package = DOCUMENT_LIBRARIES[suffix]
     try:
@@ -477,7 +521,14 @@ def _formatted_document_text(source, suffix):
             raise MissingDocumentLibraryError(suffix, package) from exc
         raise
     lines = ["Extracted document text; line numbers refer to this extraction."]
-    if suffix == ".docx":
+    if suffix == ".rtf":
+        data = source.read()
+        if not data.lstrip().startswith(b"{\\rtf"):
+            raise ValueError("Invalid RTF document")
+        codepage = re.search(rb"\\ansicpg(\d+)", data[:1024])
+        encoding = "cp" + codepage[1].decode() if codepage else "cp1252"
+        lines.append(module.rtf_to_text(data.decode(encoding, errors="replace")))
+    elif suffix == ".docx":
         document = module.Document(source)
         for block in document.iter_inner_content():
             if hasattr(block, "rows"):
@@ -507,7 +558,7 @@ def _formatted_document_text(source, suffix):
             item = document.get_item_with_id(item_id)
             if not isinstance(item, module.EpubHtml):
                 continue
-            parser = _EpubText()
+            parser = _DocumentHtmlText()
             parser.feed(item.get_content().decode("utf-8"))
             parser.close()
             lines.extend((f"# Chapter: {item.get_name()}", "".join(parser.parts).strip()))
@@ -538,9 +589,13 @@ def read_document(path):
 
 def read_document_stream(source, *, suffix=""):
     """Decode a binary stream using the same text checks for RAG and file tools."""
-    if suffix in DOCUMENT_LIBRARIES:
+    if suffix in DOCUMENT_LIBRARIES or suffix in (".eml", ".mbox"):
         try:
-            return _formatted_document_text(source, suffix)
+            return (
+                _email_text(source, suffix)
+                if suffix in (".eml", ".mbox")
+                else _formatted_document_text(source, suffix)
+            )
         except MissingDocumentLibraryError:
             raise
         except Exception as exc:
@@ -870,7 +925,7 @@ def _index(connection, folder, settings, stopped, on_missing=None):
 
     """)
     _create_chunks(connection)
-    signature = f"7:{settings.chunk_chars}:{settings.chunk_overlap}"
+    signature = f"8:{settings.chunk_chars}:{settings.chunk_overlap}"
     state = connection.execute("SELECT value FROM index_state WHERE key = 'chunking'").fetchone()
     changed = state != (signature,)
     if changed:
