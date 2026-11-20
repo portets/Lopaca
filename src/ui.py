@@ -67,24 +67,61 @@ window.lopaca-main, .transcript-scroll, .transcript {
     margin-left: 24px;
     margin-right: 24px;
 }
-.app-toolbar,
-.app-header-bar,
-.app-title,
-.app-layout,
-.chat-list-overlay,
-.disk-usage,
-.chat-disk-usage,
-.total-disk-usage,
-.chat-pane,
-.chat-title,
-.chat-folder-path,
-.main-transcript-scroll,
-.response-status,
-.status-spacer,
-.context-usage,
-.generation-speed,
-.main-frame,
-.prompt-scroll,
+.app-toolbar {
+    /* Theme defaults; add overrides here when needed. */
+}
+.app-header-bar {
+    /* Theme defaults; add overrides here when needed. */
+}
+.app-title {
+    /* Theme defaults; add overrides here when needed. */
+}
+.app-layout {
+    /* Theme defaults; add overrides here when needed. */
+}
+.chat-list-overlay {
+    /* Theme defaults; add overrides here when needed. */
+}
+.disk-usage {
+    margin-right: -8px;
+    margin-left: 8px;
+}
+.chat-disk-usage {
+    /* Theme defaults; add overrides here when needed. */
+}
+.total-disk-usage {
+    /* Theme defaults; add overrides here when needed. */
+}
+.chat-pane {
+    /* Theme defaults; add overrides here when needed. */
+}
+.chat-title {
+    /* Theme defaults; add overrides here when needed. */
+}
+.chat-folder-path {
+    /* Theme defaults; add overrides here when needed. */
+}
+.main-transcript-scroll {
+    /* Theme defaults; add overrides here when needed. */
+}
+.response-status {
+    /* Theme defaults; add overrides here when needed. */
+}
+.status-spacer {
+    /* Theme defaults; add overrides here when needed. */
+}
+.context-usage {
+    /* Theme defaults; add overrides here when needed. */
+}
+.generation-speed {
+    /* Theme defaults; add overrides here when needed. */
+}
+.main-frame {
+    /* Theme defaults; add overrides here when needed. */
+}
+.prompt-scroll {
+    /* Theme defaults; add overrides here when needed. */
+}
 .send-stop {
     /* Theme defaults; add overrides here when needed. */
 }
@@ -125,15 +162,14 @@ window.lopaca-main, .transcript-scroll, .transcript {
     background-color: alpha(@theme_selected_bg_color,0.4);
 }
 .chat-row {
-    padding: 1px 5px;
+    padding: 1px 2px 1px 10px;
+    margin-top: 1px;
+    margin-bottom: 1px;
     border-radius: 9px;
     border-spacing: 4px;
 }
 .chat-options-button {
     opacity: 0;
-    padding: 0;
-    min-width: 20px;
-    min-height: 20px;
 }
 .chat-row:hover .chat-options-button, .chat-options-button:focus {
     opacity: 1;
@@ -163,8 +199,8 @@ window.lopaca-main, .transcript-scroll, .transcript {
     margin-right: 8px;
 }
 .main-chat-list {
-    margin-left: 14px;
-    margin-right: 12px;
+    margin-left: 8px;
+    margin-right: 8px;
 }
 .main-chat-list:dir(rtl) {
     margin-left: 12px;
@@ -176,11 +212,23 @@ window.lopaca-main, .transcript-scroll, .transcript {
     margin-right: 10px;
     margin-bottom: 4px;
 }
-.chats-heading,
-.new-chat-button,
-.app-settings-button,
-.chat-list-row,
-.chat-list-label,
+.chats-heading {
+    margin-right: -1px;
+    margin-left: 1px;
+}
+.new-chat-button {
+    margin-right: 4px;
+    margin-left: -4px;
+}
+.app-settings-button {
+    /* Theme defaults; add overrides here when needed. */
+}
+.chat-list-row {
+    /* Theme defaults; add overrides here when needed. */
+}
+.chat-list-label {
+    /* Theme defaults; add overrides here when needed. */
+}
 .chat-list-options-button {
     /* Theme defaults; add overrides here when needed. */
 }
@@ -246,10 +294,18 @@ window.lopaca-main, .transcript-scroll, .transcript {
 .streaming-response-current-content {
     border-spacing: 6px;
 }
-.message-time-label,
-.message-label,
-.reasoning-header-button,
-.reasoning-arrow,
+.message-time-label {
+    /* Theme defaults; add overrides here when needed. */
+}
+.message-label {
+    /* Theme defaults; add overrides here when needed. */
+}
+.reasoning-header-button {
+    /* Theme defaults; add overrides here when needed. */
+}
+.reasoning-arrow {
+    /* Theme defaults; add overrides here when needed. */
+}
 .model-settings-reasoning {
     /* Theme defaults; add overrides here when needed. */
 }
@@ -301,12 +357,40 @@ window.lopaca-main, .transcript-scroll, .transcript {
 .thinking-dropdown {
     margin-right: 8px;
 }
+/* Inside the closed button, around the text and arrow */
+.thinking-dropdown > button {
+    padding-left: 17px;
+    padding-right: 8px;
+}
+
+/* Only the text inside the closed button */
+.thinking-dropdown > button label {
+}
+
+/* Inside the expanded popup's outer box */
+.thinking-dropdown popover contents {
+}
+
+/* Inside each selectable option */
+.thinking-dropdown popover listview row {
+    padding-left: 12px;
+    padding-right: 12px;
+    padding-top: 6px;
+    padding-bottom: 6px;
+}
+
+/* Only the text inside each option */
+.thinking-dropdown popover listview row label {
+    margin-left: -2px;
+    margin-right: 2px;
+}
 .thinking-dropdown:dir(rtl) {
     margin-left: 8px;
     margin-right: 0;
 }
 .thinking-dropdown label {
     font-weight: normal;
+    margin-left: 0px;
 }
 .prompt-view, .prompt-view text {
     background-color: transparent;
@@ -344,10 +428,14 @@ window.lopaca-main, .transcript-scroll, .transcript {
 .composer-actions {
     border-spacing: 8px;
 }
-.prompt-hint,
-.thinking-label,
-.attach-documents-button {
+.prompt-hint {
     /* Theme defaults; add overrides here when needed. */
+}
+.thinking-label {
+    /* Theme defaults; add overrides here when needed. */
+}
+.attach-documents-button {
+    margin-right: 2px;
 }
 
 /* Settings pages and shared settings controls */
@@ -379,51 +467,141 @@ window.lopaca-main, .transcript-scroll, .transcript {
 .memories-controls {
     border-spacing: 6px;
 }
-.settings-page,
-.settings-group,
-.settings-row,
-.settings-button,
-.settings-memories-row,
-.settings-choice-group,
-.override-delete-button,
-.about-page,
-.about-project,
-.about-licenses,
-.about-donations,
-.model-settings-page,
-.model-settings-paths,
-.model-settings-advanced-group,
-.model-settings-advanced,
-.model-settings-preserve,
-.model-settings-options,
-.model-settings-extra,
-.model-settings-scroll,
-.model-settings-frame,
-.model-settings-actions,
-.model-server-status,
-.model-connect-button,
-.model-settings-row,
-.model-settings-browse,
-.model-settings-check,
-.settings-subpage-toolbar,
-.settings-subpage-header,
-.settings-subpage-back,
-.settings-subpage-page,
-.settings-subpage-group,
-.knowledge-page,
-.knowledge-group,
-.knowledge-packs-merge,
-.knowledge-packs-button,
-.knowledge-packs-label,
-.knowledge-packs-spinner,
-.knowledge-packs-row,
-.knowledge-packs-switch,
-.knowledge-packs-remove,
-.knowledge-packs-info,
-.memories-row,
-.memories-entry,
-.memories-core-button,
-.memories-edit,
+.settings-page {
+    /* Theme defaults; add overrides here when needed. */
+}
+.settings-group {
+    /* Theme defaults; add overrides here when needed. */
+}
+.settings-row {
+    /* Theme defaults; add overrides here when needed. */
+}
+.settings-button {
+    /* Theme defaults; add overrides here when needed. */
+}
+.settings-memories-row {
+    /* Theme defaults; add overrides here when needed. */
+}
+.settings-choice-group {
+    /* Theme defaults; add overrides here when needed. */
+}
+.override-delete-button {
+    /* Theme defaults; add overrides here when needed. */
+}
+.about-page {
+    /* Theme defaults; add overrides here when needed. */
+}
+.about-project {
+    /* Theme defaults; add overrides here when needed. */
+}
+.about-licenses {
+    /* Theme defaults; add overrides here when needed. */
+}
+.about-donations {
+    /* Theme defaults; add overrides here when needed. */
+}
+.model-settings-page {
+    /* Theme defaults; add overrides here when needed. */
+}
+.model-settings-paths {
+    /* Theme defaults; add overrides here when needed. */
+}
+.model-settings-advanced-group {
+    /* Theme defaults; add overrides here when needed. */
+}
+.model-settings-advanced {
+    /* Theme defaults; add overrides here when needed. */
+}
+.model-settings-preserve {
+    /* Theme defaults; add overrides here when needed. */
+}
+.model-settings-options {
+    /* Theme defaults; add overrides here when needed. */
+}
+.model-settings-extra {
+    /* Theme defaults; add overrides here when needed. */
+}
+.model-settings-scroll {
+    /* Theme defaults; add overrides here when needed. */
+}
+.model-settings-frame {
+    /* Theme defaults; add overrides here when needed. */
+}
+.model-settings-actions {
+    /* Theme defaults; add overrides here when needed. */
+}
+.model-server-status {
+    /* Theme defaults; add overrides here when needed. */
+}
+.model-connect-button {
+    /* Theme defaults; add overrides here when needed. */
+}
+.model-settings-row {
+    /* Theme defaults; add overrides here when needed. */
+}
+.model-settings-browse {
+    /* Theme defaults; add overrides here when needed. */
+}
+.model-settings-check {
+    /* Theme defaults; add overrides here when needed. */
+}
+.settings-subpage-toolbar {
+    /* Theme defaults; add overrides here when needed. */
+}
+.settings-subpage-header {
+    /* Theme defaults; add overrides here when needed. */
+}
+.settings-subpage-back {
+    /* Theme defaults; add overrides here when needed. */
+}
+.settings-subpage-page {
+    /* Theme defaults; add overrides here when needed. */
+}
+.settings-subpage-group {
+    /* Theme defaults; add overrides here when needed. */
+}
+.knowledge-page {
+    /* Theme defaults; add overrides here when needed. */
+}
+.knowledge-group {
+    /* Theme defaults; add overrides here when needed. */
+}
+.knowledge-packs-merge {
+    /* Theme defaults; add overrides here when needed. */
+}
+.knowledge-packs-button {
+    /* Theme defaults; add overrides here when needed. */
+}
+.knowledge-packs-label {
+    /* Theme defaults; add overrides here when needed. */
+}
+.knowledge-packs-spinner {
+    /* Theme defaults; add overrides here when needed. */
+}
+.knowledge-packs-row {
+    /* Theme defaults; add overrides here when needed. */
+}
+.knowledge-packs-switch {
+    /* Theme defaults; add overrides here when needed. */
+}
+.knowledge-packs-remove {
+    /* Theme defaults; add overrides here when needed. */
+}
+.knowledge-packs-info {
+    /* Theme defaults; add overrides here when needed. */
+}
+.memories-row {
+    /* Theme defaults; add overrides here when needed. */
+}
+.memories-entry {
+    /* Theme defaults; add overrides here when needed. */
+}
+.memories-core-button {
+    /* Theme defaults; add overrides here when needed. */
+}
+.memories-edit {
+    /* Theme defaults; add overrides here when needed. */
+}
 .memories-delete {
     /* Theme defaults; add overrides here when needed. */
 }
@@ -473,19 +651,45 @@ window.lopaca-main, .transcript-scroll, .transcript {
 .command-review-buttons {
     border-spacing: 8px;
 }
-.rename-chat-toolbar,
-.rename-chat-header,
-.rename-chat-cancel-button,
-.rename-chat-save-button,
-.document-drop-toolbar,
-.command-review-toolbar,
-.command-review-scroll,
-.command-review-frame,
-.command-review-cancel-button,
-.command-review-approve-button,
-.command-review-label,
-.command-review-legend,
-.command-review-notice,
+.rename-chat-toolbar {
+    /* Theme defaults; add overrides here when needed. */
+}
+.rename-chat-header {
+    /* Theme defaults; add overrides here when needed. */
+}
+.rename-chat-cancel-button {
+    /* Theme defaults; add overrides here when needed. */
+}
+.rename-chat-save-button {
+    /* Theme defaults; add overrides here when needed. */
+}
+.document-drop-toolbar {
+    /* Theme defaults; add overrides here when needed. */
+}
+.command-review-toolbar {
+    /* Theme defaults; add overrides here when needed. */
+}
+.command-review-scroll {
+    /* Theme defaults; add overrides here when needed. */
+}
+.command-review-frame {
+    /* Theme defaults; add overrides here when needed. */
+}
+.command-review-cancel-button {
+    /* Theme defaults; add overrides here when needed. */
+}
+.command-review-approve-button {
+    /* Theme defaults; add overrides here when needed. */
+}
+.command-review-label {
+    /* Theme defaults; add overrides here when needed. */
+}
+.command-review-legend {
+    /* Theme defaults; add overrides here when needed. */
+}
+.command-review-notice {
+    /* Theme defaults; add overrides here when needed. */
+}
 .command-review-warnings {
     /* Theme defaults; add overrides here when needed. */
 }
@@ -868,7 +1072,7 @@ class ChatWindow(Adw.ApplicationWindow):
             self.thinking_dropdown.set_selected(
                 self._thinking_values.index(current) if current in self._thinking_values else 0
             )
-        self.thinking_dropdown.set_tooltip_text(title + " · auto chooses effort for each prompt")
+        self.thinking_dropdown.set_tooltip_text(title + " auto lets model choose for each prompt")
 
     def _thinking_selected(self, dropdown, _param):
         selected = dropdown.get_selected()
