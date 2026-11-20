@@ -624,11 +624,18 @@ _TAR_COMPRESSION = {
 }
 _COMPRESSED_TEXT_SUFFIXES = _COMPRESSED_TEXT.keys() | _OPTIONAL_COMPRESSION_LIBRARIES.keys()
 ARCHIVE_SUFFIXES = frozenset({".zip", ".tar", ".7z", *_TAR_COMPRESSION, *_COMPRESSED_TEXT_SUFFIXES})
-ARCHIVE_SIZE_LIMIT = 256 * 1024 * 1024
-_ARCHIVE_DECODE_LIMIT = 128 * 1024 * 1024
-_ARCHIVE_MEMBER_LIMIT = 16 * 1024 * 1024
-_ARCHIVE_TEXT_LIMIT = 32 * 1024 * 1024
-_ARCHIVE_ENTRY_LIMIT = 5000
+_ARCHIVE_SIZE_LIMIT = 1024 * 1024 * 1024
+_ARCHIVE_DECODE_LIMIT = 512 * 1024 * 1024
+_ARCHIVE_MEMBER_LIMIT = 64 * 1024 * 1024
+_ARCHIVE_TEXT_LIMIT = 128 * 1024 * 1024
+_ARCHIVE_ENTRY_LIMIT = 20_000
+
+
+def archive_size_limit(suffix):
+    """Limit stored size where reading one member can require decoding others."""
+    if suffix == ".7z" or suffix in _TAR_COMPRESSION:
+        return _ARCHIVE_SIZE_LIMIT
+    return None
 
 
 def document_suffix(path):
@@ -721,21 +728,22 @@ def _archive_entries(source, suffix):
     if suffix in _TAR_COMPRESSION:
         # Bound the decoded TAR itself, including headers and metadata.
         data = _read_compressed(source, suffix, _ARCHIVE_DECODE_LIMIT)
-    else:
-        data = source.read(_ARCHIVE_DECODE_LIMIT + 1)
-    if len(data) > _ARCHIVE_DECODE_LIMIT:
-        raise ValueError(
-            f"Decoded TAR exceeds the {_ARCHIVE_DECODE_LIMIT // (1024 * 1024)} MiB limit"
-        )
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+        if len(data) > _ARCHIVE_DECODE_LIMIT:
+            raise ValueError(
+                f"Decoded TAR exceeds the {_ARCHIVE_DECODE_LIMIT // (1024 * 1024)} MiB limit"
+            )
+        source = io.BytesIO(data)
+    # Plain TAR can seek over skipped members. Avoid retaining every member header.
+    with tarfile.open(fileobj=source, mode="r:", stream=True) as archive:
         for member in archive:
             if member.isreg() and not member.issparse():
                 yield member.name, member.size, lambda member=member: archive.extractfile(member)
 
 
 def _archive_text(source, suffix):
-    if suffix != ".zip" and source.seek(0, io.SEEK_END) > ARCHIVE_SIZE_LIMIT:
-        raise ValueError(f"Archive exceeds the {ARCHIVE_SIZE_LIMIT // (1024 * 1024)} MiB limit")
+    limit = archive_size_limit(suffix)
+    if limit is not None and source.seek(0, io.SEEK_END) > limit:
+        raise ValueError(f"Archive exceeds the {limit // (1024 * 1024)} MiB limit")
     source.seek(0)
     if suffix in _COMPRESSED_TEXT_SUFFIXES:
         data = _read_compressed(source, suffix, _ARCHIVE_MEMBER_LIMIT)
@@ -1141,7 +1149,7 @@ def _index(connection, folder, settings, stopped, on_missing=None):
 
     """)
     _create_chunks(connection)
-    signature = f"15:{settings.chunk_chars}:{settings.chunk_overlap}"
+    signature = f"16:{settings.chunk_chars}:{settings.chunk_overlap}"
     state = connection.execute("SELECT value FROM index_state WHERE key = 'chunking'").fetchone()
     changed = state != (signature,)
     if changed:

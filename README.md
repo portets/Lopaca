@@ -32,6 +32,8 @@ Retrieval uses SQLite FTS5/BM25, phrase and identifier matching, and filename/se
 
 DOCX, PPTX, and XLSX documents require optional Python libraries `python-docx`, `python-pptx`, and `openpyxl`, respectively. OpenDocument text (`.odt`), presentations (`.odp`), and spreadsheets (`.ods`) require `odfpy`. EPUB books require `EbookLib`, RTF documents require `striprtf`, and PDFs require `pypdf`. EML messages and MBOX mailboxes use Python’s standard library. Lopaca warns when a required library is missing. Install it in the Python environment that runs Lopaca, then restart Lopaca. Files already in `documents/` will be retried. These libraries are optional and are not installed by the installer.
 
+Lopaca indexes plain-text members of ZIP, TAR, compressed TAR, and 7z archives. ZIP and plain TAR can exceed 1 GiB because Lopaca can seek past large members. Compressed TAR and 7z have a 1 GiB file cap and a 512 MiB decompression cap. Extraction considers up to 20,000 members and 128 MiB of member data, with a 64 MiB limit per decoded member or standalone compressed text file. 7z requires `py7zr` 1.1.4 or newer. LZ4 requires `lz4`, and Zstandard uses Python's built-in reader or the optional `zstandard` fallback.
+
 **Expand Document Searches** in App Settings optionally asks the same llama-server model for related search terms. It's off by default because it adds response latency.
 
 **Model-Assisted Document Indexing** in App settings optionally allows the LLM to help process documents for better info retrieval. Very slow and depends on your model speed. Modest quality improvement. Recommended for t/s greater than 80.

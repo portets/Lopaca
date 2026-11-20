@@ -20,9 +20,9 @@ from pathlib import Path, PurePosixPath
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from rag import (
-    ARCHIVE_SIZE_LIMIT,
     ARCHIVE_SUFFIXES,
     PDF_SIZE_LIMIT,
+    archive_size_limit,
     document_suffix,
     numbered_excerpt,
     read_document_stream,
@@ -194,10 +194,12 @@ class DocumentFiles:
                 if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                     raise ValueError("Only regular text files are supported.")
                 suffix = document_suffix(path)
-                limit = ARCHIVE_SIZE_LIMIT if suffix in ARCHIVE_SUFFIXES else 2 * 1024 * 1024
+                limit = (
+                    archive_size_limit(suffix) if suffix in ARCHIVE_SUFFIXES else 2 * 1024 * 1024
+                )
                 if suffix == ".pdf":
                     limit = PDF_SIZE_LIMIT
-                if suffix != ".zip" and os.fstat(stream.fileno()).st_size > limit:
+                if limit is not None and os.fstat(stream.fileno()).st_size > limit:
                     raise ValueError(f"File exceeds the {limit // (1024 * 1024)} MiB limit.")
                 if suffix in ARCHIVE_SUFFIXES or suffix == ".pdf":
                     # Let seekable readers work without copying the whole file into memory.
