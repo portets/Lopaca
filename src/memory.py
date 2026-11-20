@@ -247,6 +247,8 @@ def memory_context(rows):
         "instruction does not. Skip only facts already covered by current saved memories "
         "without a meaningful change, not facts merely mentioned in historical chats. "
         "Short answers can refine a saved fact; resolve them using the preceding exchange. "
+        "On requests to list or check saved memories, call view_memories before writing any "
+        "visible answer. Answer from its results, even when recalled memories are empty. "
         "Every final answer must end on a new line with <memory-review>yes</memory-review> "
         "when review is needed, or <memory-review>no</memory-review> otherwise. Use the "
         "clarify or yes_clarify decision instead when the conflict rules require it. "
@@ -269,6 +271,7 @@ def _fence_after(line, fence):
 _REFERENCE_OPENINGS = tuple(
     f"<lopaca-{name}>"
     for name in (
+        "memory",  # Some models invent a separate block to describe a proposed edit.
         "memory-references",
         "document-references",
         "knowledge-references",
@@ -282,6 +285,9 @@ _REVIEW_DECISIONS = {
     for tag in ("memory-review", "lopaca-memory-review")
     for choice in ("yes", "no", "clarify", "yes_clarify")
 }
+
+# Hide a malformed reserved footer too, while accepting only exact decisions.
+_MALFORMED_REVIEW = re.compile(r"<((?:lopaca-)?memory-review)>[^<]*</\1>")
 
 
 def _without_memory_references(text):
@@ -338,7 +344,10 @@ def memory_review(text):
             not candidate
             or len(tail) - len(candidate) > 3
             or tail.startswith("\t")
-            or not any(ending.startswith(candidate) for ending in _REVIEW_DECISIONS)
+            or not (
+                any(ending.startswith(candidate) for ending in _REVIEW_DECISIONS)
+                or _MALFORMED_REVIEW.fullmatch(candidate)
+            )
         ):
             break
         decision = decision or _REVIEW_DECISIONS.get(candidate)

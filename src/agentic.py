@@ -125,11 +125,10 @@ def get_datetime():
 FILE_TOOLS = [
     _tool(
         "read_file",
-        "Read source lines in the current chat's documents/ and projects/ folders, "
-        "or a knowledge/... article path, or archived earlier chat messages at "
-        "history/transcript.txt and history/message-N.txt (N is a 1-based message number). "
-        "Use documents/py65/memory.py or projects/example.py. Unprefixed paths use projects/. "
-        "Returns numbered lines and truncation/continuation information. No writes.",
+        "Read numbered lines from documents/ or projects/ in this chat, a knowledge/... "
+        "article path, or archived chat history at history/transcript.txt or "
+        "history/message-N.txt (N starts at 1). Unprefixed paths use projects/. "
+        "Returns continuation details when truncated. Read-only.",
         {
             "path": {"type": "string"},
             "start_line": {"type": "integer", "minimum": 1},
@@ -139,17 +138,11 @@ FILE_TOOLS = [
     ),
     _tool(
         "search_files",
-        "Search the current chat's documents/ and projects/, and installed knowledge "
-        "packs. Knowledge search uses lexical ranking and requires a nonempty query; "
-        "use pattern knowledge/** to search only packs. Knowledge results are article "
-        "paths and excerpts usable with read_file. Search all sources unless a known "
-        "path identifies one. Returned paths include that prefix and can be passed "
-        "directly to read_file. Search both folders unless the request or a known file "
-        "path identifies the relevant folder; do not narrow the search based on a guess. "
-        "pattern is an optional relative file glob: **/*.py searches all subfolders, folder/** "
-        "lists files recursively under folder; folder/*.py searches only that level. An "
-        "empty query lists paths. Otherwise searches filenames and text, returning numbered "
-        "matches. No shell or regex. Read a known path directly instead of searching again.",
+        "Search filenames and text in this chat's documents/ and projects/ and enabled "
+        "knowledge packs. Search all sources unless the request or a known path identifies "
+        "one. Optional glob examples: **/*.py for all levels, documents/*.py for one level, "
+        "knowledge/** for packs only. Empty query lists local paths; packs need a query. "
+        "Pass returned paths directly to read_file. No shell or regex.",
         {
             "query": {"type": "string"},
             "pattern": {"type": "string"},
@@ -413,19 +406,14 @@ def handle_tool_call(call, files=None):
 
 
 CODING_INSTRUCTION = (
-    " When a request would benefit from terminal commands, explain their purpose and put each "
-    "complete command in a separate fenced bash block. Keep multiline commands, including "
-    "heredocs, together. Lopaca turns these blocks into review buttons and executes commands "
-    "only after the user approves them. Prefer non-destructive commands. You can help create "
-    "or edit files through approved commands. Never claim a command has run until Lopaca "
-    "reports its result. Commands may launch terminal or GUI programs. When providing a command "
-    "to create a program, also provide a separate command to run it. Use get_osinfo when platform "
-    "details matter, rather than guessing the OS. Commands start inside this chat's projects/ "
-    "folder. Run python3 example.py directly, without cd projects or a projects/ path prefix. "
-    "Prefer this workspace unless the user requests another location. "
-    "To inspect those files, use read_file with projects/example.py; document references use "
-    "documents/... paths. File tools can access only these two folders in the current chat."
+    "\nFor useful terminal commands, explain their purpose and put each complete command "
+    "in its own fenced bash block. Keep multiline commands and heredocs together. Lopaca "
+    "executes commands only after approval. Prefer non-destructive commands and wait for "
+    "results before claiming execution. Give separate commands to create a program and run "
+    "it. Use get_osinfo if platform details matter. Commands start in this chat's projects/ "
+    "folder: run python3 example.py directly. Use projects/example.py with read_file."
 )
+
 
 _RISK_RULES = tuple(
     (level, reason, re.compile(pattern, re.IGNORECASE | re.MULTILINE))
