@@ -33,7 +33,14 @@ from llama_client import (
     recent_messages,
     thinking_parameters,
 )
-from memory import edit_memories, memory_context, memory_review, recall_memories, view_memories
+from memory import (
+    MEMORY_INSTRUCTION,
+    edit_memories,
+    memory_context,
+    memory_review,
+    recall_memories,
+    view_memories,
+)
 from model_server import ModelServer
 from rag import (
     DocumentIndexer,
@@ -703,12 +710,10 @@ class ChatController:
         expanding = bool(start and capacity and capacity > previous)
         return (0 if expanding else start), expanding
 
-    def _system_message(self, agent_mode, style, memories, core_context=None):
+    def _system_message(self, agent_mode, style, memories):
         content = build_system_prompt(agent_mode, style, memories=memories)
         if memories:
-            if core_context is None:
-                core_context = memory_context(self.memories.records(core_only=True))[0]
-            content += core_context
+            content += MEMORY_INSTRUCTION
         return {"role": "system", "content": content}
 
     def _history_messages(self, history, settings):
@@ -902,11 +907,10 @@ class ChatController:
                 )
             except Exception as exc:
                 self.view.dispatch(self.view.notify, f"Chat archive retrieval unavailable: {exc}")
-        core_context, casual_context = memory_context(memory_rows) if memory_enabled else ("", "")
         messages.insert(
             0,
             self._system_message(
-                agent_mode, generation_settings["conversation_style"], memory_enabled, core_context
+                agent_mode, generation_settings["conversation_style"], memory_enabled
             ),
         )
         context_user_content = messages[-1]["content"]
@@ -937,8 +941,7 @@ class ChatController:
         messages[-1]["content"] += knowledge_context
         messages[-1]["content"] += history_context + archive_context
         if memory_enabled:
-            # Query-specific recall must not invalidate the cached system/core profile.
-            messages[-1]["content"] += casual_context
+            messages[-1]["content"] += memory_context(memory_rows)
         request_seeds = []
 
         def record_seed(seed):
@@ -1022,13 +1025,8 @@ class ChatController:
             if preserve_thinking and reasoning:
                 completed["reasoning_content"] = reasoning
             try:
-                stable_system = messages[0]
-                if memory_enabled:
-                    stable_system = self._system_message(
-                        agent_mode, generation_settings["conversation_style"], memories=True
-                    )
                 retained = [
-                    stable_system,
+                    messages[0],
                     *history[removed:],
                     {"role": "user", "content": context_user_content},
                     completed,
