@@ -16,6 +16,7 @@ import time
 import zlib
 from collections import defaultdict
 from contextlib import closing, suppress
+from html.parser import HTMLParser
 from pathlib import Path
 
 QUERY_EXPANSION_INSTRUCTION = (
@@ -368,6 +369,10 @@ DOCUMENT_LIBRARIES = {
     ".docx": ("docx", "python-docx"),
     ".pptx": ("pptx", "python-pptx"),
     ".xlsx": ("openpyxl", "openpyxl"),
+    ".odt": ("odf.opendocument", "odfpy"),
+    ".odp": ("odf.opendocument", "odfpy"),
+    ".ods": ("odf.opendocument", "odfpy"),
+    ".epub": ("ebooklib.epub", "EbookLib"),
 }
 
 
@@ -379,12 +384,96 @@ class MissingDocumentLibraryError(ValueError):
         )
 
 
-def _office_text(source, suffix):
+class _EpubText(HTMLParser):
+    """Convert packaged book chapters only; ordinary HTML files keep their source."""
+
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self.hidden = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("head", "script", "style"):
+            self.hidden += 1
+        if self.hidden:
+            return
+        if tag in ("p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6"):
+            self.parts.append("\n")
+        elif tag in ("td", "th"):
+            self.parts.append("\t")
+        elif tag == "img":
+            self.parts.append(dict(attrs).get("alt", ""))
+
+    def handle_endtag(self, tag):
+        if tag in ("head", "script", "style"):
+            self.hidden = max(0, self.hidden - 1)
+        elif not self.hidden and tag in (
+            "p",
+            "div",
+            "li",
+            "tr",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+        ):
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.parts.append(data)
+
+
+def _odf_lines(node, extract_text):
+    """Keep paragraphs, slide/sheet names and table rows in source order."""
+    kind = getattr(node, "qname", (None, None))[1]
+    if kind in ("p", "h"):
+        yield extract_text(node)
+        return
+    if kind == "table-row":
+        cells = []
+        for cell in node.childNodes:
+            if getattr(cell, "qname", (None, None))[1] != "table-cell":
+                continue
+            text = extract_text(cell)
+            formula = cell.getAttribute("formula")
+            value = (
+                text
+                or cell.getAttribute("value")
+                or cell.getAttribute("datevalue")
+                or cell.getAttribute("booleanvalue")
+                or ""
+            )
+            if formula:
+                value = f"{value} [formula: {formula}]"
+            repeats = int(cell.getAttribute("numbercolumnsrepeated") or 1)
+            cells.append(
+                f"{value} [repeated {repeats} columns]" if value and repeats > 1 else value
+            )
+        if any(cell.strip() for cell in cells):
+            yield "\t".join(cells)
+            repeats = int(node.getAttribute("numberrowsrepeated") or 1)
+            if repeats > 1:
+                yield f"[Previous row repeated {repeats} times]"
+        return
+    if kind in ("table", "page"):
+        yield (
+            "# "
+            + ("Sheet/table: " if kind == "table" else "Slide: ")
+            + (node.getAttribute("name") or "Untitled")
+        )
+    for child in getattr(node, "childNodes", ()):
+        yield from _odf_lines(child, extract_text)
+
+
+def _formatted_document_text(source, suffix):
     module_name, package = DOCUMENT_LIBRARIES[suffix]
     try:
         module = importlib.import_module(module_name)
     except ModuleNotFoundError as exc:
-        if exc.name == module_name:
+        if exc.name in (module_name, module_name.split(".")[0]):
             raise MissingDocumentLibraryError(suffix, package) from exc
         raise
     lines = ["Extracted document text; line numbers refer to this extraction."]
@@ -408,6 +497,20 @@ def _office_text(source, suffix):
                     )
             if slide.has_notes_slide and slide.notes_slide.notes_text_frame is not None:
                 lines.extend(("## Speaker notes", slide.notes_slide.notes_text_frame.text))
+    elif suffix in (".odt", ".odp", ".ods"):
+        from odf.teletype import extractText
+
+        lines.extend(_odf_lines(module.load(source).body, extractText))
+    elif suffix == ".epub":
+        document = module.read_epub(source)
+        for item_id, _linear in document.spine:
+            item = document.get_item_with_id(item_id)
+            if not isinstance(item, module.EpubHtml):
+                continue
+            parser = _EpubText()
+            parser.feed(item.get_content().decode("utf-8"))
+            parser.close()
+            lines.extend((f"# Chapter: {item.get_name()}", "".join(parser.parts).strip()))
     else:
         document = module.load_workbook(source, read_only=True, data_only=False)
         try:
@@ -437,7 +540,7 @@ def read_document_stream(source, *, suffix=""):
     """Decode a binary stream using the same text checks for RAG and file tools."""
     if suffix in DOCUMENT_LIBRARIES:
         try:
-            return _office_text(source, suffix)
+            return _formatted_document_text(source, suffix)
         except MissingDocumentLibraryError:
             raise
         except Exception as exc:
@@ -767,7 +870,7 @@ def _index(connection, folder, settings, stopped, on_missing=None):
 
     """)
     _create_chunks(connection)
-    signature = f"6:{settings.chunk_chars}:{settings.chunk_overlap}"
+    signature = f"7:{settings.chunk_chars}:{settings.chunk_overlap}"
     state = connection.execute("SELECT value FROM index_state WHERE key = 'chunking'").fetchone()
     changed = state != (signature,)
     if changed:

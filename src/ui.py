@@ -3030,7 +3030,7 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def show_document_warning(self, paths):
         detail = (
-            "Readable text and supported Office documents can be added. "
+            "Readable text and supported document formats can be added. "
             "These files are unsupported or could not be read and were not copied:\n\n"
             + "\n".join(str(path) for path in paths)
         )
