@@ -1,18 +1,25 @@
 """Incremental local FTS5 retrieval; call retrieve from a worker thread."""
 
 import ast
+import bz2
 import codecs
+import gzip
 import hashlib
 import importlib
+import io
 import itertools
 import json
 import logging
+import lzma
 import math
 import queue
 import re
 import sqlite3
+import stat
+import tarfile
 import threading
 import time
+import zipfile
 import zlib
 from collections import defaultdict
 from contextlib import closing, suppress
@@ -578,17 +585,113 @@ def _formatted_document_text(source, suffix):
     return "\n".join(lines)
 
 
+_COMPRESSED_TEXT = {
+    ".gz": gzip.open,
+    ".bz2": bz2.BZ2File,
+    ".xz": lzma.LZMAFile,
+}
+_TAR_COMPRESSION = {
+    ".tgz": ".gz",
+    ".tar.gz": ".gz",
+    ".tbz2": ".bz2",
+    ".tar.bz2": ".bz2",
+    ".txz": ".xz",
+    ".tar.xz": ".xz",
+}
+ARCHIVE_SUFFIXES = frozenset({".zip", ".tar", *_TAR_COMPRESSION, *_COMPRESSED_TEXT})
+ARCHIVE_SIZE_LIMIT = 32 * 1024 * 1024
+_ARCHIVE_MEMBER_LIMIT = 2 * 1024 * 1024
+_ARCHIVE_TEXT_LIMIT = 8 * 1024 * 1024
+
+
+def document_suffix(path):
+    suffix = path.suffix.lower()
+    compound = "".join(path.suffixes[-2:]).lower()
+    return compound if compound in _TAR_COMPRESSION else suffix
+
+
+def _archive_entries(source, suffix):
+    """Yield regular members as streams without writing paths from the archive."""
+    if suffix == ".zip":
+        with zipfile.ZipFile(source) as archive:
+            for member in archive.infolist():
+                kind = stat.S_IFMT(member.external_attr >> 16)
+                if member.is_dir() or kind not in (0, stat.S_IFREG) or member.flag_bits & 1:
+                    continue
+                yield member.filename, member.file_size, lambda member=member: archive.open(member)
+        return
+    compression = _TAR_COMPRESSION.get(suffix)
+    if compression:
+        # Bound the decoded TAR itself, including headers and metadata.
+        with _COMPRESSED_TEXT[compression](source) as stream:
+            data = stream.read(ARCHIVE_SIZE_LIMIT + 1)
+    else:
+        data = source.read(ARCHIVE_SIZE_LIMIT + 1)
+    if len(data) > ARCHIVE_SIZE_LIMIT:
+        raise ValueError("Decoded TAR exceeds the 32 MiB limit")
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+        for member in archive:
+            if member.isreg() and not member.issparse():
+                yield member.name, member.size, lambda member=member: archive.extractfile(member)
+
+
+def _archive_text(source, suffix):
+    if source.seek(0, io.SEEK_END) > ARCHIVE_SIZE_LIMIT:
+        raise ValueError("Archive exceeds the 32 MiB limit")
+    source.seek(0)
+    if suffix in _COMPRESSED_TEXT:
+        with _COMPRESSED_TEXT[suffix](source) as stream:
+            data = stream.read(_ARCHIVE_MEMBER_LIMIT + 1)
+        if len(data) > _ARCHIVE_MEMBER_LIMIT:
+            raise ValueError("Decoded file exceeds the 2 MiB limit")
+        return _plain_document_text(io.BytesIO(data))
+    parts = ["Extracted archive text; line numbers refer to this extraction."]
+    remaining = _ARCHIVE_TEXT_LIMIT
+    with closing(_archive_entries(source, suffix)) as entries:
+        for number, (name, size, open_member) in enumerate(entries, 1):
+            if number > 2000 or remaining <= 0:
+                parts.append("[Archive indexing limit reached.]")
+                break
+            if not 0 < size <= min(_ARCHIVE_MEMBER_LIMIT, remaining):
+                continue
+            with open_member() as member:
+                data = member.read(size + 1)
+            if len(data) != size:
+                continue
+            remaining -= size
+            text = _plain_document_text(io.BytesIO(data))
+            if text and text.strip():
+                # Quote names so a newline in a member name cannot split its heading.
+                parts.extend((f"# Archive member: {json.dumps(name, ensure_ascii=False)}", text))
+    return "\n\n".join(parts) if len(parts) > 2 else None
+
+
 def read_document(path):
     """Read common text encodings, skipping likely binary and unsupported documents."""
     try:
         with path.open("rb") as source:
-            return read_document_stream(source, suffix=path.suffix.lower())
+            return read_document_stream(source, suffix=document_suffix(path))
     except OSError:
         return None
 
 
 def read_document_stream(source, *, suffix=""):
     """Decode a binary stream using the same text checks for RAG and file tools."""
+    if suffix in ARCHIVE_SUFFIXES:
+        try:
+            return _archive_text(source, suffix)
+        except (
+            OSError,
+            EOFError,
+            ValueError,
+            RuntimeError,
+            tarfile.TarError,
+            zipfile.BadZipFile,
+            lzma.LZMAError,
+            zlib.error,
+        ) as exc:
+            logging.warning("Could not read %s archive: %s", suffix, exc)
+            return None
     if suffix in DOCUMENT_LIBRARIES or suffix in (".eml", ".mbox"):
         try:
             return (
@@ -601,6 +704,10 @@ def read_document_stream(source, *, suffix=""):
         except Exception as exc:
             logging.warning("Could not extract %s document: %s", suffix, exc)
             return None
+    return _plain_document_text(source)
+
+
+def _plain_document_text(source):
     sample = source.read(8192)
     if sample.startswith(b"%PDF-"):
         return None
@@ -925,7 +1032,7 @@ def _index(connection, folder, settings, stopped, on_missing=None):
 
     """)
     _create_chunks(connection)
-    signature = f"8:{settings.chunk_chars}:{settings.chunk_overlap}"
+    signature = f"10:{settings.chunk_chars}:{settings.chunk_overlap}"
     state = connection.execute("SELECT value FROM index_state WHERE key = 'chunking'").fetchone()
     changed = state != (signature,)
     if changed:

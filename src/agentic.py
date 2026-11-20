@@ -19,7 +19,13 @@ from functools import cache
 from pathlib import Path, PurePosixPath
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from rag import numbered_excerpt, read_document_stream
+from rag import (
+    ARCHIVE_SIZE_LIMIT,
+    ARCHIVE_SUFFIXES,
+    document_suffix,
+    numbered_excerpt,
+    read_document_stream,
+)
 
 _COMMAND_BLOCK_PATTERN = re.compile(r"```(?:bash|sh|shell)\s*\n(.*?)```", re.IGNORECASE | re.DOTALL)
 
@@ -186,10 +192,15 @@ class DocumentFiles:
             with os.fdopen(source, "rb") as stream:
                 if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                     raise ValueError("Only regular text files are supported.")
-                data = stream.read(2_097_153)
-            if len(data) > 2_097_152:
-                raise ValueError("File exceeds the 2 MiB limit.")
-            result = read_document_stream(io.BytesIO(data), suffix=path.suffix.lower())
+                suffix = document_suffix(path)
+                limit = ARCHIVE_SIZE_LIMIT if suffix in ARCHIVE_SUFFIXES else 2 * 1024 * 1024
+                if os.fstat(stream.fileno()).st_size > limit:
+                    raise ValueError(f"File exceeds the {limit // (1024 * 1024)} MiB limit.")
+                # Keep the read bounded if the file changes while it is open.
+                data = stream.read(limit + 1)
+            if len(data) > limit:
+                raise ValueError(f"File exceeds the {limit // (1024 * 1024)} MiB limit.")
+            result = read_document_stream(io.BytesIO(data), suffix=suffix)
             if result is None:
                 raise ValueError("Unsupported/binary document.")
             return result

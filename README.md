@@ -32,6 +32,8 @@ Retrieval uses SQLite FTS5/BM25, phrase and identifier matching, and filename/se
 
 DOCX, PPTX, and XLSX documents require optional Python libraries `python-docx`, `python-pptx`, and `openpyxl`, respectively. OpenDocument text (`.odt`), presentations (`.odp`), and spreadsheets (`.ods`) require `odfpy`. EPUB books require `EbookLib`; RTF documents require `striprtf`. EML messages and MBOX mailboxes use Python’s standard library. Lopaca warns when a required library is missing. Install it in the Python environment that runs Lopaca, then restart Lopaca. Files already in `documents/` will be retried. These libraries are optional and are not installed by the installer.
 
+ZIP and TAR archives can be added to `documents/` like other documents. Lopaca reads their text files in place, uses member filenames as headings, and shares that text view between RAG and file tools. Gzip, bzip2, and xz work both with TAR and as standalone compressed text (`.gz`, `.bz2`, `.xz`). Extraction is bounded to 32 MiB for the archive and decoded TAR, 2 MiB per member or standalone decoded file, and 8 MiB total member data. Nested archives and binary documents inside archives are skipped.
+
 **Expand Document Searches** in App Settings optionally asks the same llama-server model for related search terms. It's off by default because it adds response latency.
 
 **Model-Assisted Document Indexing** in App settings optionally allows the LLM to help process documents for better info retrieval. Very slow and depends on your model speed. Modest quality improvement. Recommended for t/s greater than 80.
