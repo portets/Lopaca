@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from rag import (
     ARCHIVE_SIZE_LIMIT,
     ARCHIVE_SUFFIXES,
+    PDF_SIZE_LIMIT,
     document_suffix,
     numbered_excerpt,
     read_document_stream,
@@ -194,13 +195,19 @@ class DocumentFiles:
                     raise ValueError("Only regular text files are supported.")
                 suffix = document_suffix(path)
                 limit = ARCHIVE_SIZE_LIMIT if suffix in ARCHIVE_SUFFIXES else 2 * 1024 * 1024
-                if os.fstat(stream.fileno()).st_size > limit:
+                if suffix == ".pdf":
+                    limit = PDF_SIZE_LIMIT
+                if suffix != ".zip" and os.fstat(stream.fileno()).st_size > limit:
                     raise ValueError(f"File exceeds the {limit // (1024 * 1024)} MiB limit.")
-                # Keep the read bounded if the file changes while it is open.
-                data = stream.read(limit + 1)
-            if len(data) > limit:
-                raise ValueError(f"File exceeds the {limit // (1024 * 1024)} MiB limit.")
-            result = read_document_stream(io.BytesIO(data), suffix=suffix)
+                if suffix in ARCHIVE_SUFFIXES or suffix == ".pdf":
+                    # Let seekable readers work without copying the whole file into memory.
+                    result = read_document_stream(stream, suffix=suffix)
+                else:
+                    # Keep the read bounded if the file changes while it is open.
+                    data = stream.read(limit + 1)
+                    if len(data) > limit:
+                        raise ValueError(f"File exceeds the {limit // (1024 * 1024)} MiB limit.")
+                    result = read_document_stream(io.BytesIO(data), suffix=suffix)
             if result is None:
                 raise ValueError("Unsupported/binary document.")
             return result

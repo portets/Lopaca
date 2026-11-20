@@ -22,7 +22,7 @@ import time
 import zipfile
 import zlib
 from collections import defaultdict
-from contextlib import closing, suppress
+from contextlib import closing, nullcontext, suppress
 from email import policy
 from email.parser import BytesParser
 from html.parser import HTMLParser
@@ -375,6 +375,7 @@ def numbered_excerpt(path, lines, start_line, line_count, *, text_key="text"):
 
 # Optional document readers. Module names differ from their installable packages.
 DOCUMENT_LIBRARIES = {
+    ".pdf": ("pypdf", "pypdf"),
     ".docx": ("docx", "python-docx"),
     ".pptx": ("pptx", "python-pptx"),
     ".xlsx": ("openpyxl", "openpyxl"),
@@ -384,6 +385,8 @@ DOCUMENT_LIBRARIES = {
     ".epub": ("ebooklib.epub", "EbookLib"),
     ".rtf": ("striprtf.striprtf", "striprtf"),
 }
+PDF_SIZE_LIMIT = 64 * 1024 * 1024
+_PDF_PAGE_HEADING = re.compile(r"# (PDF page [1-9]\d*)\s*$")
 
 
 class MissingDocumentLibraryError(ValueError):
@@ -531,6 +534,18 @@ def _optional_document_library(suffix, module_name, package):
 def _formatted_document_text(source, suffix):
     module = _optional_document_library(suffix, *DOCUMENT_LIBRARIES[suffix])
     lines = ["Extracted document text; line numbers refer to this extraction."]
+    if suffix == ".pdf":
+        if source.seek(0, io.SEEK_END) > PDF_SIZE_LIMIT:
+            raise ValueError(f"PDF exceeds the {PDF_SIZE_LIMIT // (1024 * 1024)} MiB limit")
+        source.seek(0)
+        document = module.PdfReader(source)
+        if document.is_encrypted:
+            raise ValueError("Encrypted PDFs are unsupported")
+        for number, page in enumerate(document.pages, 1):
+            page_text = (page.extract_text() or "").strip()
+            if page_text:
+                lines.extend(("", f"# PDF page {number}", page_text))
+        return "\n".join(lines) if len(lines) > 1 else None
     if suffix == ".rtf":
         data = source.read()
         if not data.lstrip().startswith(b"{\\rtf"):
@@ -608,10 +623,12 @@ _TAR_COMPRESSION = {
     ".tar.lz4": ".lz4",
 }
 _COMPRESSED_TEXT_SUFFIXES = _COMPRESSED_TEXT.keys() | _OPTIONAL_COMPRESSION_LIBRARIES.keys()
-ARCHIVE_SUFFIXES = frozenset({".zip", ".tar", *_TAR_COMPRESSION, *_COMPRESSED_TEXT_SUFFIXES})
-ARCHIVE_SIZE_LIMIT = 32 * 1024 * 1024
-_ARCHIVE_MEMBER_LIMIT = 2 * 1024 * 1024
-_ARCHIVE_TEXT_LIMIT = 8 * 1024 * 1024
+ARCHIVE_SUFFIXES = frozenset({".zip", ".tar", ".7z", *_TAR_COMPRESSION, *_COMPRESSED_TEXT_SUFFIXES})
+ARCHIVE_SIZE_LIMIT = 256 * 1024 * 1024
+_ARCHIVE_DECODE_LIMIT = 128 * 1024 * 1024
+_ARCHIVE_MEMBER_LIMIT = 16 * 1024 * 1024
+_ARCHIVE_TEXT_LIMIT = 32 * 1024 * 1024
+_ARCHIVE_ENTRY_LIMIT = 5000
 
 
 def document_suffix(path):
@@ -651,8 +668,48 @@ def _read_compressed(source, suffix, limit):
         return stream.read(limit + 1)
 
 
+def _seven_zip_entries(source):
+    py7zr = _optional_document_library(".7z", "py7zr", "py7zr 1.1.4 or newer")
+    version = re.match(r"^(\d+)\.(\d+)\.(\d+)", py7zr.__version__)
+    if version is None or tuple(map(int, version.groups())) < (1, 1, 4):
+        raise MissingDocumentLibraryError(".7z", "py7zr 1.1.4 or newer")
+    from py7zr.exceptions import AbsolutePathError, ArchiveError, PasswordRequired
+    from py7zr.io import BytesIOFactory
+
+    # Extract selected members together so solid blocks are decoded at most once.
+    try:
+        with py7zr.SevenZipFile(source, max_extract_size=_ARCHIVE_DECODE_LIMIT) as archive:
+            if archive.needs_password():
+                raise ValueError("Password-protected 7z archives are unsupported")
+            selected = {}
+            remaining = _ARCHIVE_TEXT_LIMIT
+            for member in archive.list()[:_ARCHIVE_ENTRY_LIMIT]:
+                if member.is_file and 0 < member.uncompressed <= min(
+                    _ARCHIVE_MEMBER_LIMIT, remaining
+                ):
+                    if member.filename in selected:
+                        raise ValueError("7z archive contains duplicate member names")
+                    selected[member.filename] = member.uncompressed
+                    remaining -= member.uncompressed
+            if not selected:
+                return
+            factory = BytesIOFactory(_ARCHIVE_MEMBER_LIMIT)
+            archive.extract(targets=list(selected), factory=factory)
+        for name, size in selected.items():
+            key = Path(name.replace("\\", "/")).as_posix()
+            stream = factory.products.get(key)
+            if stream is not None:
+                stream.seek(0)
+                yield name, size, lambda stream=stream: nullcontext(stream)
+    except (AbsolutePathError, ArchiveError, PasswordRequired) as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def _archive_entries(source, suffix):
     """Yield regular members as streams without writing paths from the archive."""
+    if suffix == ".7z":
+        yield from _seven_zip_entries(source)
+        return
     if suffix == ".zip":
         with zipfile.ZipFile(source) as archive:
             for member in archive.infolist():
@@ -663,11 +720,13 @@ def _archive_entries(source, suffix):
         return
     if suffix in _TAR_COMPRESSION:
         # Bound the decoded TAR itself, including headers and metadata.
-        data = _read_compressed(source, suffix, ARCHIVE_SIZE_LIMIT)
+        data = _read_compressed(source, suffix, _ARCHIVE_DECODE_LIMIT)
     else:
-        data = source.read(ARCHIVE_SIZE_LIMIT + 1)
-    if len(data) > ARCHIVE_SIZE_LIMIT:
-        raise ValueError("Decoded TAR exceeds the 32 MiB limit")
+        data = source.read(_ARCHIVE_DECODE_LIMIT + 1)
+    if len(data) > _ARCHIVE_DECODE_LIMIT:
+        raise ValueError(
+            f"Decoded TAR exceeds the {_ARCHIVE_DECODE_LIMIT // (1024 * 1024)} MiB limit"
+        )
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
         for member in archive:
             if member.isreg() and not member.issparse():
@@ -675,25 +734,30 @@ def _archive_entries(source, suffix):
 
 
 def _archive_text(source, suffix):
-    if source.seek(0, io.SEEK_END) > ARCHIVE_SIZE_LIMIT:
-        raise ValueError("Archive exceeds the 32 MiB limit")
+    if suffix != ".zip" and source.seek(0, io.SEEK_END) > ARCHIVE_SIZE_LIMIT:
+        raise ValueError(f"Archive exceeds the {ARCHIVE_SIZE_LIMIT // (1024 * 1024)} MiB limit")
     source.seek(0)
     if suffix in _COMPRESSED_TEXT_SUFFIXES:
         data = _read_compressed(source, suffix, _ARCHIVE_MEMBER_LIMIT)
         if len(data) > _ARCHIVE_MEMBER_LIMIT:
-            raise ValueError("Decoded file exceeds the 2 MiB limit")
+            raise ValueError(
+                f"Decoded file exceeds the {_ARCHIVE_MEMBER_LIMIT // (1024 * 1024)} MiB limit"
+            )
         return _plain_document_text(io.BytesIO(data))
     parts = ["Extracted archive text; line numbers refer to this extraction."]
     remaining = _ARCHIVE_TEXT_LIMIT
     with closing(_archive_entries(source, suffix)) as entries:
         for number, (name, size, open_member) in enumerate(entries, 1):
-            if number > 2000 or remaining <= 0:
+            if number > _ARCHIVE_ENTRY_LIMIT or remaining <= 0:
                 parts.append("[Archive indexing limit reached.]")
                 break
             if not 0 < size <= min(_ARCHIVE_MEMBER_LIMIT, remaining):
                 continue
             with open_member() as member:
-                data = member.read(size + 1)
+                sample = member.read(min(size, 8192))
+                if _plain_document_text(io.BytesIO(sample)) is None:
+                    continue
+                data = sample + member.read(size + 1 - len(sample))
             if len(data) != size:
                 continue
             remaining -= size
@@ -861,7 +925,12 @@ def _sections(text, filename):
     """Find Markdown sections and code definitions with standard-library tools."""
     lines = text.splitlines(keepends=True)
     starts = {0: ""}
-    if filename.lower().endswith((".py", ".pyi")):
+    if filename.lower().endswith(".pdf"):
+        # Keep retrieved passages within one page and retain extracted-text line numbers.
+        for index, line in enumerate(lines):
+            if heading := _PDF_PAGE_HEADING.fullmatch(line):
+                starts[index] = heading[1]
+    elif filename.lower().endswith((".py", ".pyi")):
         try:
             tree = ast.parse(text)
         except SyntaxError, ValueError, RecursionError:
@@ -908,7 +977,7 @@ def _sections(text, filename):
                 headings.pop()
             headings.append((level, title))
             starts[index] = " > ".join(title for _, title in headings)
-        elif not markdown and not filename.lower().endswith((".py", ".pyi")):
+        elif not markdown and not filename.lower().endswith((".py", ".pyi", ".pdf")):
             definition = _CODE_HEADING.match(line)
             if definition:
                 indent = len(definition[1].expandtabs(4))
@@ -1072,7 +1141,7 @@ def _index(connection, folder, settings, stopped, on_missing=None):
 
     """)
     _create_chunks(connection)
-    signature = f"11:{settings.chunk_chars}:{settings.chunk_overlap}"
+    signature = f"15:{settings.chunk_chars}:{settings.chunk_overlap}"
     state = connection.execute("SELECT value FROM index_state WHERE key = 'chunking'").fetchone()
     changed = state != (signature,)
     if changed:
@@ -1192,11 +1261,13 @@ def _source_scope(paths, terms, query):
 def _document_context(connection, row, limit):
     """Keep small source documents together instead of losing facts across tiny sections."""
     source = row[1]
-    parts = connection.execute(
-        "SELECT rowid,source,section,body,start_line,end_line FROM chunk_content "
-        "WHERE source=? ORDER BY start_line,rowid LIMIT 17",
-        (source,),
-    ).fetchall()
+    parts = []
+    if not source.lower().endswith(".pdf"):
+        parts = connection.execute(
+            "SELECT rowid,source,section,body,start_line,end_line FROM chunk_content "
+            "WHERE source=? ORDER BY start_line,rowid LIMIT 17",
+            (source,),
+        ).fetchall()
     if not (1 < len(parts) < 17 and sum(len(part[3]) + 2 for part in parts) <= limit):
         parts = (
             connection.execute(
