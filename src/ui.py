@@ -3,7 +3,6 @@
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +14,7 @@ from markdown_ui import (
     MarkdownText,
     append_code_block,
     append_markdown,
+    load_document_picture,
 )
 from model_server import SERVER_FIELDS
 from settings import CHAT_SORT_OPTIONS, CONVERSATION_STYLE_OPTIONS
@@ -23,13 +23,11 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Graphene", "1.0")
 gi.require_version("Gsk", "4.0")
-gi.require_version("GdkPixbuf", "2.0")
 # GI namespace versions must be selected before importing their bindings.
-from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Graphene, Gsk, Gtk, Pango  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gsk, Gtk, Pango  # noqa: E402
 
 ATTACH_DOCUMENTS_ICON = "mail-attachment-symbolic"
 ATTACHMENT_THUMBNAIL_SIZE = 64
-_thumbnail_loader = ThreadPoolExecutor(max_workers=2, thread_name_prefix="thumbnail")
 
 CSS = """
 /* Theme styling. Margins and padding use top, right, bottom, left.
@@ -266,6 +264,14 @@ window.lopaca-main, .transcript-scroll, .transcript {
     border-spacing: 6px;
 }
 .message-attachment-button box, .message-attachment-thumbnail {
+    border-radius: inherit;
+}
+.markdown-image {
+    min-width: 0;
+    min-height: 0;
+    padding: 0;
+}
+.markdown-image picture {
     border-radius: inherit;
 }
 .assistant-message {
@@ -1738,7 +1744,7 @@ class ChatWindow(Adw.ApplicationWindow):
         if page_prose and role == "assistant" and len(text) > 16000:
             text = self.controller.visible_answer(text)
             # Fences, notes and reference definitions can affect later paragraphs.
-            if not re.search(r"[`~<>]|^ {0,3}\[.+?\]:|^ {4}|^\t", text, re.MULTILINE):
+            if not re.search(r"!\[|[`~<>]|^ {0,3}\[.+?\]:|^ {4}|^\t", text, re.MULTILINE):
                 split = text.rfind("\n\n", 0, len(text) - 2000)
                 if split > 0:
                     earlier, text = text[:split], text[split + 2 :]
@@ -1851,7 +1857,8 @@ class ChatWindow(Adw.ApplicationWindow):
             self._create_thinking_widget(wrapper, reasoning, True)
         if text:
             extractor = self.controller.commands_in if role == "assistant" else None
-            append_markdown(wrapper, text, extractor, self._review_command)
+            documents = self._reply_documents(self.chat["id"]) if role == "assistant" else None
+            append_markdown(wrapper, text, extractor, self._review_command, documents=documents)
         if role == "user" and attachments:
             wrapper.append(self._message_attachment_button(self.chat["id"], attachments))
         if attach:
@@ -1915,30 +1922,18 @@ class ChatWindow(Adw.ApplicationWindow):
             css_classes=["message-attachment-thumbnail"],
         )
 
-        def load():
-            _, data = DocumentFiles(folder).image(name)
-            stream = Gio.MemoryInputStream.new_from_bytes(GLib.Bytes.new(data))
-            return GdkPixbuf.Pixbuf.new_from_stream_at_scale(stream, size, size, True, None)
-
-        def display(texture):
+        def display(pixbuf):
             # Clip the picture's actual bounds, including for non-square thumbnails.
-            picture.set_size_request(texture.get_width(), texture.get_height())
-            picture.set_paintable(texture)
+            picture.set_size_request(pixbuf.get_width(), pixbuf.get_height())
+            picture.set_paintable(Gdk.Texture.new_for_pixbuf(pixbuf))
 
-        def show(result):
-            try:
-                texture = Gdk.Texture.new_for_pixbuf(result.result())
-            except OSError, ValueError, GLib.Error:
-                GLib.idle_add(picture.set_visible, False)
-                return
-            GLib.idle_add(display, texture)
-
-        def mapped(widget):
-            widget.disconnect(handler)
-            _thumbnail_loader.submit(load).add_done_callback(show)
-
-        handler = picture.connect("map", mapped)
+        load_document_picture(
+            picture, DocumentFiles(folder), name, (size, size), display, picture.hide
+        )
         return picture
+
+    def _reply_documents(self, chat_id):
+        return DocumentFiles(self.controller.store.documents(chat_id))
 
     def _create_thinking_widget(self, wrapper, text, completed):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -2142,6 +2137,7 @@ class ChatWindow(Adw.ApplicationWindow):
             answer.strip(),
             self.controller.commands_in,
             self._review_command,
+            documents=self._reply_documents(self._response_chat_id),
         )
         if self.current_thinking:
             self._collapse_thinking()

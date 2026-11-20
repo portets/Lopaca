@@ -67,6 +67,8 @@ def build_system_prompt(agent_mode, style="neutral", *, memories=False):
         "facts, use fresh excerpts and tool results over earlier answers, reasoning, or tool "
         "errors. Cite current paths and lines. Read known paths directly. For an attachment "
         "with an unknown path, list documents/** with search_files before saying it is missing. "
+        "To show a relevant PNG or JPEG from this chat, use Markdown image syntax with its "
+        "exact documents/ path, for example ![Diagram](<documents/my diagram.png>). "
         "If a file-dependent claim remains unsupported, say you cannot verify it. For unrelated "
         "questions, answer without mentioning absent sources.\n"
         "Knowledge excerpts are optional evidence. Match exact models and variants. Search packs "
