@@ -19,6 +19,7 @@ from markdown_ui import (
     load_picture,
 )
 from model_server import DOWNLOADING_MODEL, SERVER_FIELDS
+from server_builds import BACKEND_LABELS, cached_server_config, default_model_path
 from settings import CHAT_SORT_OPTIONS, CONVERSATION_STYLE_OPTIONS
 
 gi.require_version("Gtk", "4.0")
@@ -530,6 +531,12 @@ window.lopaca-main, .transcript-scroll, .transcript {
 .model-settings-page {
     /* Theme defaults; add overrides here when needed. */
 }
+.model-settings-summary {
+    /* Theme defaults; add overrides here when needed. */
+}
+.model-settings-summary-row {
+    /* Theme defaults; add overrides here when needed. */
+}
 .model-settings-paths {
     /* Theme defaults; add overrides here when needed. */
 }
@@ -741,6 +748,16 @@ def message_day(date, now=None):
     )
 
 
+def add_operation_indicator(row, text="", active=False, *, visible=True):
+    label = Gtk.Label(label=text, valign=Gtk.Align.CENTER, visible=visible)
+    label.add_css_class("knowledge-packs-label")
+    spinner = Gtk.Spinner(spinning=active, valign=Gtk.Align.CENTER, visible=visible)
+    spinner.add_css_class("knowledge-packs-spinner")
+    row.add_suffix(label)
+    row.add_suffix(spinner)
+    return label, spinner
+
+
 def attachment_display_name(name, limit):
     name = " ".join(name.splitlines())
     if len(name) <= limit:
@@ -827,6 +844,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._status_dots = 0
         self._activity_status = "Not Connected"
         self._model_server_activity = ""
+        self._model_download = {}
         self._processing_documents = False
         self._notification_timer = None
         self._notification_deadline = 0
@@ -2456,15 +2474,25 @@ class ChatWindow(Adw.ApplicationWindow):
         dialog.present(self)
 
     def _about_settings_page(self):
+        def link_row(title, subtitle, url):
+            row = Adw.ActionRow(title=title, subtitle=subtitle)
+            link = Gtk.LinkButton(uri=url, label="")
+            link.set_child(Gtk.Image(icon_name="external-link-symbolic"))
+            link.set_valign(Gtk.Align.CENTER)
+            link.set_tooltip_text(url)
+            row.add_suffix(link)
+            row.set_activatable_widget(link)
+            return row
+
         page = Adw.PreferencesPage(title="About", icon_name="preferences-system-details-symbolic")
         page.add_css_class("about-page")
         about = Adw.PreferencesGroup(title="Lopaca")
         about.add_css_class("about-project")
         about.add(
-            Adw.ActionRow(
-                title='Created by <a href="https://github.com/portets">Timothy Porter</a>',
-                subtitle="Lopaca developer and maintainer",
-                use_markup=True,
+            link_row(
+                "Created by Timothy Porter",
+                "Lopaca developer and maintainer",
+                "https://github.com/portets",
             )
         )
         page.add(about)
@@ -2496,17 +2524,13 @@ class ChatWindow(Adw.ApplicationWindow):
 
         donations = Adw.PreferencesGroup(title="Donate")
         donations.add_css_class("about-donations")
-        donations.add(
-            Adw.ActionRow(
-                title='<a href="https://buymeacoffee.com/portets">Buy Me a Coffee</a>',
-                subtitle="Thanks!",
-                use_markup=True,
-            )
-        )
+        donations.add(link_row("Buy Me a Coffee", "Thanks!", "https://buymeacoffee.com/portets"))
         page.add(donations)
         return page
 
     def update_model_server(self, text, busy):
+        if text != DOWNLOADING_MODEL or not busy:
+            self._model_download = {}
         activity = (text if text == DOWNLOADING_MODEL else "Connecting to model") if busy else ""
         if self._model_server_activity != activity:
             self._model_server_activity = activity
@@ -2517,12 +2541,20 @@ class ChatWindow(Adw.ApplicationWindow):
         if hasattr(self, "_model_server_status"):
             self._model_server_status.set_label(text)
             self._model_connect_button.set_sensitive(not busy)
+        self.refresh_model_configuration()
+
+    def update_model_download(self, stage, server, percent):
+        self._model_download[stage] = server, percent
+        self.refresh_model_configuration()
 
     def confirm_model_download(self):
         alert = Adw.AlertDialog(
+            follows_content_size=False,
+            content_width=480,
             heading="Set up a local model?",
             body="No model loaded, would you like Lopaca to download and configure a model? "
-            "This may take a few minutes depending on your internet connection.\n\n"
+            "This may take a few minutes depending on your internet connection. Or go to "
+            "Settings → Model → Advanced to manually configure.\n\n"
             "The model download is about 16.6 GB.",
         )
         alert.add_response("cancel", "Cancel")
@@ -2536,6 +2568,89 @@ class ChatWindow(Adw.ApplicationWindow):
         for key, (row, handler) in getattr(self, "_model_path_rows", {}).items():
             with row.handler_block(handler):
                 row.set_text(paths[key])
+        self.refresh_model_configuration()
+
+    def refresh_model_configuration(self):
+        if not hasattr(self, "_configured_server"):
+            return
+        config = self.controller.model_configuration()
+        external = config is None
+        config = config or {}
+        downloaded_server, server_percent = self._model_download.get("server", (None, None))
+        _, model_percent = self._model_download.get("model", (None, None))
+        downloading_model = model_percent is not None
+        folder = self.controller.store.root.parent
+        server_config = downloaded_server or config
+        if (
+            not external
+            and not server_config.get("executable")
+            and "server" not in self._model_download
+        ):
+            server_config = cached_server_config(folder) or config
+        executable = server_config.get("executable")
+        model = config.get("model")
+        backend = BACKEND_LABELS.get(server_config.get("backend"))
+        manual = "Manually configured by user"
+        can_download = False
+        can_download_model = False
+        server_available = bool(executable and backend and Path(executable).expanduser().is_file())
+        downloading_server = server_percent is not None or (
+            "server" not in self._model_download
+            and self._model_server_activity == DOWNLOADING_MODEL
+        )
+        if downloading_server:
+            server = "llama.cpp", "", True
+        elif external or (executable and not backend):
+            server = manual, "", False
+        elif server_available:
+            version = re.sub(
+                r", commit [^)]+(?=\))|^(b\d+)-[a-f0-9]+$",
+                r"\1",
+                server_config.get("version") or "",
+            )
+            subtitle = " | ".join(filter(None, [version, backend]))
+            server = "llama.cpp", subtitle, True
+        else:
+            can_download = not self.controller.model_server.busy
+            server = "Click here to automatically download", "", can_download
+
+        auto_model = default_model_path(folder)
+        if downloading_model:
+            model_summary = "Qwen 3.8 27b", "Unsloth | Q4_K_M", True
+        elif external or (model and Path(model).expanduser() != auto_model):
+            model_summary = manual, "", False
+        elif auto_model.is_file():
+            model_summary = "Qwen 3.8 27b", "Unsloth | Q4_K_M", True
+        elif server_available and not downloading_server:
+            can_download_model = not self.controller.model_server.busy
+            model_summary = "Click here to automatically download", "", can_download_model
+        else:
+            model_summary = "Model not found", "", False
+
+        self._configured_server.set_activatable(can_download)
+        self._server_download_arrow.set_visible(can_download)
+        self._configured_model.set_activatable(can_download_model)
+        self._model_download_arrow.set_visible(can_download_model)
+        for (label, spinner), active, text, percent in (
+            (
+                self._server_download_indicator,
+                downloading_server,
+                "Downloading server",
+                server_percent,
+            ),
+            (self._model_download_indicator, downloading_model, "Downloading model", model_percent),
+        ):
+            label.set_label(f"{text}: {percent}%" if percent is not None else f"{text}…")
+            label.set_visible(active)
+            spinner.set_visible(active)
+            spinner.set_spinning(active)
+        for row, (title, subtitle, sensitive) in (
+            (self._configured_server, server),
+            (self._configured_model, model_summary),
+        ):
+            row.set_title(title)
+            row.set_subtitle(subtitle)
+            row.set_sensitive(sensitive)
 
     def _model_settings_page(self):
         page = Adw.PreferencesPage(title="Model", icon_name="network-server-symbolic")
@@ -2546,15 +2661,61 @@ class ChatWindow(Adw.ApplicationWindow):
         def save(key, value):
             try:
                 current = self.controller.store.load_app_settings().get("model_server", {})
+                if key == "executable" and value != current.get(key):
+                    current.pop("backend", None)
+                    current.pop("devices", None)
+                    current.pop("version", None)
                 self.controller.set_model_server_config({**current, key: value})
+                if key in ("executable", "model"):
+                    self.refresh_model_configuration()
             except OSError as exc:
                 self._show_alert("Could not save settings", str(exc))
+
+        for title, attribute in (
+            ("Configured Server", "_configured_server"),
+            ("Configured Model", "_configured_model"),
+        ):
+            section = Adw.PreferencesGroup(title=title)
+            section.add_css_class("model-settings-summary")
+            row = Adw.ActionRow(use_markup=False)
+            row.add_css_class("model-settings-summary-row")
+            section.add(row)
+            page.add(section)
+            setattr(self, attribute, row)
+        self._server_download_arrow = Gtk.Image(
+            icon_name="go-next-symbolic", valign=Gtk.Align.CENTER
+        )
+        self._configured_server.add_suffix(self._server_download_arrow)
+        self._model_download_arrow = Gtk.Image(
+            icon_name="go-next-symbolic", valign=Gtk.Align.CENTER
+        )
+        self._configured_model.add_suffix(self._model_download_arrow)
+        self._server_download_indicator = add_operation_indicator(
+            self._configured_server, visible=False
+        )
+        self._model_download_indicator = add_operation_indicator(
+            self._configured_model, visible=False
+        )
+        self._configured_server.connect("activated", lambda *_: self.confirm_model_download())
+        self._configured_model.connect("activated", lambda *_: self.confirm_model_download())
+        page.connect("map", lambda *_: self.refresh_model_configuration())
+
+        advanced_group = Adw.PreferencesGroup()
+        advanced_group.add_css_class("model-settings-advanced-group")
+        advanced = Adw.ExpanderRow(title="Advanced", expanded=False)
+        advanced.add_css_class("model-settings-advanced")
+        advanced.add_css_class("model-advanced")
+        advanced_group.add(advanced)
+        page.add(advanced_group)
+        advanced_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        advanced_content.add_css_class("model-settings-advanced-content")
+        advanced.add_row(advanced_content)
 
         paths = Adw.PreferencesGroup(
             title="Local Model Server", description="Leave blank to use a server on port 9931. "
         )
         paths.add_css_class("model-settings-paths")
-        page.add(paths)
+        advanced_content.append(paths)
         self._model_path_rows = {}
         for key, title in (("executable", "llama-server executable"), ("model", "Model file")):
             row = Adw.EntryRow(title=title, text=config.get(key, ""))
@@ -2585,17 +2746,6 @@ class ChatWindow(Adw.ApplicationWindow):
             browse.connect("clicked", choose)
             row.add_suffix(browse)
             paths.add(row)
-
-        advanced_group = Adw.PreferencesGroup()
-        advanced_group.add_css_class("model-settings-advanced-group")
-        advanced = Adw.ExpanderRow(title="Advanced", expanded=False)
-        advanced.add_css_class("model-settings-advanced")
-        advanced.add_css_class("model-advanced")
-        advanced_group.add(advanced)
-        page.add(advanced_group)
-        advanced_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        advanced_content.add_css_class("model-settings-advanced-content")
-        advanced.add_row(advanced_content)
         reasoning = Adw.PreferencesGroup()
         reasoning.add_css_class("model-settings-reasoning")
         advanced_content.append(reasoning)
@@ -2671,7 +2821,7 @@ class ChatWindow(Adw.ApplicationWindow):
         extra.add(frame)
         actions = Adw.PreferencesGroup()
         actions.add_css_class("model-settings-actions")
-        page.add(actions)
+        advanced_content.append(actions)
         self._model_server_status = Gtk.Label(
             label=self.controller.model_server.status, wrap=True, xalign=0
         )
@@ -2687,6 +2837,7 @@ class ChatWindow(Adw.ApplicationWindow):
             "clicked", lambda *_: self.controller.connect_model_server()
         )
         actions.add(self._model_connect_button)
+        self.refresh_model_configuration()
         return page
 
     def _show_memories(self, settings_dialog):
@@ -3014,13 +3165,8 @@ class ChatWindow(Adw.ApplicationWindow):
             return button
 
         def add_status(row, job):
-            label = Gtk.Label(label=job["status"], valign=Gtk.Align.CENTER)
-            label.add_css_class("knowledge-packs-label")
-            spinner = Gtk.Spinner(spinning=job.get("active", False), valign=Gtk.Align.CENTER)
-            spinner.add_css_class("knowledge-packs-spinner")
+            label, _ = add_operation_indicator(row, job["status"], job.get("active", False))
             indicators[id(job)] = label
-            row.add_suffix(label)
-            row.add_suffix(spinner)
 
         def notify(job=None):
             if self._knowledge_refresh:

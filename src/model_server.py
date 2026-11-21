@@ -1,13 +1,11 @@
 """Launch and supervise a local llama-server without owning external servers."""
 
 import json
+import logging
 import os
-import platform
-import re
 import shlex
 import socket
 import subprocess
-import tarfile
 import threading
 import time
 import urllib.error
@@ -15,30 +13,8 @@ import urllib.request
 from collections import deque
 from contextlib import suppress
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit
 
-from web import download_verified_file, matches_download
-
-_SERVER_RELEASE = "b12359"
-_SERVER_ARCHIVE = f"llama-{_SERVER_RELEASE}-bin-ubuntu-x64.tar.gz"
-_SERVER_URL = (
-    f"https://github.com/ggml-org/llama.cpp/releases/download/{_SERVER_RELEASE}/{_SERVER_ARCHIVE}"
-)
-_SERVER_SIZE = 23_311_084
-_SERVER_SHA256 = "0bc1f091e8916102b6d8f2cf944233a620e90a0f856c72d0ce41150c65c2e72e"
-_SERVER_LIBRARY = re.compile(
-    r"(?:libggml(?:-base|-cpu-[\w-]+)?|libllama(?:-server-impl|-common)?|libmtmd)"
-    r"\.so(?:\.\d+)*"
-)
-_MODEL_NAME = "Qwen3.8-27B-UD-Q4_K_M.gguf"
-# Same file as the main-branch download, pinned to the published checksum.
-_MODEL_URL = (
-    "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/"
-    f"4af51b3542f775b0a8e4b310bfb3f17e01c306c9/{_MODEL_NAME}?download=true"
-)
-_MODEL_SIZE = 16_564_259_744
-_MODEL_SHA256 = "1bce504dfecd84153666928a41d8a66706f0158d3a317bc5196b72819d7dc529"
 DOWNLOADING_MODEL = "Downloading model"
 
 # Blank values inherit llama-server defaults, rather than model-specific presets.
@@ -59,55 +35,6 @@ SERVER_FIELDS = (
     ("presence-penalty", "Presence penalty", "Penalty for previously used tokens"),
     ("repeat-penalty", "Repeat penalty", "Repetition penalty"),
 )
-
-
-def _extract_default_server(archive_path, staging):
-    root = f"llama-{_SERVER_RELEASE}"
-    with tarfile.open(archive_path, "r:gz") as archive:
-        members = {}
-        for member in archive:
-            parent, _, name = member.name.rpartition("/")
-            if parent != root or not (name == "llama-server" or _SERVER_LIBRARY.fullmatch(name)):
-                continue
-            if name in members or not (member.isfile() or member.issym()):
-                raise ValueError(f"Invalid release member: {member.name}")
-            members[name] = member
-        if not members.get("llama-server") or not members["llama-server"].isfile():
-            raise ValueError("The downloaded release is missing llama-server.")
-        for member in members.values():
-            if member.issym() and member.linkname not in members:
-                raise ValueError(f"Invalid release library link: {member.name}")
-        archive.extractall(staging, members=members.values(), filter="data")
-    return staging / root
-
-
-def install_default_model(folder, stopped):
-    """Verify the pinned release and model before publishing their configured paths."""
-    if platform.system() != "Linux" or platform.machine() not in ("x86_64", "amd64"):
-        raise ValueError("The automatic setup uses the Ubuntu x64 build of llama-server.")
-    server = folder / "server"
-    executable = server / "llama-server"
-    if not executable.is_file():
-        server.parent.mkdir(parents=True, exist_ok=True)
-        with TemporaryDirectory(dir=server.parent, prefix=".server-install-") as temporary:
-            staging = Path(temporary)
-            archive = staging / _SERVER_ARCHIVE
-            download_verified_file(
-                _SERVER_URL, archive, size=_SERVER_SIZE, sha256=_SERVER_SHA256, stopped=stopped
-            )
-            _extract_default_server(archive, staging).rename(server)
-
-    model = folder / "models" / _MODEL_NAME
-    model.parent.mkdir(parents=True, exist_ok=True)
-    expected = {"size": _MODEL_SIZE, "sha256": _MODEL_SHA256, "stopped": stopped}
-    if model.exists():
-        if not matches_download(model, **expected):
-            raise ValueError(f"The file at {model} differs from the default model.")
-    else:
-        partial = model.with_suffix(".gguf.download")
-        download_verified_file(_MODEL_URL, partial, **expected)
-        partial.rename(model)
-    return {"executable": str(executable), "model": str(model)}
 
 
 def launch_command(config, server_url):
@@ -134,6 +61,13 @@ def launch_command(config, server_url):
     for key in ("flash-attn", "fit"):
         if config.get(key, False):
             args.extend(("--" + key, "on"))
+    devices = config.get("devices")
+    if (
+        devices
+        and not os.environ.get("LLAMA_ARG_DEVICE")
+        and not any(arg.split("=", 1)[0] in ("-dev", "--device") for arg in extra)
+    ):
+        args.extend(("--device", ",".join(devices)))
     return args + extra + ["--host", "127.0.0.1", "--port", str(address.port or 80)]
 
 
@@ -156,13 +90,18 @@ class ModelServer:
         self.status = text
         self.on_state(text, self.busy)
 
-    def connect(self, config, *, startup=False, prepare=None):
+    @property
+    def running_config(self):
+        process = self.process
+        return self._config if process is not None and process.poll() is None else None
+
+    def connect(self, config, *, startup=False, prepare=None, on_config=None):
         with self._lock:
             if self.busy or self._closed.is_set():
                 return
             self.busy = True
         threading.Thread(
-            target=self._connect, args=(dict(config), startup, prepare), daemon=True
+            target=self._connect, args=(dict(config), startup, prepare, on_config), daemon=True
         ).start()
 
     def _health(self):
@@ -179,9 +118,8 @@ class ModelServer:
         with socket.socket() as probe:
             return probe.connect_ex((address.hostname, address.port or 80)) == 0
 
-    def _connect(self, config, startup, prepare=None):
+    def _connect(self, config, startup, prepare=None, on_config=None):
         args = None
-        reader = None
         try:
             if (
                 prepare is None
@@ -202,56 +140,44 @@ class ModelServer:
                     return
             except urllib.error.URLError:
                 pass
-            occupied = self._port_occupied()
-            if prepare is not None and not occupied:
+            if self._port_occupied():
+                self._wait_for_existing_server()
+                return
+            if startup and not config.get("executable"):
+                self._state("No server configured")
+                return
+
+            if prepare:
                 self._state(DOWNLOADING_MODEL)
-                config.update(prepare(self._closed.is_set))
+            candidates = prepare(self._closed.is_set) if prepare else (None,)
+            last_error = None
+            for installed in candidates:
                 if self._closed.is_set():
                     return
-                occupied = self._port_occupied()
-            if occupied:
-                self._state("Waiting for the existing server…")
-            else:
-                if startup and not config.get("executable"):
-                    self._state("No server configured")
+                if self._port_occupied():
+                    self._wait_for_existing_server()
                     return
-                args = launch_command(config, self.url)
-                self._output.clear()
-                self._state("Starting llama-server…")
-                with self._lock:
-                    if self._closed.is_set():
-                        return
-                    self.process = subprocess.Popen(
-                        args,
-                        cwd=str(Path(args[0]).parent),
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                    )
-                    self._config = config
-                reader = threading.Thread(
-                    target=self._read_output, args=(self.process,), daemon=True
-                )
-                reader.start()
-            deadline = time.monotonic() + 300
-            while not self._closed.wait(0.25):
-                if args is not None and self.process.poll() is not None:
-                    raise RuntimeError(f"llama-server exited with code {self.process.returncode}.")
+                selected = {**config, **(installed or {})}
+                args = launch_command(selected, self.url)
                 try:
-                    if self._health():
-                        self._state("Connected")
-                        if args:
-                            threading.Thread(
-                                target=self._watch_exit, args=(self.process, reader), daemon=True
-                            ).start()
+                    if not self._launch(args, selected):
                         return
-                except urllib.error.URLError:
-                    pass
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("The server did not become ready within 5 minutes.")
+                except (OSError, RuntimeError) as exc:
+                    if not installed or not self._backend_failed(installed["backend"], exc):
+                        raise
+                    last_error = exc
+                    logging.warning(
+                        "Trying another backend after %s failed: %s", installed["backend"], exc
+                    )
+                    self._state(DOWNLOADING_MODEL)
+                    continue
+                if installed and on_config:
+                    on_config(installed)
+                self._state("Connected")
+                return
+            if last_error and not self._closed.is_set():
+                raise last_error
         except Exception as exc:
-            if reader and self.process.poll() is not None:
-                reader.join(timeout=1)
             self._state("Could not connect")
             details = str(exc)
             if args:
@@ -264,6 +190,92 @@ class ModelServer:
         finally:
             self.busy = False
             self.on_state(self.status, False)
+
+    def _wait_for_existing_server(self):
+        self._state("Waiting for the existing server…")
+        if self._wait_for_health():
+            self._state("Connected to an existing server")
+
+    def _wait_for_health(self, process=None):
+        deadline = time.monotonic() + 300
+        while not self._closed.wait(0.25):
+            if process is not None and process.poll() is not None:
+                raise RuntimeError(f"llama-server exited with code {process.returncode}.")
+            try:
+                if self._health():
+                    return True
+            except urllib.error.URLError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError("The server did not become ready within 5 minutes.")
+        return False
+
+    def _launch(self, args, config):
+        self._output.clear()
+        self._state("Starting llama-server…")
+        with self._lock:
+            if self._closed.is_set():
+                return False
+            process = self.process = subprocess.Popen(
+                args,
+                cwd=str(Path(args[0]).parent),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            self._config = config
+        reader = threading.Thread(target=self._read_output, args=(process,), daemon=True)
+        reader.start()
+        try:
+            if not self._wait_for_health(process):
+                return False
+        except OSError, RuntimeError:
+            if process.poll() is None:
+                self._stop_process(process)
+            reader.join(timeout=1)
+            self.process = None
+            raise
+        threading.Thread(target=self._watch_exit, args=(process, reader), daemon=True).start()
+        return True
+
+    def _backend_failed(self, backend, error):
+        if backend == "cpu":
+            return False
+        # Invalid model files and unrelated launch flags should surface directly.
+        output = (str(error) + "\n" + "\n".join(self._output)).casefold()
+        if any(
+            marker in output
+            for marker in (
+                "cuda error",
+                "cuda failure",
+                "cudacheck",
+                "cublas_status",
+                "cublas failed",
+                "libcuda.so",
+                "libcublas.so",
+                "libcublaslt.so",
+                "libcudart.so",
+                "cuda driver version is insufficient",
+                "no kernel image",
+                "unsupported toolchain",
+                "vk_error",
+                "vk::",
+                "vkerror",
+                "device lost",
+                "out of device memory",
+                "libvulkan",
+                "failed to allocate cuda",
+                "failed to allocate vulkan",
+                "no devices found",
+            )
+        ):
+            return True
+        prefix = "ggml_vulkan" if backend == "vulkan" else "ggml_cuda"
+        return any(
+            line.startswith(prefix)
+            and any(word in line for word in ("fatal", "failed", "out of memory"))
+            for line in output.splitlines()
+        )
 
     def _read_output(self, process):
         with process.stdout:

@@ -43,7 +43,7 @@ from memory import (
     recall_memories,
     view_memories,
 )
-from model_server import ModelServer, install_default_model
+from model_server import ModelServer
 from rag import (
     DocumentIndexer,
     MissingDocumentLibraryError,
@@ -51,6 +51,7 @@ from rag import (
     read_document,
     retrieve,
 )
+from server_builds import default_model_configs, default_model_download_path, default_model_path
 from settings import CHAT_SETTING_DEFAULTS, Settings
 from storage import ChatStore, MemoryStore
 
@@ -146,6 +147,7 @@ class ChatController:
         self._disk_sizes, self._disk_total = {}, None
         self.connected = None
         self.was_connected = False
+        self._reported_server_version = None
         self._connection_wakeup = threading.Event()
         self.model_server = ModelServer(
             settings.server_url,
@@ -170,12 +172,36 @@ class ChatController:
                 else self.store.create()["id"]
             )
         self.open_chat(active_chat)
-        self.model_server.connect(app_settings.get("model_server", {}), startup=True)
+        config = app_settings.get("model_server", {})
+        folder = self.store.root.parent
+        model = default_model_path(folder)
+        configured_model = config.get("model")
+        if (
+            default_model_download_path(folder).is_file()
+            and not model.is_file()
+            and (not configured_model or Path(configured_model).expanduser() == model)
+            and (not config.get("executable") or config.get("backend"))
+        ):
+            self._connect_default_model(config)
+        else:
+            self.model_server.connect(config, startup=True)
 
     def set_model_server_config(self, config):
         settings = self.store.load_app_settings()
         settings["model_server"] = config
         self.store.save_app_settings(settings)
+
+    def model_configuration(self):
+        """Use the active configuration while connected, otherwise show saved paths."""
+        if self.connected:
+            config = self.model_server.running_config
+            if config is None:
+                return None  # The connected server is owned by another process.
+            executable, version = self._reported_server_version or (None, None)
+            if not config.get("version") and version and executable == config.get("executable"):
+                return {**config, "version": version}
+            return config
+        return self.store.load_app_settings().get("model_server", {})
 
     def connect_model_server(self):
         self.cancel_chat_warm()
@@ -187,15 +213,20 @@ class ChatController:
     def download_default_model(self):
         if self.connected or self.busy or self.model_server.busy:
             return
-        config = self.store.load_app_settings().get("model_server", {})
+        self._connect_default_model(self.store.load_app_settings().get("model_server", {}))
 
-        def prepare(stopped):
-            paths = install_default_model(self.store.root.parent, stopped)
-            if not stopped():
-                self.view.dispatch(self._save_downloaded_model, paths)
-            return paths
-
-        self.model_server.connect(config, prepare=prepare)
+    def _connect_default_model(self, config):
+        self.model_server.connect(
+            config,
+            prepare=lambda stopped: default_model_configs(
+                self.store.root.parent,
+                stopped,
+                lambda stage, server, percent: self.view.dispatch(
+                    self.view.update_model_download, stage, server, percent
+                ),
+            ),
+            on_config=lambda paths: self.view.dispatch(self._save_downloaded_model, paths),
+        )
 
     def _save_downloaded_model(self, paths):
         config = self.store.load_app_settings().get("model_server", {})
@@ -228,6 +259,7 @@ class ChatController:
         if connected and not self.busy:
             self._drain_messages()
         if changed:
+            self.view.refresh_model_configuration()
             self._schedule_chat_warm()
         return False
 
@@ -254,6 +286,14 @@ class ChatController:
             self._connection_wakeup.clear()
 
     def _server_properties_changed(self, props):
+        config = self.model_server.running_config
+        if config and config.get("backend") and not config.get("version"):
+            version = props.get("build_info")
+            if isinstance(version, str) and version:
+                reported = (config["executable"], version)
+                if self._reported_server_version != reported:
+                    self._reported_server_version = reported
+                    self.view.refresh_model_configuration()
         self.client.vision_enabled = props.get("modalities", {}).get("vision") is True
         capacity = props.get("default_generation_settings", {}).get("n_ctx")
         if isinstance(capacity, int) and capacity > 0:

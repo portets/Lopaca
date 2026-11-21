@@ -50,6 +50,10 @@ def matches_download(path, *, size, sha256, stopped):
     return path.stat().st_size == size and _hash_file(path, stopped).hexdigest() == sha256
 
 
+class DownloadChecksumError(ValueError):
+    pass
+
+
 def download_verified_file(url, path, *, size, sha256, on_progress=None, stopped=lambda: False):
     """Resume a staged download and check its advertised size and checksum."""
     offset = path.stat().st_size if path.exists() else 0
@@ -93,7 +97,9 @@ def download_verified_file(url, path, *, size, sha256, on_progress=None, stopped
         raise OSError("Download interrupted; retry to resume.")
     if digest.hexdigest() != sha256:
         path.unlink(missing_ok=True)
-        raise ValueError("Download checksum does not match the expected file; download discarded.")
+        raise DownloadChecksumError(
+            "Download checksum does not match the expected file; download discarded."
+        )
 
 
 def is_web_image_url(source):
