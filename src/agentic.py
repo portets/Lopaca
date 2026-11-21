@@ -19,6 +19,7 @@ from functools import cache
 from pathlib import Path, PurePosixPath
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from images import NATIVE_IMAGE_MIMES, image_mime_type, image_to_png, read_image
 from rag import (
     ARCHIVE_SUFFIXES,
     PDF_SIZE_LIMIT,
@@ -54,15 +55,6 @@ GET_DATETIME_TOOL = _tool(
     "Use clock_format when presenting times unless the user requests otherwise.",
 )
 RUNTIME_TOOLS = [GET_OSINFO_TOOL, GET_DATETIME_TOOL]
-
-IMAGE_SIZE_LIMIT = 16 * 1024 * 1024
-_IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
-
-
-def image_mime_type(path):
-    if str(path).endswith("/"):
-        return None
-    return _IMAGE_TYPES.get(Path(path).suffix.lower())
 
 
 def image_attachment_note(paths):
@@ -168,7 +160,7 @@ FILE_TOOLS = [
 # Lopaca supplies the image bytes as a multimodal tool result.
 VIEW_IMAGE_TOOL = _tool(
     "view_image",
-    "Inspect a PNG or JPEG in this chat's documents/ folder. Use when you need to see an "
+    "Inspect an image in this chat's documents/ folder. Use when you need to see an "
     "earlier attachment again or inspect an image that was not included in the current input.",
     {"path": {"type": "string", "description": "Chat-relative path starting with documents/."}},
     ["path"],
@@ -237,15 +229,9 @@ class DocumentFiles:
     def image(self, name):
         mime = image_mime_type(name)
         if not mime:
-            raise ValueError("Use a PNG or JPEG image.")
-        with self._open_file(name) as (stream, size):
-            data = stream.read(IMAGE_SIZE_LIMIT + 1) if size <= IMAGE_SIZE_LIMIT else None
-        if data is None or len(data) > IMAGE_SIZE_LIMIT:
-            raise ValueError(f"Image exceeds the {IMAGE_SIZE_LIMIT // (1024 * 1024)} MiB limit.")
-        signature = b"\x89PNG\r\n\x1a\n" if mime == "image/png" else b"\xff\xd8\xff"
-        if not data.startswith(signature):
-            raise ValueError("Image data does not match its extension.")
-        return mime, data
+            raise ValueError("Unsupported image format.")
+        with self._open_file(name) as (stream, _):
+            return mime, read_image(stream, mime)
 
     def read_file(self, path, start_line=1, line_count=100):
         return _line_excerpt(path, self._text(path).splitlines(), start_line, line_count)
@@ -336,7 +322,10 @@ class ChatFiles:
     def view_image(self, path):
         if not isinstance(path, str) or not path.startswith("documents/"):
             raise ValueError("Use an image path starting with documents/.")
-        return self.roots["documents"].image(path.removeprefix("documents/"))
+        mime, data = self.roots["documents"].image(path.removeprefix("documents/"))
+        return (
+            (mime, data) if mime in NATIVE_IMAGE_MIMES else ("image/png", image_to_png(mime, data))
+        )
 
     def read_file(self, path, start_line=1, line_count=100):
         if not isinstance(path, str):

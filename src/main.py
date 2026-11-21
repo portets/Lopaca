@@ -18,7 +18,6 @@ from agentic import (
     CODING_INSTRUCTION,
     extract_commands,
     image_attachment_note,
-    image_mime_type,
     parse_file_heredoc,
     prepare_command,
     run_command,
@@ -27,6 +26,7 @@ from agentic import (
     write_file,
 )
 from history import HistoryIndex
+from images import image_mime_type
 from knowledge import KnowledgeStore
 from llama_client import (
     LlamaClient,
@@ -67,7 +67,7 @@ def build_system_prompt(agent_mode, style="neutral", *, memories=False):
         "facts, use fresh excerpts and tool results over earlier answers, reasoning, or tool "
         "errors. Cite current paths and lines. Read known paths directly. For an attachment "
         "with an unknown path, list documents/** with search_files before saying it is missing. "
-        "To show a relevant PNG or JPEG from this chat, use Markdown image syntax with its "
+        "To show a relevant image from this chat, use Markdown image syntax with its "
         "exact documents/ path, for example ![Diagram](<documents/my diagram.png>). "
         "For an existing web image, use the same syntax with a known direct HTTP(S) image URL. "
         "Do not invent image URLs. "
@@ -519,7 +519,7 @@ class ChatController:
         copied = []
         if supported:
             try:
-                copied = self.store.add_documents(chat_id, supported)
+                copied = self.store.add_documents(chat_id, supported, skipped=skipped)
                 self.document_indexer.schedule(self.store.documents(chat_id))
                 self.view.dispatch(self.view.notify, "Documents added to this chat's folder")
             except OSError as exc:

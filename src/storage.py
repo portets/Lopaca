@@ -10,6 +10,7 @@ import uuid
 from contextlib import closing
 from pathlib import Path
 
+from images import NATIVE_IMAGE_MIMES, image_mime_type, image_to_png, read_image
 from settings import CHAT_SORT_OPTIONS, CHATS_DIR, CONVERSATION_STYLE_OPTIONS, Settings
 
 
@@ -248,7 +249,7 @@ class ChatStore:
         chats.sort(key=sort_key)
         return chats
 
-    def add_documents(self, chat_id, paths):
+    def add_documents(self, chat_id, paths, *, skipped=None):
         folder = self.documents(chat_id)
         folder.mkdir(exist_ok=True)
         copied = []
@@ -257,11 +258,38 @@ class ChatStore:
             if not path.is_file() or path.is_symlink():
                 continue
             target = folder / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists():
-                target = folder / f"{path.stem}-{uuid.uuid4().hex[:6]}{path.suffix}"
-            shutil.copyfile(path, target)
-            copied.append("documents/" + target.relative_to(folder).as_posix())
+            with path.open("rb") as source:
+                converted = None
+                mime = image_mime_type(path)
+                if mime and mime not in NATIVE_IMAGE_MIMES:
+                    try:
+                        converted = image_to_png(mime, read_image(source, mime))
+                    except ValueError:
+                        if skipped is None:
+                            raise
+                        skipped.append(path)
+                        continue
+                    if target.name.lower().endswith(".svg.gz"):
+                        target = target.with_suffix("")
+                    target = target.with_suffix(".png")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                destination = target
+                while True:
+                    try:
+                        output = destination.open("xb")
+                        break
+                    except FileExistsError:
+                        destination = target.with_stem(f"{target.stem}-{uuid.uuid4().hex[:6]}")
+                try:
+                    with output:
+                        if converted is None:
+                            shutil.copyfileobj(source, output)
+                        else:
+                            output.write(converted)
+                except OSError:
+                    destination.unlink(missing_ok=True)
+                    raise
+            copied.append("documents/" + destination.relative_to(folder).as_posix())
         return copied
 
     def delete(self, chat_id):

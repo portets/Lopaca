@@ -8,7 +8,8 @@ from pathlib import Path
 
 import gi
 
-from agentic import DocumentFiles, get_clock_format, image_mime_type
+from agentic import DocumentFiles, get_clock_format
+from images import image_mime_type
 from markdown_ui import (
     CODE_BLOCK_PATTERN,
     MarkdownText,
@@ -3175,7 +3176,7 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def show_document_warning(self, paths):
         detail = (
-            "Readable text, supported documents, and PNG or JPEG images can be added. "
+            "Readable text, supported documents, and supported images can be added. "
             "These files are unsupported or could not be read and were not copied:\n\n"
             + "\n".join(str(path) for path in paths)
         )

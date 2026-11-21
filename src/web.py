@@ -8,14 +8,13 @@ from ipaddress import ip_address
 from time import monotonic
 from urllib.parse import quote, urljoin, urlsplit
 
-from agentic import IMAGE_SIZE_LIMIT
+from images import IMAGE_SIZE_LIMIT, supported_image_mimes
 
-_IMAGE_TYPES = ("image/png", "image/jpeg", "image/webp", "image/gif")
 _REDIRECTS = {301, 302, 303, 307, 308}
 _SOCKET_TIMEOUT = 5
 _DOWNLOAD_TIMEOUT = 15
 _HEADERS = {
-    "Accept": ", ".join(_IMAGE_TYPES),
+    "Accept": "image/*",
     "User-Agent": "Lopaca (https://github.com/portets/Lopaca)",
 }
 
@@ -86,8 +85,11 @@ def _download_image(url):
                 if response.status in _REDIRECTS and (location := response.getheader("Location")):
                     url = urljoin(url, location)
                     continue
-                mime = response.headers.get_content_type()
-                if response.status != 200 or mime not in _IMAGE_TYPES:
+                content_type = response.headers.get_content_type()
+                mime = supported_image_mimes().get(content_type)
+                if response.status != 200 or (
+                    mime is None and content_type != "application/octet-stream"
+                ):
                     raise ValueError("URL did not return a supported image.")
                 if response.length is not None and response.length > IMAGE_SIZE_LIMIT:
                     raise ValueError("Web image is too large.")

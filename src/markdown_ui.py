@@ -8,7 +8,7 @@ from urllib.parse import unquote
 
 import gi
 
-from agentic import image_mime_type
+from images import decode_image, fit_image_size, image_mime_type
 from web import fetch_web_image, is_web_image_url
 
 gi.require_version("Gtk", "4.0")
@@ -56,23 +56,9 @@ def image_spans(text, *, streaming=False):
             yield match.start(), match.end(), (source, alt)
 
 
-def _fit_image_size(width, height, bounds):
-    scale = min(1, bounds[0] / width, bounds[1] / height)
-    return max(1, round(width * scale)), max(1, round(height * scale))
-
-
 def _decode_picture(read_image, bounds):
     mime, data = read_image()
-    loader = GdkPixbuf.PixbufLoader.new_with_mime_type(mime)
-    loader.connect(
-        "size-prepared",
-        lambda decoder, width, height: decoder.set_size(*_fit_image_size(width, height, bounds)),
-    )
-    try:
-        loader.write(data)
-    finally:
-        loader.close()
-    return loader.get_pixbuf()
+    return decode_image(mime, data, bounds)
 
 
 def _show_picture_when_mapped(widget, request, loaded, failed):
@@ -166,7 +152,7 @@ class MarkdownImage(Gtk.Button):
             if self.get_child() is not status:
                 return
             full = Gdk.Texture.new_for_pixbuf(pixbuf)
-            size = _fit_image_size(full.get_width(), full.get_height(), _REPLY_IMAGE_SIZE)
+            size = fit_image_size(full.get_width(), full.get_height(), _REPLY_IMAGE_SIZE)
             picture = Gtk.Picture(
                 content_fit=Gtk.ContentFit.SCALE_DOWN,
                 overflow=Gtk.Overflow.HIDDEN,
