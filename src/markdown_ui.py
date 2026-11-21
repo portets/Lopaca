@@ -3,11 +3,13 @@
 import html
 import re
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from urllib.parse import unquote
 
 import gi
 
 from agentic import image_mime_type
+from web import fetch_web_image, is_web_image_url
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
@@ -17,6 +19,7 @@ gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gdk, GdkPixbuf, GLib, Graphene, Gtk, Pango  # noqa: E402
 
 _image_loader = ThreadPoolExecutor(max_workers=2, thread_name_prefix="chat-image")
+_web_image_loader = ThreadPoolExecutor(max_workers=2, thread_name_prefix="web-image")
 _REPLY_IMAGE_SIZE = (256, 512)
 _EXPANDED_IMAGE_SIZE = (512, 1024)
 
@@ -31,20 +34,26 @@ _IMAGE_SPAN = re.compile(
     r"|!\[(?P<alt>(?:\\.|[^\]\\\n])*)\]\([ \t]*"
     r"(?P<source><[^<>\n]+>|(?:[^\s()<>]|\([^\s()<>]*\))+)"
     r'(?:[ \t]+"[^"\n]*")?[ \t]*\)'
+    r"|(?P<unfinished>!\[(?:\\.|[^\]\\\n])*(?:\](?:\([^\n]*)?)?)\Z"
 )
 
 
-def image_spans(text):
-    """Recognize Markdown image links to the chat's documents folder."""
+def image_spans(text, *, streaming=False):
+    """Recognize Markdown images from the chat's documents folder or the web."""
     if "![" not in text:
         return
     for match in _IMAGE_SPAN.finditer(text):
+        if streaming and match["unfinished"]:
+            yield match.start(), match.end(), None
         if match["source"] is None:
             continue
-        path = unquote(html.unescape(match["source"].removeprefix("<").removesuffix(">")))
-        if path.startswith("documents/") and image_mime_type(path):
+        source = html.unescape(match["source"].removeprefix("<").removesuffix(">"))
+        from_web = is_web_image_url(source)
+        if not from_web:
+            source = unquote(source)
+        if from_web or (source.startswith("documents/") and image_mime_type(source)):
             alt = html.unescape(re.sub(r"\\([\\\[\]])", r"\1", match["alt"]))
-            yield match.start(), match.end(), (path.removeprefix("documents/"), alt)
+            yield match.start(), match.end(), (source, alt)
 
 
 def _fit_image_size(width, height, bounds):
@@ -52,37 +61,74 @@ def _fit_image_size(width, height, bounds):
     return max(1, round(width * scale)), max(1, round(height * scale))
 
 
-def load_document_picture(widget, documents, name, bounds, loaded, failed):
-    """Decode a scoped image off the GTK thread when its widget first maps."""
+def _decode_picture(read_image, bounds):
+    mime, data = read_image()
+    loader = GdkPixbuf.PixbufLoader.new_with_mime_type(mime)
+    loader.connect(
+        "size-prepared",
+        lambda decoder, width, height: decoder.set_size(*_fit_image_size(width, height, bounds)),
+    )
+    try:
+        loader.write(data)
+    finally:
+        loader.close()
+    return loader.get_pixbuf()
 
-    def load():
-        mime, data = documents.image(name)
-        loader = GdkPixbuf.PixbufLoader.new_with_mime_type(mime)
-        loader.connect(
-            "size-prepared",
-            lambda decoder, width, height: decoder.set_size(
-                *_fit_image_size(width, height, bounds)
-            ),
-        )
-        try:
-            loader.write(data)
-        finally:
-            loader.close()
-        return loader.get_pixbuf()
 
-    def complete(result):
+def _show_picture_when_mapped(widget, request, loaded, failed):
+    """Subscribe on map and apply the result on the GTK thread."""
+
+    def display(result):
         try:
             pixbuf = result.result()
         except OSError, ValueError, GLib.Error:
-            GLib.idle_add(failed)
+            failed()
         else:
-            GLib.idle_add(loaded, pixbuf)
+            loaded(pixbuf)
+
+    def start():
+        result = request()
+        if result.done():
+            display(result)
+        else:
+            result.add_done_callback(lambda future: GLib.idle_add(display, future))
 
     def mapped(widget):
         widget.disconnect(handler)
-        _image_loader.submit(load).add_done_callback(complete)
+        start()
 
-    handler = widget.connect("map", mapped)
+    if widget.get_mapped():
+        start()
+    else:
+        handler = widget.connect("map", mapped)
+
+
+def load_picture(widget, read_image, bounds, loaded, failed):
+    """Read and decode a thumbnail off the GTK thread when its widget maps."""
+    _show_picture_when_mapped(
+        widget, lambda: _image_loader.submit(_decode_picture, read_image, bounds), loaded, failed
+    )
+
+
+class ReplyImages:
+    """Share image loads across all renders of one reply."""
+
+    def __init__(self, documents):
+        self.documents = documents
+        self.requests = {}
+
+    def request(self, source):
+        if source not in self.requests:
+            if is_web_image_url(source):
+                executor = _web_image_loader
+                read_image = partial(fetch_web_image, source)
+            else:
+                executor = _image_loader
+                read_image = partial(self.documents.image, source.removeprefix("documents/"))
+            self.requests[source] = executor.submit(
+                _decode_picture, read_image, _EXPANDED_IMAGE_SIZE
+            )
+        return self.requests[source]
 
 
 class _ImageLayout(Gtk.BoxLayout):
@@ -97,21 +143,19 @@ class _ImageLayout(Gtk.BoxLayout):
 
 
 class MarkdownImage(Gtk.Button):
-    """An existing chat image that can expand inline."""
+    """A reply image that can expand inline."""
 
-    def __init__(self, documents, value, alignment=Gtk.Align.START):
+    def __init__(self, images, value, alignment=Gtk.Align.START):
         super().__init__(has_frame=False, halign=alignment, css_classes=["markdown-image"])
         self.set_layout_manager(_ImageLayout(orientation=Gtk.Orientation.VERTICAL))
-        self.set_image(documents, value)
+        self.set_image(images, value)
 
-    def set_image(self, documents, value):
-        name, alt = value
-        description = alt or name.rsplit("/", 1)[-1]
-        picture = Gtk.Picture(
-            content_fit=Gtk.ContentFit.SCALE_DOWN,
-            overflow=Gtk.Overflow.HIDDEN,
-            alternative_text=description,
-        )
+    def set_image(self, images, value):
+        source, alt = value
+        from_web = is_web_image_url(source)
+        description = alt or ("Web image" if from_web else source.rsplit("/", 1)[-1])
+        status = Gtk.Label(label=f"Loading image: {description}", ellipsize=Pango.EllipsizeMode.END)
+        self.set_child(status)
         self.set_sensitive(False)
         self.set_tooltip_text(description)
         if handler := getattr(self, "_zoom_handler", None):
@@ -119,12 +163,18 @@ class MarkdownImage(Gtk.Button):
             self._zoom_handler = None
 
         def loaded(pixbuf):
-            if self.get_child() is not picture:
+            if self.get_child() is not status:
                 return
             full = Gdk.Texture.new_for_pixbuf(pixbuf)
             size = _fit_image_size(full.get_width(), full.get_height(), _REPLY_IMAGE_SIZE)
+            picture = Gtk.Picture(
+                content_fit=Gtk.ContentFit.SCALE_DOWN,
+                overflow=Gtk.Overflow.HIDDEN,
+                alternative_text=description,
+            )
             if size == (full.get_width(), full.get_height()):
                 picture.set_paintable(full)
+                self.set_child(picture)
                 self.set_sensitive(True)
                 self.set_can_focus(False)
                 return
@@ -132,6 +182,7 @@ class MarkdownImage(Gtk.Button):
                 pixbuf.scale_simple(*size, GdkPixbuf.InterpType.BILINEAR)
             )
             picture.set_paintable(preview)
+            self.set_child(picture)
             self.set_sensitive(True)
             self.set_can_focus(True)
 
@@ -144,11 +195,10 @@ class MarkdownImage(Gtk.Button):
             self._zoom_handler = self.connect("clicked", zoom)
 
         def failed():
-            if self.get_child() is picture:
-                self.set_child(Gtk.Label(label=f"Image unavailable: {description}", wrap=True))
+            if self.get_child() is status:
+                status.set_text(f"Image unavailable: {description}")
 
-        load_document_picture(picture, documents, name, _EXPANDED_IMAGE_SIZE, loaded, failed)
-        self.set_child(picture)
+        _show_picture_when_mapped(self, lambda: images.request(source), loaded, failed)
 
 
 _INLINE = re.compile(
@@ -715,13 +765,13 @@ class HorizontalScrollFrame(Gtk.Frame):
 class MarkdownTable(HorizontalScrollFrame):
     """Keep columns aligned and update only changed cells during streaming."""
 
-    def __init__(self, data, *, documents=None):
+    def __init__(self, data, *, images=None):
         self.grid = Gtk.Grid()
         super().__init__(self.grid)
         self.add_css_class("markdown-table")
         self.cells = []
         self.data = ([], [])
-        self.documents = documents
+        self.images = images
         self.set_data(data)
 
     def set_data(self, data):
@@ -742,7 +792,7 @@ class MarkdownTable(HorizontalScrollFrame):
                 if row_index >= len(previous_rows) or previous_rows[row_index][column] != value:
                     cell = self.cells[row_index][column]
                     xalign = alignment[column]
-                    has_image = self.documents is not None and next(image_spans(value), None)
+                    has_image = self.images is not None and next(image_spans(value), None)
                     if cell is None or bool(has_image) != isinstance(cell, MarkdownText):
                         if cell is not None:
                             self.grid.remove(cell)
@@ -752,9 +802,7 @@ class MarkdownTable(HorizontalScrollFrame):
                                 0.5: Gtk.Align.CENTER,
                                 1.0: Gtk.Align.END,
                             }
-                            cell = MarkdownText(
-                                documents=self.documents, image_alignment=align[xalign]
-                            )
+                            cell = MarkdownText(images=self.images, image_alignment=align[xalign])
                         else:
                             cell = markdown_label()
                             cell.set_max_width_chars(500)
@@ -804,20 +852,21 @@ def _stream_text_blocks(blocks, wrap_boundary):
                 yield "paragraph-start" if i and not start else "fragment", fragment
 
 
-def _with_images(blocks):
+def _with_images(blocks, *, streaming=False):
     for kind, value in blocks:
         if kind not in ("prose", "item"):
             yield kind, value
             continue
         text = value if kind == "prose" else value[2]
         start = 0
-        for left, right, image in image_spans(text):
+        for left, right, image in image_spans(text, streaming=streaming):
             lead = text[start:left].strip("\n")
             if kind == "item" and not start:
                 yield kind, (*value[:2], lead)
             elif lead.strip():
                 yield "prose", lead
-            yield "image", image
+            if image is not None:
+                yield "image", image
             start = right
         if not start:
             yield kind, value
@@ -837,16 +886,14 @@ class _WrappedBoxLayout(Gtk.BoxLayout):
 class MarkdownText(Gtk.Box):
     """Share prose/table rendering between stored messages and the streaming tail."""
 
-    def __init__(
-        self, text="", *, streaming=False, documents=None, image_alignment=Gtk.Align.START
-    ):
+    def __init__(self, text="", *, streaming=False, images=None, image_alignment=Gtk.Align.START):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.add_css_class("markdown-text")
         self._wrap_width = 680
         self._wrap_breaks = {}
         self._rewrap_id = 0
         self.streaming = streaming
-        self.documents = documents
+        self.images = images
         self.image_alignment = image_alignment
         self.blocks = []
         self._source_text = None
@@ -906,7 +953,10 @@ class MarkdownText(Gtk.Box):
             self._source_text = text[start:]
             yield True
 
-    def set_text(self, text):
+    def set_text(self, text, *, finished=False):
+        if finished and self.streaming:
+            self.streaming = False
+            self._source_text = None
         # While a fenced block streams, its preceding prose often stays identical.
         if text == self._source_text:
             return
@@ -934,8 +984,8 @@ class MarkdownText(Gtk.Box):
             for block in (prose_blocks(value) if kind == "prose" else [(kind, value)])
         ]
         blocks.extend(notes)
-        if self.documents is not None:
-            blocks = list(_with_images(blocks))
+        if self.images is not None:
+            blocks = list(_with_images(blocks, streaming=self.streaming))
         grouped = []
         fragmented = self.streaming or len(text) > 8192
         if fragmented:
@@ -957,13 +1007,13 @@ class MarkdownText(Gtk.Box):
                 while len(self.blocks) > index:
                     self.remove(self.blocks.pop()[1])
                 child = render_markdown_block(
-                    kind, value, documents=self.documents, image_alignment=self.image_alignment
+                    kind, value, images=self.images, image_alignment=self.image_alignment
                 )
                 self.append(child)
             else:
                 _, child, previous = self.blocks[index]
                 if value != previous:
-                    render_markdown_block(kind, value, child, documents=self.documents)
+                    render_markdown_block(kind, value, child, images=self.images)
             continuation = (
                 index
                 and kind == "fragment"
@@ -1029,16 +1079,16 @@ def selectable_markdown(label, blocks):
 
 
 def render_markdown_block(
-    kind, value, widget=None, *, documents=None, image_alignment=Gtk.Align.START
+    kind, value, widget=None, *, images=None, image_alignment=Gtk.Align.START
 ):
     if kind == "table":
         if widget is None:
-            return MarkdownTable(value, documents=documents)
+            return MarkdownTable(value, images=images)
         widget.set_data(value)
     elif kind == "image":
         if widget is None:
-            return MarkdownImage(documents, value, image_alignment)
-        widget.set_image(documents, value)
+            return MarkdownImage(images, value, image_alignment)
+        widget.set_image(images, value)
     elif kind == "rule":
         return (
             widget if widget is not None else Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
@@ -1056,7 +1106,7 @@ def render_markdown_block(
             title = Gtk.Label(label="Note:" if kind == "note" else "Quote:", xalign=0)
             title.add_css_class("dim-label")
             content.append(title)
-            content.append(MarkdownText(documents=documents))
+            content.append(MarkdownText(images=images))
             widget.set_child(content)
             widget.add_css_class("markdown-quote")
         widget.get_child().get_last_child().set_text(value)
@@ -1146,14 +1196,14 @@ def append_code_block(parent, text, language=""):
     return frame, label
 
 
-def append_markdown(parent, text, command_extractor=None, command_handler=None, *, documents=None):
+def append_markdown(parent, text, command_extractor=None, command_handler=None, *, images=None):
     """Append safe Markdown, tables, and fenced code or command blocks."""
 
     text, notes = markdown_footnotes(text)
     last = 0
     for match in CODE_BLOCK_PATTERN.finditer(text):
         if text[last : match.start()]:
-            parent.append(MarkdownText(text[last : match.start()], documents=documents))
+            parent.append(MarkdownText(text[last : match.start()], images=images))
         commands = command_extractor(match.group(0)) if command_extractor else []
         if commands:
             for command in commands:
@@ -1165,7 +1215,7 @@ def append_markdown(parent, text, command_extractor=None, command_handler=None, 
             append_code_block(parent, match.group(3).rstrip("\n"), match.group(2).strip())
         last = match.end()
     if text[last:] or not last:
-        parent.append(MarkdownText(text[last:], documents=documents))
+        parent.append(MarkdownText(text[last:], images=images))
     if notes:
         footer = MarkdownText()
         for _kind, value in notes:

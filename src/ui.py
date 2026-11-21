@@ -12,9 +12,10 @@ from agentic import DocumentFiles, get_clock_format, image_mime_type
 from markdown_ui import (
     CODE_BLOCK_PATTERN,
     MarkdownText,
+    ReplyImages,
     append_code_block,
     append_markdown,
-    load_document_picture,
+    load_picture,
 )
 from model_server import SERVER_FIELDS
 from settings import CHAT_SORT_OPTIONS, CONVERSATION_STYLE_OPTIONS
@@ -786,6 +787,17 @@ class BubbleLayout(Gtk.LayoutManager):
         child.allocate(bubble_width, height, -1, transform)
 
 
+class TranscriptViewport(Gtk.Viewport):
+    def do_size_allocate(self, width, height, baseline):
+        adjustment = self.get_vadjustment()
+        previous = adjustment.get_value()
+        Gtk.Viewport.do_size_allocate(self, width, height, baseline)
+        # GTK can emit the scroll range change after allocating the transcript.
+        # Apply the new offset before this layout pass can reach the screen.
+        if adjustment.get_value() != previous:
+            Gtk.Viewport.do_size_allocate(self, width, height, baseline)
+
+
 class ChatWindow(Adw.ApplicationWindow):
     def __init__(self, app, controller):
         super().__init__(application=app, title="Lopaca")
@@ -990,7 +1002,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.transcript_scroll.add_css_class("main-transcript-scroll")
         self.transcript_scroll.add_css_class("transcript-scroll")
         self.transcript_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.transcript_scroll.set_child(self.transcript)
+        self.transcript_scroll.set_child(TranscriptViewport(child=self.transcript))
         self.transcript_scroll.set_vexpand(True)
         main.append(self.transcript_scroll)
         adjustment = self.transcript_scroll.get_vadjustment()
@@ -1420,13 +1432,12 @@ class ChatWindow(Adw.ApplicationWindow):
     def _adjustment_changed(self, adjustment):
         if self._prepend_upper is not None and adjustment.get_upper() > self._prepend_upper:
             shift = adjustment.get_upper() - self._prepend_upper
-            self._scroll_guard = True
-            adjustment.set_value(adjustment.get_value() + shift)
-            self._scroll_guard = False
+            self._set_scroll_value(adjustment, adjustment.get_value() + shift)
             self._prepend_upper = None
             self._schedule_older_history(adjustment)
-            return
-        self.scroll_bottom()
+        elif self.follow_output:
+            # Anchor the bottom as GTK lays out newly loaded images and text.
+            self._set_scroll_value(adjustment, adjustment.get_upper() - adjustment.get_page_size())
 
     def show_chat(self, chat, folder):
         # Release the sidebar row before refresh removes it and GTK moves focus.
@@ -1857,8 +1868,8 @@ class ChatWindow(Adw.ApplicationWindow):
             self._create_thinking_widget(wrapper, reasoning, True)
         if text:
             extractor = self.controller.commands_in if role == "assistant" else None
-            documents = self._reply_documents(self.chat["id"]) if role == "assistant" else None
-            append_markdown(wrapper, text, extractor, self._review_command, documents=documents)
+            images = self._reply_images(self.chat["id"]) if role == "assistant" else None
+            append_markdown(wrapper, text, extractor, self._review_command, images=images)
         if role == "user" and attachments:
             wrapper.append(self._message_attachment_button(self.chat["id"], attachments))
         if attach:
@@ -1927,13 +1938,13 @@ class ChatWindow(Adw.ApplicationWindow):
             picture.set_size_request(pixbuf.get_width(), pixbuf.get_height())
             picture.set_paintable(Gdk.Texture.new_for_pixbuf(pixbuf))
 
-        load_document_picture(
-            picture, DocumentFiles(folder), name, (size, size), display, picture.hide
+        load_picture(
+            picture, lambda: DocumentFiles(folder).image(name), (size, size), display, picture.hide
         )
         return picture
 
-    def _reply_documents(self, chat_id):
-        return DocumentFiles(self.controller.store.documents(chat_id))
+    def _reply_images(self, chat_id):
+        return ReplyImages(DocumentFiles(self.controller.store.documents(chat_id)))
 
     def _create_thinking_widget(self, wrapper, text, completed):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -2018,7 +2029,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.current_wrapper = self.append_message(
             "assistant", "", timestamp=timestamp, attach=chat_id == self.chat["id"]
         )
-        self.current_answer = MarkdownText(streaming=True)
+        self.current_answer = MarkdownText(streaming=True, images=self._reply_images(chat_id))
         self.current_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.current_content.add_css_class("streaming-response-current-content")
         self.current_content.append(self.current_answer)
@@ -2095,7 +2106,11 @@ class ChatWindow(Adw.ApplicationWindow):
                 self._stream_code = None
             self.current_content.remove(self.current_answer)
             append_markdown(
-                self.current_content, tail[:end], self.controller.commands_in, self._review_command
+                self.current_content,
+                tail[:end],
+                self.controller.commands_in,
+                self._review_command,
+                images=self.current_answer.images,
             )
             self.current_content.append(self.current_answer)
             self._answer_committed += end
@@ -2131,14 +2146,24 @@ class ChatWindow(Adw.ApplicationWindow):
         self._response_row.time_label.set_text(message_time(timestamp))
         if reasoning and self.current_thinking is None:
             self.current_thinking = self._create_thinking_widget(self.current_wrapper, "", True)
-        self.current_wrapper.remove(self.current_content)
-        append_markdown(
-            self.current_wrapper,
-            answer.strip(),
-            self.controller.commands_in,
-            self._review_command,
-            documents=self._reply_documents(self._response_chat_id),
-        )
+        answer = answer.strip()
+        if (
+            self.current_answer.images.requests
+            and not self._answer_committed
+            and self._stream_code is None
+            and not CODE_BLOCK_PATTERN.search(answer)
+        ):
+            self.current_answer.set_text(answer, finished=True)
+            self.current_answer.set_visible(bool(answer))
+        else:
+            self.current_wrapper.remove(self.current_content)
+            append_markdown(
+                self.current_wrapper,
+                answer,
+                self.controller.commands_in,
+                self._review_command,
+                images=self.current_answer.images,
+            )
         if self.current_thinking:
             self._collapse_thinking()
             if self.current_thinking.get_visible():
@@ -2174,17 +2199,22 @@ class ChatWindow(Adw.ApplicationWindow):
         if force:
             self.follow_output = True
         if self.follow_output and self._scroll_idle_id is None:
-            self._scroll_idle_id = GLib.idle_add(self._scroll_to_bottom)
+            self._scroll_idle_id = GLib.idle_add(
+                self._scroll_to_bottom, priority=GLib.PRIORITY_HIGH_IDLE
+            )
 
     def _scroll_to_bottom(self):
         self._scroll_idle_id = None
         if not self.follow_output:
             return False
         adjustment = self.transcript_scroll.get_vadjustment()
-        self._scroll_guard = True
-        adjustment.set_value(adjustment.get_upper() - adjustment.get_page_size())
-        self._scroll_guard = False
+        self._set_scroll_value(adjustment, adjustment.get_upper() - adjustment.get_page_size())
         return False
+
+    def _set_scroll_value(self, adjustment, value):
+        self._scroll_guard = True
+        adjustment.set_value(value)
+        self._scroll_guard = False
 
     def _show_alert(self, heading, body):
         alert = Adw.AlertDialog(heading=heading, body=body)

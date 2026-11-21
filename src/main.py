@@ -69,6 +69,8 @@ def build_system_prompt(agent_mode, style="neutral", *, memories=False):
         "with an unknown path, list documents/** with search_files before saying it is missing. "
         "To show a relevant PNG or JPEG from this chat, use Markdown image syntax with its "
         "exact documents/ path, for example ![Diagram](<documents/my diagram.png>). "
+        "For an existing web image, use the same syntax with a known direct HTTP(S) image URL. "
+        "Do not invent image URLs. "
         "If a file-dependent claim remains unsupported, say you cannot verify it. For unrelated "
         "questions, answer without mentioning absent sources.\n"
         "Knowledge excerpts are optional evidence. Match exact models and variants. Search packs "
