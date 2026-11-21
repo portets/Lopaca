@@ -152,25 +152,27 @@ class MarkdownImage(Gtk.Button):
             if self.get_child() is not status:
                 return
             full = Gdk.Texture.new_for_pixbuf(pixbuf)
-            size = fit_image_size(full.get_width(), full.get_height(), _REPLY_IMAGE_SIZE)
+            original_size = full.get_width(), full.get_height()
+            size = fit_image_size(*original_size, _REPLY_IMAGE_SIZE)
+            can_zoom = size != original_size
+            preview = (
+                Gdk.Texture.new_for_pixbuf(
+                    pixbuf.scale_simple(*size, GdkPixbuf.InterpType.BILINEAR)
+                )
+                if can_zoom
+                else full
+            )
             picture = Gtk.Picture(
+                paintable=preview,
                 content_fit=Gtk.ContentFit.SCALE_DOWN,
                 overflow=Gtk.Overflow.HIDDEN,
                 alternative_text=description,
             )
-            if size == (full.get_width(), full.get_height()):
-                picture.set_paintable(full)
-                self.set_child(picture)
-                self.set_sensitive(True)
-                self.set_can_focus(False)
-                return
-            preview = Gdk.Texture.new_for_pixbuf(
-                pixbuf.scale_simple(*size, GdkPixbuf.InterpType.BILINEAR)
-            )
-            picture.set_paintable(preview)
             self.set_child(picture)
             self.set_sensitive(True)
-            self.set_can_focus(True)
+            self.set_can_focus(can_zoom)
+            if not can_zoom:
+                return
 
             def zoom(_button):
                 expand = picture.get_paintable() == preview
@@ -775,38 +777,38 @@ class MarkdownTable(HorizontalScrollFrame):
             if row_index == len(self.cells):
                 self.cells.append([None] * len(alignment))
             for column, value in enumerate(row):
-                if row_index >= len(previous_rows) or previous_rows[row_index][column] != value:
-                    cell = self.cells[row_index][column]
-                    xalign = alignment[column]
-                    has_image = self.images is not None and next(image_spans(value), None)
-                    if cell is None or bool(has_image) != isinstance(cell, MarkdownText):
-                        if cell is not None:
-                            self.grid.remove(cell)
-                        if has_image:
-                            align = {
-                                0.0: Gtk.Align.START,
-                                0.5: Gtk.Align.CENTER,
-                                1.0: Gtk.Align.END,
-                            }
-                            cell = MarkdownText(images=self.images, image_alignment=align[xalign])
-                        else:
-                            cell = markdown_label()
-                            cell.set_max_width_chars(500)
-                            cell.set_xalign(xalign)
-                        cell.set_hexpand(True)
-                        cell.add_css_class("table-cell")
-                        if row_index == 0:
-                            cell.add_css_class("table-heading")
-                        elif row_index % 2 == 0:
-                            cell.add_css_class("table-alternate")
-                        self.grid.attach(cell, column, row_index, 1, 1)
-                        self.cells[row_index][column] = cell
-                    if has_image:
-                        cell.set_text(value)
-                    else:
-                        set_markdown_text(cell, value)
-                        self.update_content_width(cell)
+                if row_index < len(previous_rows) and previous_rows[row_index][column] == value:
+                    continue
+                cell = self.cells[row_index][column]
+                has_image = self.images is not None and any(image_spans(value))
+                if cell is None or has_image != isinstance(cell, MarkdownText):
+                    if cell is not None:
+                        self.grid.remove(cell)
+                    cell = self._add_cell(row_index, column, alignment[column], has_image)
+                    self.cells[row_index][column] = cell
+                if has_image:
+                    cell.set_text(value)
+                else:
+                    set_markdown_text(cell, value)
+                    self.update_content_width(cell)
         self.data = data
+
+    def _add_cell(self, row, column, xalign, has_image):
+        if has_image:
+            align = {0.0: Gtk.Align.START, 0.5: Gtk.Align.CENTER, 1.0: Gtk.Align.END}
+            cell = MarkdownText(images=self.images, image_alignment=align[xalign])
+        else:
+            cell = markdown_label()
+            cell.set_max_width_chars(500)
+            cell.set_xalign(xalign)
+        cell.set_hexpand(True)
+        cell.add_css_class("table-cell")
+        if row == 0:
+            cell.add_css_class("table-heading")
+        elif row % 2 == 0:
+            cell.add_css_class("table-alternate")
+        self.grid.attach(cell, column, row, 1, 1)
+        return cell
 
 
 _INLINE_PROSE_MARKUP = re.compile(r"[\\`*_~=^$<&@\[]|https?://|www\.")
@@ -970,7 +972,7 @@ class MarkdownText(Gtk.Box):
             for block in (prose_blocks(value) if kind == "prose" else [(kind, value)])
         ]
         blocks.extend(notes)
-        if self.images is not None:
+        if self.images is not None and "![" in text:
             blocks = list(_with_images(blocks, streaming=self.streaming))
         grouped = []
         fragmented = self.streaming or len(text) > 8192

@@ -1,16 +1,14 @@
-"""Pack formats, compatibility, catalog metadata and verified downloads."""
+"""Pack formats, compatibility and catalog metadata."""
 
-import hashlib
 import json
 import re
-import shutil
 import sqlite3
 import uuid
 from contextlib import closing
 from pathlib import Path
-from urllib.request import Request, urlopen
 
 from settings import APP_DIR
+from web import KNOWLEDGE_PACK_URL_PREFIX, download_verified_file, fetch_knowledge_catalog
 
 APP_VERSION = "0.1.0"
 INDEX_FORMAT = 1
@@ -102,13 +100,8 @@ def installed_issues(folder):
     return issues
 
 
-CATALOG_URL = (
-    "https://huggingface.co/datasets/portets/lopaca-wikicat/resolve/main/packs/catalog.json"
-)
-
-
 def validate_catalog(data):
-    if data.get("catalog_format_version") != CATALOG_FORMAT:
+    if not isinstance(data, dict) or data.get("catalog_format_version") != CATALOG_FORMAT:
         raise ValueError("Unsupported knowledge catalog version.")
     releases = data.get("releases")
     if not isinstance(releases, list):
@@ -126,11 +119,12 @@ def validate_catalog(data):
         if key in seen:
             raise ValueError("Duplicate catalog release.")
         seen.add(key)
-        if not re.fullmatch(r"[a-f0-9]{64}", row.get("sha256", "")):
+        sha256 = row.get("sha256")
+        if not isinstance(sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", sha256):
             raise ValueError("Invalid catalog checksum.")
         if not isinstance(row.get("size_bytes"), int) or row["size_bytes"] < 1:
             raise ValueError("Invalid catalog file size.")
-        if not row["url"].startswith("https://huggingface.co/datasets/"):
+        if not row["url"].startswith(KNOWLEDGE_PACK_URL_PREFIX):
             raise ValueError("Unsupported catalog download URL.")
         if not isinstance(row.get("hidden", False), bool):
             raise ValueError("Invalid hidden-pack flag.")
@@ -148,11 +142,7 @@ def validate_catalog(data):
 def load_catalog(*, refresh=False, folder=None):
     path = (folder or APP_DIR / "knowledge") / "catalog.json"
     if refresh:
-        # Bound metadata size and network wait; the caller runs this off the GTK thread.
-        with urlopen(CATALOG_URL, timeout=10) as response:
-            raw = response.read(4 * 1024 * 1024 + 1)
-        if len(raw) > 4 * 1024 * 1024:
-            raise ValueError("Knowledge catalog is too large.")
+        raw = fetch_knowledge_catalog()
         releases = validate_catalog(json.loads(raw))
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f"catalog-{uuid.uuid4().hex}.tmp")
@@ -179,51 +169,17 @@ def download_pack(release, path, progress=None):
     validate_catalog({"catalog_format_version": CATALOG_FORMAT, "releases": [release]})
     if error := compatibility_error(release):
         raise ValueError(error)
-    total = release["size_bytes"]
-    offset = path.stat().st_size if path.exists() else 0
-    if offset > total:
-        path.unlink()
-        offset = 0
-    if shutil.disk_usage(path.parent).free < total - offset + 64 * 1024**2:
-        raise OSError("Not enough free space to download this knowledge pack.")
-    digest = hashlib.sha256()
-    if offset:
-        with path.open("rb") as stream:
-            while block := stream.read(4 * 1024**2):
-                digest.update(block)
-    if offset < total:
-        request = Request(release["url"], headers={"Range": f"bytes={offset}-"} if offset else {})
-        with urlopen(request, timeout=60) as response:
-            if response.status == 206:
-                content_range = response.headers.get("Content-Range", "")
-                if not content_range.startswith(f"bytes {offset}-"):
-                    raise ValueError("Server returned an unexpected download range.")
-            elif response.status == 200:
-                offset = 0
-                digest = hashlib.sha256()
-                if (
-                    shutil.disk_usage(path.parent).free
-                    + (path.stat().st_size if path.exists() else 0)
-                    < total + 64 * 1024**2
-                ):
-                    raise OSError("Not enough free space to restart this download.")
-            else:
-                raise ValueError("Unexpected download response.")
-            with path.open("ab" if offset else "wb") as stream:
-                while block := response.read(1024**2):
-                    offset += len(block)
-                    if offset > total:
-                        path.unlink(missing_ok=True)
-                        raise ValueError("Download exceeds the advertised size.")
-                    stream.write(block)
-                    digest.update(block)
-                    if progress:
-                        progress("Downloading", offset, total, release["title"])
-    if offset != total:
-        raise OSError("Download interrupted; retry to resume.")
-    if digest.hexdigest() != release["sha256"]:
-        path.unlink(missing_ok=True)
-        raise ValueError("Pack checksum does not match the catalog; download discarded.")
+    download_verified_file(
+        release["url"],
+        path,
+        size=release["size_bytes"],
+        sha256=release["sha256"],
+        on_progress=(
+            lambda received, total: progress("Downloading", received, total, release["title"])
+        )
+        if progress
+        else None,
+    )
     with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
         manifest = read_manifest(db)
         for key in ("pack_id", "title", "release_sequence", "indexed_format_version", "contains"):

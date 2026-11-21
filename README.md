@@ -37,7 +37,6 @@ DOCX, PPTX, and XLSX documents require optional Python libraries `python-docx`, 
 **Model-Assisted Document Indexing** in App settings optionally allows the LLM to help process documents for better info retrieval. Very slow and depends on your model speed. Modest quality improvement. Recommended for t/s greater than 80.
 
 # TO-DO
-- Add image sending to llm for vision equipped models(not image gen)
 - Add embedding model support?
 - Make features list
 - More advanced agentic mode with more tools, web searching, etc

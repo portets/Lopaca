@@ -18,7 +18,7 @@ from markdown_ui import (
     append_markdown,
     load_picture,
 )
-from model_server import SERVER_FIELDS
+from model_server import DOWNLOADING_MODEL, SERVER_FIELDS
 from settings import CHAT_SORT_OPTIONS, CONVERSATION_STYLE_OPTIONS
 
 gi.require_version("Gtk", "4.0")
@@ -826,7 +826,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._status_timer = None
         self._status_dots = 0
         self._activity_status = "Not Connected"
-        self._connecting_model = False
+        self._model_server_activity = ""
         self._processing_documents = False
         self._notification_timer = None
         self._notification_deadline = 0
@@ -1266,8 +1266,8 @@ class ChatWindow(Adw.ApplicationWindow):
         return False
 
     def _display_status(self, text):
-        if self._connecting_model:
-            text = "Connecting to model"
+        if self._model_server_activity:
+            text = self._model_server_activity
         if text == self._status_text:
             return
         self._status_text = text
@@ -1286,6 +1286,7 @@ class ChatWindow(Adw.ApplicationWindow):
             "Cancelling",
             "Condensing context",
             "Connecting to model",
+            DOWNLOADING_MODEL,
         ):
             self._status_timer = GLib.timeout_add(650, self._animate_status)
 
@@ -2506,8 +2507,9 @@ class ChatWindow(Adw.ApplicationWindow):
         return page
 
     def update_model_server(self, text, busy):
-        if self._connecting_model != busy:
-            self._connecting_model = busy
+        activity = (text if text == DOWNLOADING_MODEL else "Connecting to model") if busy else ""
+        if self._model_server_activity != activity:
+            self._model_server_activity = activity
             if self._notification_timer is not None:
                 GLib.source_remove(self._notification_timer)
                 self._notification_timer = None
@@ -2516,6 +2518,25 @@ class ChatWindow(Adw.ApplicationWindow):
             self._model_server_status.set_label(text)
             self._model_connect_button.set_sensitive(not busy)
 
+    def confirm_model_download(self):
+        alert = Adw.AlertDialog(
+            heading="Set up a local model?",
+            body="No model loaded, would you like Lopaca to download and configure a model? "
+            "This may take a few minutes depending on your internet connection.\n\n"
+            "The model download is about 16.6 GB.",
+        )
+        alert.add_response("cancel", "Cancel")
+        alert.add_response("yes", "Yes")
+        alert.set_default_response("cancel")
+        alert.set_close_response("cancel")
+        alert.connect("response::yes", lambda *_: self.controller.download_default_model())
+        alert.present(self)
+
+    def update_model_paths(self, paths):
+        for key, (row, handler) in getattr(self, "_model_path_rows", {}).items():
+            with row.handler_block(handler):
+                row.set_text(paths[key])
+
     def _model_settings_page(self):
         page = Adw.PreferencesPage(title="Model", icon_name="network-server-symbolic")
         page.add_css_class("model-settings-page")
@@ -2523,9 +2544,9 @@ class ChatWindow(Adw.ApplicationWindow):
         config = dict(self.controller.store.load_app_settings().get("model_server", {}))
 
         def save(key, value):
-            config[key] = value
             try:
-                self.controller.set_model_server_config(config)
+                current = self.controller.store.load_app_settings().get("model_server", {})
+                self.controller.set_model_server_config({**current, key: value})
             except OSError as exc:
                 self._show_alert("Could not save settings", str(exc))
 
@@ -2534,10 +2555,14 @@ class ChatWindow(Adw.ApplicationWindow):
         )
         paths.add_css_class("model-settings-paths")
         page.add(paths)
+        self._model_path_rows = {}
         for key, title in (("executable", "llama-server executable"), ("model", "Model file")):
             row = Adw.EntryRow(title=title, text=config.get(key, ""))
             row.add_css_class("model-settings-row")
-            row.connect("notify::text", lambda entry, _pspec, key=key: save(key, entry.get_text()))
+            handler = row.connect(
+                "notify::text", lambda entry, _pspec, key=key: save(key, entry.get_text())
+            )
+            self._model_path_rows[key] = row, handler
             browse = Gtk.Button(icon_name="folder-open-symbolic", valign=Gtk.Align.CENTER)
             browse.add_css_class("model-settings-browse")
             browse.add_css_class("flat")

@@ -888,20 +888,21 @@ class LlamaClient:
                 if self._on_context:
                     self._on_context(False)
         capture = getattr(self, "_capture", None)
-        if any("image_parts" in message for message in body["messages"]):
-            if capture:
-                # Keep attachment references and tool calls in the log without image copies.
-                capture.write(
-                    "request",
-                    url=self.chat_url,
-                    body={
-                        **body,
-                        "messages": [_text_message(message) for message in body["messages"]],
-                    },
-                )
-            body = {**body, "messages": [_multimodal_message(m) for m in body["messages"]]}
-        elif capture:
-            capture.write("request", url=self.chat_url, body=body)
+        request_messages = body["messages"]
+        has_images = any("image_parts" in message for message in request_messages)
+        if capture:
+            # Keep attachment references and tool calls in the log without image copies.
+            logged = (
+                {**body, "messages": [_text_message(message) for message in request_messages]}
+                if has_images
+                else body
+            )
+            capture.write("request", url=self.chat_url, body=logged)
+        if has_images:
+            body = {
+                **body,
+                "messages": [_multimodal_message(message) for message in request_messages],
+            }
         request = self._post_request(self.chat_url, body)
         reasoning_parts, answer_parts, finish_reason = [], [], None
         tool_calls = {}

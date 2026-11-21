@@ -1,15 +1,24 @@
-"""Download images from public HTTP(S) URLs for the chat renderer."""
+"""Internet downloads for reply images and knowledge packs."""
 
+import hashlib
 import http.client
+import shutil
 import socket
 import ssl
 from contextlib import closing
 from ipaddress import ip_address
 from time import monotonic
 from urllib.parse import quote, urljoin, urlsplit
+from urllib.request import Request, urlopen
 
 from images import IMAGE_SIZE_LIMIT, supported_image_mimes
 
+KNOWLEDGE_PACK_URL_PREFIX = "https://huggingface.co/datasets/"
+KNOWLEDGE_CATALOG_URL = (
+    KNOWLEDGE_PACK_URL_PREFIX + "portets/lopaca-wikicat/resolve/main/packs/catalog.json"
+)
+_CATALOG_SIZE_LIMIT = 4 * 1024**2
+_DOWNLOAD_DISK_RESERVE = 64 * 1024**2
 _REDIRECTS = {301, 302, 303, 307, 308}
 _SOCKET_TIMEOUT = 5
 _DOWNLOAD_TIMEOUT = 15
@@ -17,6 +26,74 @@ _HEADERS = {
     "Accept": "image/*",
     "User-Agent": "Lopaca (https://github.com/portets/Lopaca)",
 }
+
+
+def fetch_knowledge_catalog():
+    with urlopen(KNOWLEDGE_CATALOG_URL, timeout=10) as response:
+        raw = response.read(_CATALOG_SIZE_LIMIT + 1)
+    if len(raw) > _CATALOG_SIZE_LIMIT:
+        raise ValueError("Knowledge catalog is too large.")
+    return raw
+
+
+def _hash_file(path, stopped):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while block := stream.read(4 * 1024**2):
+            if stopped():
+                raise InterruptedError("Download cancelled.")
+            digest.update(block)
+    return digest
+
+
+def matches_download(path, *, size, sha256, stopped):
+    return path.stat().st_size == size and _hash_file(path, stopped).hexdigest() == sha256
+
+
+def download_verified_file(url, path, *, size, sha256, on_progress=None, stopped=lambda: False):
+    """Resume a staged download and check its advertised size and checksum."""
+    offset = path.stat().st_size if path.exists() else 0
+    if offset > size:
+        path.unlink()
+        offset = 0
+    if shutil.disk_usage(path.parent).free < size - offset + _DOWNLOAD_DISK_RESERVE:
+        raise OSError(f"Not enough free space to download {path.name}.")
+
+    digest = _hash_file(path, stopped) if offset else hashlib.sha256()
+    if stopped():
+        raise InterruptedError("Download cancelled.")
+    if offset < size:
+        headers = {"Range": f"bytes={offset}-"} if offset else {}
+        with urlopen(Request(url, headers=headers), timeout=60) as response:
+            if response.status == 206:
+                content_range = response.headers.get("Content-Range", "")
+                if not content_range.startswith(f"bytes {offset}-"):
+                    raise ValueError("Server returned an unexpected download range.")
+            elif response.status == 200:
+                # A server may ignore Range. Reuse the disk space of the partial file.
+                if shutil.disk_usage(path.parent).free + offset < size + _DOWNLOAD_DISK_RESERVE:
+                    raise OSError("Not enough free space to restart this download.")
+                offset = 0
+                digest = hashlib.sha256()
+            else:
+                raise ValueError("Unexpected download response.")
+            with path.open("ab" if offset else "wb") as stream:
+                while block := response.read(1024**2):
+                    if stopped():
+                        raise InterruptedError("Download cancelled.")
+                    offset += len(block)
+                    if offset > size:
+                        path.unlink(missing_ok=True)
+                        raise ValueError("Download exceeds the advertised size.")
+                    stream.write(block)
+                    digest.update(block)
+                    if on_progress:
+                        on_progress(offset, size)
+    if offset != size:
+        raise OSError("Download interrupted; retry to resume.")
+    if digest.hexdigest() != sha256:
+        path.unlink(missing_ok=True)
+        raise ValueError("Download checksum does not match the expected file; download discarded.")
 
 
 def is_web_image_url(source):

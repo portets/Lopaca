@@ -43,7 +43,7 @@ from memory import (
     recall_memories,
     view_memories,
 )
-from model_server import ModelServer
+from model_server import ModelServer, install_default_model
 from rag import (
     DocumentIndexer,
     MissingDocumentLibraryError,
@@ -67,12 +67,11 @@ def build_system_prompt(agent_mode, style="neutral", *, memories=False):
         "facts, use fresh excerpts and tool results over earlier answers, reasoning, or tool "
         "errors. Cite current paths and lines. Read known paths directly. For an attachment "
         "with an unknown path, list documents/** with search_files before saying it is missing. "
-        "To show a relevant image from this chat, use Markdown image syntax with its "
-        "exact documents/ path, for example ![Diagram](<documents/my diagram.png>). "
-        "For an existing web image, use the same syntax with a known direct HTTP(S) image URL. "
-        "Do not invent image URLs. "
-        "If a file-dependent claim remains unsupported, say you cannot verify it. For unrelated "
-        "questions, answer without mentioning absent sources.\n"
+        "To show a relevant image from this chat, use Markdown image syntax with its exact "
+        "documents/ path, for example ![Diagram](<documents/my diagram.png>). For an existing "
+        "web image, use the same syntax with a known direct HTTP(S) image URL. Do not invent "
+        "image URLs. If a file-dependent claim remains unsupported, say you cannot verify it. "
+        "For unrelated questions, answer without mentioning absent sources.\n"
         "Knowledge excerpts are optional evidence. Match exact models and variants. Search packs "
         "when a relevant unfamiliar name or identifier needs verification. If still unclear, "
         "state uncertainty or ask rather than guess.\n"
@@ -184,6 +183,28 @@ class ChatController:
             self.view._show_alert("Model is busy", "Wait for the current model request to finish.")
             return
         self.model_server.connect(self.store.load_app_settings().get("model_server", {}))
+
+    def download_default_model(self):
+        if self.connected or self.busy or self.model_server.busy:
+            return
+        config = self.store.load_app_settings().get("model_server", {})
+
+        def prepare(stopped):
+            paths = install_default_model(self.store.root.parent, stopped)
+            if not stopped():
+                self.view.dispatch(self._save_downloaded_model, paths)
+            return paths
+
+        self.model_server.connect(config, prepare=prepare)
+
+    def _save_downloaded_model(self, paths):
+        config = self.store.load_app_settings().get("model_server", {})
+        try:
+            self.set_model_server_config({**config, **paths})
+        except OSError as exc:
+            self.view._show_alert("Could not save model paths", str(exc))
+        else:
+            self.view.update_model_paths(paths)
 
     def _model_server_changed(self, text, busy):
         self.view.dispatch(self.view.update_model_server, text, busy)
@@ -520,10 +541,11 @@ class ChatController:
         if supported:
             try:
                 copied = self.store.add_documents(chat_id, supported, skipped=skipped)
-                self.document_indexer.schedule(self.store.documents(chat_id))
-                self.view.dispatch(self.view.notify, "Documents added to this chat's folder")
             except OSError as exc:
                 self.view.dispatch(self.view.notify, f"Could not add documents: {exc}")
+        if copied:
+            self.document_indexer.schedule(destination)
+            self.view.dispatch(self.view.notify, "Documents added to this chat's folder")
         if missing:
             self.view.dispatch(
                 self.view._show_alert, "Document libraries required", "\n\n".join(sorted(missing))
@@ -636,7 +658,8 @@ class ChatController:
         if not text and not self.has_draft_attachments():
             return False
         if not self.connected:
-            self.view.notify("Not connected")
+            if not self.model_server.busy and not self.busy:
+                self.view.confirm_model_download()
             return False
         chat_id = self.chat["id"]
         attachments = self._draft_attachments.pop(chat_id, ())

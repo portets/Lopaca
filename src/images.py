@@ -20,6 +20,7 @@ _NATIVE_SIGNATURES = {
 }
 
 
+@cache
 def _pixbuf_libraries():
     import gi
 
