@@ -56,6 +56,17 @@ MODEL_DOWNLOADS = {
         minimum_cuda_compute=100,
         vision_family="3.8",
     ),
+    "9b-q5": ModelDownload(
+        "Qwen 3.5 9B",
+        "Unsloth",
+        "UD-Q5_K_XL",
+        _UNSLOTH_9B,
+        _UNSLOTH_9B_REVISION,
+        "Qwen3.5-9B-UD-Q5_K_XL.gguf",
+        6_743_680_224,
+        "96cf42ddb97f9572410a72b9ed6f2299b1e887ee08da4c2a6c01e897cfa9f673",
+        vision_family="3.5",
+    ),
     "9b-q4": ModelDownload(
         "Qwen 3.5 9B",
         "Unsloth",
@@ -136,17 +147,27 @@ MODEL_DOWNLOADS = {
 }
 
 
-# Qwen publishes the llama-server-compatible Q8_0 GGUF for this embedding model.
 EMBEDDING_DOWNLOAD = ModelDownload(
-    "Qwen3-embedding 0.6B",
+    "Qwen 3 Embedding 0.6B",
     "Qwen",
-    "Q8_0",
+    "FP16",
     "Qwen/Qwen3-Embedding-0.6B-GGUF",
-    "71a379860247873620c83349673f4bcbdbc24922",
-    "Qwen3-Embedding-0.6B-Q8_0.gguf",
-    639_150_016,
-    "a0e820fb3f8f448d3582862f9161bfaf58a63f89b46353f061e017597655821c",
+    "370f27d7550e0def9b39c1f16d3fbaa13aa67728",
+    "Qwen3-Embedding-0.6B-f16.gguf",
+    1_197_629_632,
+    "421a27e58d165478cc7acb984a688c2aa41404968b0203e7cd743ece44c54340",
 )
+EMBEDDING_LEGACY_Q8 = ("Qwen3-Embedding-0.6B-Q8_0.gguf", 639_150_016)
+EMBEDDING_CPU_AUTO_DOWNLOAD_MIN_RAM_GIB = 22 # for cpu-only main models
+EMBEDDING_QUERY_INSTRUCTION = (
+    "Given a search query, retrieve relevant passages that answer the query"
+)
+# Cosine cutoffs for semantic recall over the local embedding model's 256-dimensional vectors.
+EMBEDDING_MEMORY_MINIMUM = 0.56
+EMBEDDING_MEMORY_WITH_KEYWORD_MINIMUM = 0.62
+EMBEDDING_HISTORY_MINIMUM = 0.54
+EMBEDDING_HISTORY_WITH_KEYWORD_MINIMUM = 0.63
+EMBEDDING_HISTORY_CANDIDATES = 24
 
 
 @dataclass(frozen=True)
@@ -202,11 +223,13 @@ class ModelRecommendation:
     backends: tuple[str, ...] = ()
     vram_gib: int = 0
     cuda_compute: int = 0
+    ram_gib: int = 0
 
 
-# First match wins. Discounts are for reported VRAM minor discrepancies.
+# First match wins. Discounts are for reported VRAM and RAM minor discrepancies.
 MODEL_TOTAL_VRAM_DISCOUNT_GIB = 1
 MODEL_FREE_VRAM_DISCOUNT_GIB = 2
+MODEL_TOTAL_RAM_DISCOUNT_GIB = 2
 MODEL_RECOMMENDATIONS = {
     "blackwell": ModelRecommendation(
         balanced="27b-nvfp4",
@@ -230,11 +253,18 @@ MODEL_RECOMMENDATIONS = {
         backends=("cuda", "vulkan"),
         vram_gib=8,
     ),
-    # Includes CPU, unknown VRAM, and GPUs under 8 GiB.
+    # Includes CPU, unknown VRAM, GPUs under 8 GiB, but with 32gb RAM.
     "small": ModelRecommendation(
         balanced="9b-q4",
         faster="9b-q3",
         better="27b-q4s",
+        ram_gib=32,
+    ),
+    # Includes remainder.
+    "smaller": ModelRecommendation(
+        balanced="9b-q4",
+        faster="9b-q3",
+        better="9b-q5",
     ),
 }
 

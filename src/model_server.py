@@ -185,6 +185,7 @@ class ModelServer:
         args = None
         try:
             prepared = False
+            replacing = prepare is not None and self.running_config is not None
             if prepare is None and self.running_config is not None:
                 if prepare_config:
                     self._state("Preparing model configuration…")
@@ -195,20 +196,18 @@ class ModelServer:
                 if config != self._config:
                     # Validate first: an incomplete edit must not stop a working model.
                     launch_command(config, self.url)
-                    self._state("Restarting llama-server…")
-                    self._expected_exits.add(self.process)
-                    self._stop_process(self.process)
-                    self.process = None
-            self._state("Checking for an existing server…")
-            try:
-                if self._health():
-                    self._state("Connected to an existing server")
+                    self._restart_process()
+            if not replacing:
+                self._state("Checking for an existing server…")
+                try:
+                    if self._health():
+                        self._state("Connected to an existing server")
+                        return
+                except urllib.error.URLError:
+                    pass
+                if self._port_occupied():
+                    self._wait_for_existing_server()
                     return
-            except urllib.error.URLError:
-                pass
-            if self._port_occupied():
-                self._wait_for_existing_server()
-                return
             if startup and not (config.get("executable") and config.get("model")):
                 self._state("No server configured")
                 return
@@ -220,7 +219,7 @@ class ModelServer:
             for installed in candidates:
                 if self._closed.is_set():
                     return
-                if self._port_occupied():
+                if not (replacing and self.running_config is not None) and self._port_occupied():
                     self._wait_for_existing_server()
                     return
                 selected = {**config, **(installed or {})}
@@ -229,6 +228,9 @@ class ModelServer:
                 if self._closed.is_set():
                     return
                 args = launch_command(selected, self.url)
+                if replacing and self.running_config is not None:
+                    self._restart_process()
+                replacing = False
                 try:
                     if not self._launch(args, selected):
                         return
@@ -262,6 +264,12 @@ class ModelServer:
             self.on_state(self.status, False)
             if on_finished:
                 on_finished()
+
+    def _restart_process(self):
+        self._state("Restarting llama-server…")
+        self._expected_exits.add(self.process)
+        self._stop_process(self.process)
+        self.process = None
 
     def _wait_for_existing_server(self):
         self._state("Waiting for the existing server…")

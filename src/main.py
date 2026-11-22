@@ -26,6 +26,7 @@ from agentic import (
     workspace_command,
     write_file,
 )
+from embeddings import RecallEmbeddings
 from history import HistoryIndex
 from images import image_mime_type
 from knowledge import KnowledgeStore
@@ -54,13 +55,16 @@ from rag import (
 )
 from server_builds import (
     cached_server_config,
+    custom_server_backend,
     default_model_configs,
     detect_recommendation,
     detect_vision_precision,
+    embedding_auto_download_allowed,
     embedding_path,
     install_embedding,
     install_model,
     install_vision,
+    legacy_embedding_file,
     managed_vision_file,
     model_download_path,
     model_path,
@@ -70,6 +74,10 @@ from server_builds import (
 )
 from settings import (
     CHAT_SETTING_DEFAULTS,
+    EMBEDDING_HISTORY_MINIMUM,
+    EMBEDDING_HISTORY_WITH_KEYWORD_MINIMUM,
+    EMBEDDING_MEMORY_MINIMUM,
+    EMBEDDING_MEMORY_WITH_KEYWORD_MINIMUM,
     MODEL_DOWNLOADS,
     MODEL_RECOMMENDATIONS,
     VISION_DOWNLOADS,
@@ -131,6 +139,7 @@ class ChatController:
     def __init__(self, settings):
         self.settings, self.store, self.client = settings, ChatStore(), LlamaClient(settings)
         self.memories = MemoryStore(self.store.root.parent / "memories.sqlite", settings)
+        self.recall_embeddings = RecallEmbeddings()
         self.knowledge = KnowledgeStore()
         self._model_lock = threading.Lock()
         self._chat_warm_stop = threading.Event()
@@ -204,6 +213,8 @@ class ChatController:
                 else self.store.create()["id"]
             )
         self.open_chat(active_chat)
+        if self.get_chat_settings(active_chat)["global_memories"] is True:
+            self._prepare_memory_embeddings()
         config = app_settings.get("model_server", {})
         folder = self.store.root.parent
         configured_model = Path(config.get("model") or ".").expanduser()
@@ -237,8 +248,6 @@ class ChatController:
             self._connect_configured_model(config, startup=True)
             if pending:
                 self.download_model(pending)
-        if embedding_path(folder).with_suffix(".gguf.download").is_file():
-            self.download_embedding(automatic=True)
 
     def _set_model_recommendation(self, profile, vision_precision):
         self._recommended_profile = profile
@@ -277,15 +286,36 @@ class ChatController:
         self._connect_configured_model(self.store.load_app_settings().get("model_server", {}))
 
     def _connect_configured_model(self, config, *, startup=False):
+        def configured(paths):
+            self.view.dispatch(self._save_vision_settings, config, paths)
+            if startup:
+                folder = self.store.root.parent
+                embedding = self.store.load_app_settings().get("embedding_model", {})
+                if embedding_path(folder).with_suffix(".gguf.download").is_file() or (
+                    legacy_embedding_file(embedding.get("path"))
+                ):
+                    backend = paths.get("backend") or custom_server_backend(paths["executable"])
+                    self.view.dispatch(
+                        lambda: self.download_embedding(automatic=True, backend=backend or "cpu")
+                    )
+
         self.model_server.connect(
             config,
             startup=startup,
             prepare_config=self._prepare_model_vision,
-            on_config=lambda paths: self.view.dispatch(self._save_vision_settings, config, paths),
+            on_config=configured,
         )
 
-    def download_default_model(self):
-        if self.connected or self.busy or self.model_server.busy or self.model_file_download:
+    def download_default_model(self, *, reconfigure=False):
+        owned = self.model_server.running_config is not None
+        if (
+            (self.connected and not (reconfigure and owned))
+            or self.busy
+            or self.model_server.busy
+            or self.model_file_download
+        ):
+            return
+        if reconfigure and self._model_selection_busy():
             return
         if self._connect_default_model(self.store.load_app_settings().get("model_server", {})):
             self._finish_first_launch()
@@ -303,19 +333,8 @@ class ChatController:
         self.view.update_first_launch()
 
     def _connect_default_model(self, config, model_key=None, *, installed=False, on_finished=None):
-        started = self.model_server.connect(
-            {**config, "mmproj": "", "mmproj_manual": False},
-            prepare=lambda stopped: default_model_configs(
-                self.store.root.parent,
-                stopped,
-                self._model_download_progress,
-                model_key=model_key,
-                installed=installed,
-            ),
-            prepare_config=self._prepare_model_vision,
-            on_finished=on_finished,
-            on_config=lambda paths: self.view.dispatch(
-                self._save_downloaded_model,
+        def save(paths):
+            self._save_downloaded_model(
                 {
                     key: paths[key]
                     for key in (
@@ -330,12 +349,24 @@ class ChatController:
                         "vision_precision",
                     )
                     if key in paths
-                },
+                }
+            )
+            if not installed:
+                self.download_embedding(automatic=True, backend=paths["backend"])
+
+        return self.model_server.connect(
+            {**config, "mmproj": "", "mmproj_manual": False},
+            prepare=lambda stopped: default_model_configs(
+                self.store.root.parent,
+                stopped,
+                self._model_download_progress,
+                model_key=model_key,
+                installed=installed,
             ),
+            prepare_config=self._prepare_model_vision,
+            on_finished=on_finished,
+            on_config=lambda paths: self.view.dispatch(save, paths),
         )
-        if started and not installed:
-            self.download_embedding(automatic=True)
-        return started
 
     def _model_download_progress(self, stage, item, percent):
         self.view.dispatch(self.view.update_model_download, stage, item, percent)
@@ -486,18 +517,79 @@ class ChatController:
         settings = self.store.load_app_settings()
         settings.setdefault("embedding_model", {})[key] = value
         self.store.save_app_settings(settings)
+        self.recall_embeddings.prepare(None, None, None, ())
 
-    def download_embedding(self, *, automatic=False):
+    def _embedding_configuration(self):
+        settings = self.store.load_app_settings()
+        embedding = settings.get("embedding_model", {})
+        executable = settings.get("model_server", {}).get("executable")
+        filename = embedding.get("path")
+        if (
+            embedding.get("enabled") is False
+            or not executable
+            or not filename
+            or legacy_embedding_file(filename)
+        ):
+            self.recall_embeddings.prepare(None, None, None, ())
+            return None
+        return executable, filename, embedding.get("parameters")
+
+    def _prepare_memory_embeddings(self):
+        config = self._embedding_configuration()
+        if not config:
+            return None, ()
+        try:
+            rows = self.memories.records()
+        except OSError, sqlite3.Error:
+            logging.debug("Could not prepare memory embeddings", exc_info=True)
+            return None, ()
+        recall = self.recall_embeddings.prepare(
+            *config, [text for _, text, core in rows if not core]
+        )
+        return recall, rows
+
+    def _semantic_memory_recall(self, query, seen):
+        recall, rows = self._prepare_memory_embeddings()
+        if recall and not self.stop_requested:
+            # Require a stronger match when keyword recall already supplied some context.
+            minimum = EMBEDDING_MEMORY_WITH_KEYWORD_MINIMUM if seen else EMBEDDING_MEMORY_MINIMUM
+            row = recall(
+                query,
+                [(row, row[1]) for row in rows if not row[2] and row[0] not in seen],
+                minimum=minimum,
+            )
+            if row:
+                return [row]
+        return []
+
+    def _semantic_history_recall(self, config, query, choices, *, local, keyword_matches):
+        if self.stop_requested or config != self._embedding_configuration():
+            return None
+        group = "archive" if local else "chat history"
+        match = self.recall_embeddings.prepare(*config, [text for _, text in choices], group=group)
+        if match and choices:
+            minimum = (
+                EMBEDDING_HISTORY_WITH_KEYWORD_MINIMUM
+                if keyword_matches
+                else EMBEDDING_HISTORY_MINIMUM
+            )
+            return match(query, choices, minimum=minimum)
+        return None
+
+    def download_embedding(self, *, automatic=False, backend=None):
         stopped = self._model_file_stop.is_set
         if self.embedding_download_active or stopped():
             return
         config = self.store.load_app_settings().get("embedding_model", {})
         original_path = config.get("path", "")
         if automatic:
-            if config.get("enabled") is False:
+            if config.get("enabled") is False or not embedding_auto_download_allowed(
+                backend or "cpu"
+            ):
                 return
             with suppress(RuntimeError):
-                if Path(original_path or ".").expanduser().is_file():
+                path = Path(original_path or ".").expanduser()
+                if path.is_file() and not legacy_embedding_file(path):
                     return
         self.embedding_download_active = True
         self.view.refresh_model_configuration()
@@ -545,7 +637,7 @@ class ChatController:
             current = Path(config.get("path") or ".")
             with suppress(RuntimeError):
                 current = current.expanduser()
-            if not current.is_file():
+            if not current.is_file() or legacy_embedding_file(current):
                 path = embedding_path(self.store.root.parent)
                 if not path.is_file():
                     self.view.refresh_model_configuration()
@@ -559,6 +651,10 @@ class ChatController:
         else:
             if path is not None:
                 self.view.update_model_paths({"embedding_path": str(path)})
+            if active and self.get_chat_settings()["global_memories"] is True:
+                self._prepare_memory_embeddings()
+            elif not active:
+                self.recall_embeddings.prepare(None, None, None, ())
         self.view.refresh_model_configuration()
 
     def delete_embedding(self):
@@ -574,6 +670,7 @@ class ChatController:
             if not config.get("path") or selected == path:
                 config.update(path="", enabled=False)
                 self.store.save_app_settings(settings)
+                self.recall_embeddings.prepare(None, None, None, ())
                 self.view.update_model_paths({"embedding_path": ""})
             path.unlink(missing_ok=True)
             path.with_suffix(".gguf.download").unlink(missing_ok=True)
@@ -1555,6 +1652,15 @@ class ChatController:
             return expansion
 
         expand_query = expand if query_expansion else None
+        embedding_config = self._embedding_configuration()
+        semantic_history = None
+        if embedding_config:
+
+            def semantic_history(choices, *, local, keyword_matches):
+                return self._semantic_history_recall(
+                    embedding_config, query, choices, local=local, keyword_matches=keyword_matches
+                )
+
         try:
             retrieved = retrieve(
                 query,
@@ -1576,6 +1682,7 @@ class ChatController:
                     self.settings,
                     expand=expand_query,
                     previous_queries=previous_queries,
+                    semantic=self._semantic_memory_recall,
                 )
             except Exception as exc:
                 self.view.dispatch(self.view.notify, f"Memory retrieval unavailable: {exc}")
@@ -1588,6 +1695,7 @@ class ChatController:
                     self._generation_chat_id,
                     expand=expand_query,
                     previous_queries=previous_queries,
+                    semantic=semantic_history,
                 )
             except Exception as exc:
                 self.view.dispatch(self.view.notify, f"Chat history retrieval unavailable: {exc}")
@@ -1603,6 +1711,7 @@ class ChatController:
                     expand=expand_query,
                     boundary=self._generation_context_start,
                     previous_queries=previous_queries,
+                    semantic=semantic_history,
                 )
             except Exception as exc:
                 self.view.dispatch(self.view.notify, f"Chat archive retrieval unavailable: {exc}")
@@ -1711,6 +1820,7 @@ class ChatController:
                         enabled=memories_enabled,
                         pending_clarification=pending,
                     )
+                    self._prepare_memory_embeddings()
                 except Exception as exc:
                     if not self.stop_requested:
                         self.view.dispatch(self.view.notify, f"Could not save memories: {exc}")

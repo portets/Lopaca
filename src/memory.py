@@ -1,6 +1,7 @@
 """Memory recall, hidden review decisions and private editing; storage owns writes."""
 
 import json
+import logging
 import re
 
 from rag import retrieve_memories
@@ -212,12 +213,21 @@ ws ::= [ \t\n\r]{0,16}
 """  # noqa: E501 -- Keep the tested GBNF productions readable.
 
 
-def recall_memories(store, query, settings, *, expand=None, previous_queries=()):
+def recall_memories(store, query, settings, *, expand=None, previous_queries=(), semantic=None):
     """Select bounded core and relevant casual records, optionally sharing query expansion."""
     core = store.records(core_only=True)
-    recalled = retrieve_memories(store, query, previous_queries=previous_queries, expand=expand)
+    recalled = [
+        row
+        for row in retrieve_memories(store, query, previous_queries=previous_queries, expand=expand)
+        if not row[2]
+    ]
+    if semantic and len(recalled) < 6:
+        try:
+            recalled.extend(semantic(query, {row[0] for row in recalled})[: 6 - len(recalled)])
+        except Exception:
+            logging.debug("Semantic memory recall unavailable", exc_info=True)
     selected, used = [], 0
-    for row in core + [row for row in recalled if not row[2]]:
+    for row in core + recalled:
         if used + len(row[1]) + 40 <= settings.memory_context_chars:
             selected.append(row)
             used += len(row[1]) + 40

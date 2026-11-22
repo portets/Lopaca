@@ -17,10 +17,13 @@ from tempfile import TemporaryDirectory
 from threading import Event, Lock
 
 from settings import (
+    EMBEDDING_CPU_AUTO_DOWNLOAD_MIN_RAM_GIB,
     EMBEDDING_DOWNLOAD,
+    EMBEDDING_LEGACY_Q8,
     MODEL_DOWNLOADS,
     MODEL_FREE_VRAM_DISCOUNT_GIB,
     MODEL_RECOMMENDATIONS,
+    MODEL_TOTAL_RAM_DISCOUNT_GIB,
     MODEL_TOTAL_VRAM_DISCOUNT_GIB,
     VISION_DOWNLOADS,
 )
@@ -105,15 +108,31 @@ class GpuMemory:
 
 def recommendation_for(backend, devices):
     kind = "cuda" if backend.startswith("cuda") else backend
+    ram = total_ram_gib()
     return next(
         key
         for key, rule in MODEL_RECOMMENDATIONS.items()
-        if not rule.backends
-        or (
-            kind in rule.backends
-            and any(device.qualifies(rule.vram_gib, rule.cuda_compute) for device in devices)
+        if ram >= max(0, rule.ram_gib - MODEL_TOTAL_RAM_DISCOUNT_GIB)
+        and (not rule.backends or kind in rule.backends)
+        and (
+            not (rule.vram_gib or rule.cuda_compute)
+            or any(device.qualifies(rule.vram_gib, rule.cuda_compute) for device in devices)
         )
     )
+
+
+def total_ram_gib():
+    with suppress(AttributeError, OSError, ValueError):
+        return max(0, os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // (1 << 30))
+    return 0
+
+
+def embedding_auto_download_allowed(backend=None):
+    if total_ram_gib() >= EMBEDDING_CPU_AUTO_DOWNLOAD_MIN_RAM_GIB:
+        return True
+    if backend is None and (arch := _server_arch()):
+        backend, _ = next(_candidates(arch))
+    return bool(backend and (backend.startswith("cuda") or backend == "vulkan"))
 
 
 def _nvidia_board_memory(driver, device):
@@ -278,7 +297,7 @@ def detect_vision_precision(config, *, fallback="FP16"):
     backend = config.get("backend")
     if not backend:
         if executable := config.get("executable"):
-            backend = _custom_server_backend(executable)
+            backend = custom_server_backend(executable)
         elif arch := _server_arch():
             backend, _ = next(_candidates(arch))
     if not backend:
@@ -408,7 +427,7 @@ def _server_info(executable, option, *, timeout=20):
     return result.stdout
 
 
-def _custom_server_backend(filename):
+def custom_server_backend(filename):
     try:
         executable = Path(filename).expanduser().resolve()
         output = _server_info(executable, "--list-devices", timeout=3)
@@ -516,6 +535,13 @@ def vision_file_precision(folder, family, filename):
 
 def embedding_path(folder):
     return folder / "models" / EMBEDDING_DOWNLOAD.filename
+
+
+def legacy_embedding_file(filename):
+    with suppress(OSError, RuntimeError):
+        path = Path(filename or ".").expanduser()
+        return path.name == EMBEDDING_LEGACY_Q8[0] and path.stat().st_size == EMBEDDING_LEGACY_Q8[1]
+    return False
 
 
 def managed_vision_file(folder, filename):

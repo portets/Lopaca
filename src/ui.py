@@ -23,8 +23,10 @@ from model_server import DOWNLOADING_MODEL, SERVER_FIELDS
 from server_builds import (
     BACKEND_LABELS,
     cached_server_config,
+    embedding_auto_download_allowed,
     embedding_launch_parameters,
     embedding_path,
+    legacy_embedding_file,
     managed_vision_file,
     model_path,
     model_vision_family,
@@ -2738,25 +2740,56 @@ class ChatWindow(Adw.ApplicationWindow):
             self._model_download[stage] = server, percent
         self.refresh_model_configuration()
 
-    def confirm_model_download(self):
+    def confirm_model_download(self, *, reconfigure=False):
         rule = MODEL_RECOMMENDATIONS[self.controller.model_recommendation()]
         model = MODEL_DOWNLOADS[rule.balanced]
+        folder = self.controller.store.root.parent
+        settings = self.controller.store.load_app_settings()
+        config = settings.get("model_server", {})
+        downloads = []
+        if not model_path(folder, rule.balanced).is_file():
+            downloads.append(f"{model.name} ({model.quantization}) · {model.size / 10**9:.2f} GB")
+        family = model.vision_family
+        if family and family not in config.get("vision_disabled", ()):
+            precision = self.controller._recommended_vision_precision
+            vision = VISION_DOWNLOADS[family][precision]
+            if not vision_path(folder, family, precision).is_file():
+                downloads.append(
+                    f"Qwen {family} Vision ({precision}) · {vision.size / 10**9:.2f} GB"
+                )
+        embedding = settings.get("embedding_model", {})
+        if (
+            embedding.get("enabled") is not False
+            and not embedding_path(folder).is_file()
+            and embedding_auto_download_allowed()
+        ):
+            selected = Path(embedding.get("path") or ".")
+            with suppress(RuntimeError):
+                selected = selected.expanduser()
+            if not selected.is_file() or legacy_embedding_file(selected):
+                downloads.append(
+                    f"{EMBEDDING_DOWNLOAD.name} · {EMBEDDING_DOWNLOAD.size / 10**9:.2f} GB"
+                )
+        intro = (
+            "Switch to an automatically configured model? "
+            if reconfigure
+            else "No model loaded, would you like Lopaca to download and configure a model? "
+        )
+        details = "\n\nEstimated downloads\n" + "\n".join(downloads) if downloads else ""
         alert = Adw.AlertDialog(
             follows_content_size=False,
             content_width=480,
             heading="Set up a local model?",
-            body="No model loaded, would you like Lopaca to download and configure a model? "
-            "This may take a few minutes depending on your internet connection. Or go to "
-            "Settings → Model → Advanced to manually configure.\n\n"
-            f"Recommended model: {model.name} ({model.quantization}), "
-            f"about {model.size / 10**9:.1f} GB. "
-            f"The embedding model adds up to {EMBEDDING_DOWNLOAD.size / 10**9:.2f} GB.",
+            body=f"{intro}You can also configure a model in Settings → Model → Advanced.{details}",
         )
         alert.add_response("cancel", "Cancel")
         alert.add_response("yes", "Yes")
         alert.set_default_response("cancel")
         alert.set_close_response("cancel")
-        alert.connect("response::yes", lambda *_: self.controller.download_default_model())
+        alert.connect(
+            "response::yes",
+            lambda *_: self.controller.download_default_model(reconfigure=reconfigure),
+        )
         alert.present(self)
 
     def update_model_paths(self, paths):
@@ -2784,7 +2817,18 @@ class ChatWindow(Adw.ApplicationWindow):
             server_config = cached_server_config(folder) or config
         executable = server_config.get("executable")
         backend = BACKEND_LABELS.get(server_config.get("backend"))
-        manual = "Manually configured by user"
+        model = config.get("model")
+        manual = bool(
+            (executable and not backend)
+            or (
+                model
+                and all(
+                    Path(model).expanduser() != model_path(folder, key) for key in MODEL_DOWNLOADS
+                )
+            )
+        )
+        self._auto_configure_manual = manual
+        busy = self.controller.model_server.busy or self.controller.model_file_download
         can_download = False
         server_available = bool(executable and backend and Path(executable).expanduser().is_file())
         downloading_server = server_percent is not None or (
@@ -2793,8 +2837,11 @@ class ChatWindow(Adw.ApplicationWindow):
         )
         if downloading_server:
             server = "llama.cpp", "", True
-        elif external or (executable and not backend):
-            server = manual, "", False
+        elif external:
+            server = "Manually configured by user", "", False
+        elif manual:
+            can_download = not busy
+            server = "Manually configured by user, click here to auto-configure", "", can_download
         elif server_available:
             version = re.sub(
                 r", commit [^)]+(?=\))|^(b\d+)-[a-f0-9]+$",
@@ -2804,9 +2851,7 @@ class ChatWindow(Adw.ApplicationWindow):
             subtitle = " | ".join(filter(None, [version, backend]))
             server = "llama.cpp", subtitle, True
         else:
-            can_download = not (
-                self.controller.model_server.busy or self.controller.model_file_download
-            )
+            can_download = not busy
             server = "Click here to automatically download and set-up", "", can_download
 
         self._configured_server.set_activatable(can_download)
@@ -2882,7 +2927,7 @@ class ChatWindow(Adw.ApplicationWindow):
         config = self.controller.store.load_app_settings().get("embedding_model", {})
         row, download, switch, remove, indicator, handler = self._embedding_row
         installed = embedding_path(folder).is_file()
-        available = selected.is_file()
+        available = selected.is_file() and not legacy_embedding_file(selected)
         if installed or available:
             row.remove_css_class("dim-label")
         else:
@@ -2981,8 +3026,8 @@ class ChatWindow(Adw.ApplicationWindow):
         self._vision_group = Adw.PreferencesGroup(title="Vision")
         self._vision_group.add_css_class("model-settings-summary")
         self._vision_rows = {}
-        for family in reversed(VISION_DOWNLOADS):
-            row = Adw.ActionRow(title=f"Qwen {family} Vision", use_markup=False)
+        for family, size in (("3.8", "27B"), ("3.5", "9B")):
+            row = Adw.ActionRow(title=f"Qwen {family} Vision {size}", use_markup=False)
             self._vision_rows[family] = self._model_row_controls(
                 row,
                 "Vision Files",
@@ -3113,7 +3158,10 @@ class ChatWindow(Adw.ApplicationWindow):
         self._server_download_indicator = add_operation_indicator(
             self._configured_server, visible=False
         )
-        self._configured_server.connect("activated", lambda *_: self.confirm_model_download())
+        self._configured_server.connect(
+            "activated",
+            lambda *_: self.confirm_model_download(reconfigure=self._auto_configure_manual),
+        )
         page.add(self._model_choices())
         page.add(self._vision_choices())
         page.add(self._embedding_choice())
@@ -4055,6 +4103,7 @@ class Lopaca(Adw.Application):
     def do_shutdown(self):
         self.controller.cancel_chat_warm()
         self.controller._model_file_stop.set()
+        self.controller.recall_embeddings.close()
         self.controller.model_server.close()
         Adw.Application.do_shutdown(self)
 
