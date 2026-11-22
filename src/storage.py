@@ -127,6 +127,8 @@ class ChatStore:
     def load_app_settings(self):
         try:
             data = _read_json_object(self.root.parent / "app-settings.json")
+        except FileNotFoundError:
+            data = {"first_launch": True}
         except OSError, json.JSONDecodeError:
             data = {}
         for key in ("pinned_chats", "unpinned_chat_order"):

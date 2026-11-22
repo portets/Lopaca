@@ -39,9 +39,9 @@ DOCX, PPTX, and XLSX documents require optional Python libraries `python-docx`, 
 # TO-DO
 - Add embedding model support?
 - Make features list
-- More advanced agentic mode with more tools, web searching, etc
 
 # Further TO-DOs
+- More advanced agentic mode with more tools, web searching, etc
 - Add support for other llm servers
 - Windows and Mac support
 - Add Image and Code tabs, image can connect to stable-diffusion.cpp

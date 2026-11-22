@@ -244,6 +244,15 @@ window.lopaca-main, .transcript-scroll, .transcript {
 .app-settings-button {
     /* Theme defaults; add overrides here when needed. */
 }
+@keyframes first-launch-pulse {
+    from { box-shadow: inset 0 0 0 2px alpha(@accent_color, 0.95); }
+    to { box-shadow: inset 0 0 0 2px alpha(@accent_color, 0.12); }
+}
+.first-launch-highlight,
+.first-launch-model-tab viewswitcher > button:nth-child(2) {
+    box-shadow: inset 0 0 0 2px @accent_color;
+    animation: first-launch-pulse 1s ease-in-out infinite alternate;
+}
 .chat-list-row {
     /* Theme defaults; add overrides here when needed. */
 }
@@ -468,6 +477,12 @@ window.lopaca-main, .transcript-scroll, .transcript {
 }
 .composer-actions {
     border-spacing: 8px;
+}
+.model-picker {
+    border-spacing: 8px;
+}
+.model-picker > dropdown > button label {
+    font-weight: normal;
 }
 .prompt-hint {
     /* Theme defaults; add overrides here when needed. */
@@ -858,6 +873,10 @@ class ChatWindow(Adw.ApplicationWindow):
         self._activity_status = "Not Connected"
         self._model_server_activity = ""
         self._model_download = {}
+        self._model_switch_timer = None
+        self._welcome_shown = False
+        self._welcome_dialog = None
+        self._app_settings_dialog = None
         self._processing_documents = False
         self._notification_timer = None
         self._notification_deadline = 0
@@ -877,6 +896,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._build_ui()
         controller.attach(self)
         self.connect("map", self._start_date_timer)
+        self.connect("map", lambda *_: self.update_first_launch())
         self.connect("unmap", lambda *_: GLib.source_remove(self._date_timer))
         self.chat_list.add_tick_callback(self._scroll_initial_chat)
 
@@ -1000,12 +1020,12 @@ class ChatWindow(Adw.ApplicationWindow):
         usage.set_center_widget(Gtk.Label(label=" | "))
         usage.set_end_widget(self.total_usage)
         footer.append(usage)
-        settings_button = Gtk.Button(
+        self._settings_button = Gtk.Button(
             icon_name="emblem-system-symbolic", tooltip_text="App Settings"
         )
-        settings_button.add_css_class("app-settings-button")
-        settings_button.connect("clicked", lambda *_: self._show_settings())
-        footer.append(settings_button)
+        self._settings_button.add_css_class("app-settings-button")
+        self._settings_button.connect("clicked", lambda *_: self._show_settings())
+        footer.append(self._settings_button)
         sidebar.append(footer)
         root.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
         main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -1106,11 +1126,16 @@ class ChatWindow(Adw.ApplicationWindow):
         self.send_button.connect("clicked", self._send_clicked)
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         actions.add_css_class("composer-actions")
-        hint = Gtk.Label(label="Shift+Enter for new line · Enter to send", xalign=0)
+        hint = Gtk.Label(
+            label="Shift+Enter for new line · Enter to send",
+            xalign=0,
+            ellipsize=Pango.EllipsizeMode.END,
+        )
         hint.add_css_class("prompt-hint")
         hint.set_hexpand(True)
         hint.add_css_class("muted")
         actions.append(hint)
+        actions.append(self._build_model_picker())
         self.thinking_label = Gtk.Label(label="Thinking budget")
         self.thinking_label.add_css_class("thinking-label")
         self.thinking_label.add_css_class("muted")
@@ -1131,6 +1156,86 @@ class ChatWindow(Adw.ApplicationWindow):
         inner.append(actions)
         main.append(compose)
         self.update_send_button()
+
+    def _build_model_picker(self):
+        self._model_picker = Gtk.Box(visible=False)
+        self._model_picker.add_css_class("model-picker")
+        model_label = Gtk.Label(label="Model:")
+        model_label.add_css_class("muted")
+        self._model_picker.append(model_label)
+        self._model_dropdown = Gtk.DropDown(valign=Gtk.Align.CENTER)
+        self._model_dropdown.set_list_factory(self._model_dropdown.get_factory())
+        role_factory = Gtk.SignalListItemFactory()
+        role_factory.connect("setup", lambda _, row: row.set_child(Gtk.Label(xalign=0)))
+        role_factory.connect(
+            "bind",
+            lambda _, row: row.get_child().set_text(
+                row.get_item().get_string().split(":", 1)[0].lower()
+            ),
+        )
+        self._model_dropdown.set_factory(role_factory)
+        self._model_keys = ()
+        self._model_labels = ()
+        self._model_handler = self._model_dropdown.connect("notify::selected", self._model_selected)
+        self._model_picker.append(self._model_dropdown)
+        return self._model_picker
+
+    def _update_model_picker(self):
+        keys = self.controller.installed_models()
+        self._model_picker.set_visible(len(keys) > 1)
+        if len(keys) < 2:
+            return
+        profile = self.controller.model_recommendation()
+        roles = {}
+        for rule in (*MODEL_RECOMMENDATIONS.values(), MODEL_RECOMMENDATIONS[profile]):
+            roles.update({rule.balanced: "Balanced", rule.faster: "Faster", rule.better: "Better"})
+        labels = tuple(
+            f"{roles.get(key, 'Installed')}: {MODEL_DOWNLOADS[key].name} · "
+            f"{MODEL_DOWNLOADS[key].quantization}"
+            for key in keys
+        )
+        config = self.controller.model_configuration()
+        key = self.controller.model_switch_target
+        if key is None and config:
+            folder = self.controller.store.root.parent
+            path = Path(config.get("model") or ".").expanduser()
+            key = next((key for key in keys if model_path(folder, key) == path), None)
+        with self._model_dropdown.handler_block(self._model_handler):
+            if keys != self._model_keys or labels != self._model_labels:
+                self._model_dropdown.set_model(Gtk.StringList.new(labels))
+                self._model_keys = keys
+                self._model_labels = labels
+            self._model_dropdown.set_selected(
+                keys.index(key) if key in keys else Gtk.INVALID_LIST_POSITION
+            )
+        self._model_dropdown.set_sensitive(
+            config is not None
+            and not self.controller.switching_model
+            and not self.controller.model_server.busy
+        )
+        if self.controller.switching_model:
+            tooltip = "Loading the selected model"
+        elif self.controller.model_switch_target is not None:
+            tooltip = "Switching after the current model request finishes"
+        elif config is None:
+            tooltip = "The model is managed by an external server"
+        else:
+            tooltip = "Switch models"
+        self._model_dropdown.set_tooltip_text(tooltip)
+
+    def _model_selected(self, dropdown, _param):
+        index = dropdown.get_selected()
+        if index >= len(self._model_keys):
+            return
+        self.controller.request_model_switch(self._model_keys[index])
+        if self._model_switch_timer is None and self.controller.try_model_switch():
+            self._model_switch_timer = GLib.timeout_add(100, self._retry_model_switch)
+
+    def _retry_model_switch(self):
+        if self.controller.try_model_switch():
+            return GLib.SOURCE_CONTINUE
+        self._model_switch_timer = None
+        return GLib.SOURCE_REMOVE
 
     def update_thinking_options(self):
         key, title, choices = self.controller.thinking_choices()
@@ -1380,6 +1485,7 @@ class ChatWindow(Adw.ApplicationWindow):
         if self.busy:
             steering = (
                 self.controller._generation_streaming
+                and self.controller.model_switch_target is None
                 and can_stop
                 and not self.controller.stop_requested
                 and self.chat["id"] == self._response_chat_id
@@ -1391,6 +1497,10 @@ class ChatWindow(Adw.ApplicationWindow):
                 ("Interrupt and send" if steering else "Queue message")
                 if can_send
                 else "Stop generation"
+            )
+        else:
+            self.send_button.set_tooltip_text(
+                "Queue message" if self.controller.model_switch_target is not None else "Send"
             )
 
     def _send_clicked(self, _button):
@@ -2250,12 +2360,61 @@ class ChatWindow(Adw.ApplicationWindow):
         adjustment.set_value(value)
         self._scroll_guard = False
 
-    def _show_alert(self, heading, body):
+    @staticmethod
+    def _closeable_alert(heading, body):
         alert = Adw.AlertDialog(heading=heading, body=body)
         alert.add_response("close", "Close")
         alert.set_default_response("close")
         alert.set_close_response("close")
-        alert.present(self)
+        return alert
+
+    def _show_alert(self, heading, body):
+        self._closeable_alert(heading, body).present(self)
+
+    def update_first_launch(self):
+        self._update_first_launch_highlight()
+        if not self.controller.first_launch:
+            if self._welcome_dialog is not None:
+                self._welcome_dialog.close()
+            return
+        if self._welcome_shown or self.controller.connected is not False or not self.get_mapped():
+            return
+        self._welcome_shown = True
+        self._welcome_dialog = self._closeable_alert(
+            "Welcome to Lopaca!",
+            "Go to settings to configure a model, after you get acquainted check out the "
+            "Knowledge Packs and other settings.",
+        )
+        self._welcome_dialog.connect("closed", self._welcome_closed)
+        self._welcome_dialog.present(self)
+
+    def _welcome_closed(self, _dialog):
+        self._welcome_dialog = None
+
+    def _update_first_launch_highlight(self):
+        active = self.controller.first_launch
+        dialog = self._app_settings_dialog
+        targets = [(self._settings_button, "first-launch-highlight", active and dialog is None)]
+        model_visible = False
+        if dialog is not None:
+            page = dialog.get_visible_page()
+            model_visible = page is not None and page.get_name() == "model"
+            targets.append((dialog, "first-launch-model-tab", active and not model_visible))
+        if hasattr(self, "_configured_server"):
+            row = self._configured_server
+            targets.append(
+                (row, "first-launch-highlight", active and model_visible and row.get_activatable())
+            )
+        for widget, css_class, highlight in targets:
+            if highlight:
+                widget.add_css_class(css_class)
+            else:
+                widget.remove_css_class(css_class)
+
+    def _app_settings_closed(self, dialog):
+        dialog.remove_css_class("first-launch-model-tab")
+        self._app_settings_dialog = None
+        self._update_first_launch_highlight()
 
     def _rename_chat(self, chat_id):
         chat = self.controller.store.load_settings(chat_id)
@@ -2485,6 +2644,10 @@ class ChatWindow(Adw.ApplicationWindow):
             dialog.add(self._model_settings_page())
             dialog.add(self._knowledge_settings_page(dialog))
             dialog.add(self._about_settings_page())
+            self._app_settings_dialog = dialog
+            dialog.connect("notify::visible-page", lambda *_: self._update_first_launch_highlight())
+            dialog.connect("closed", self._app_settings_closed)
+            self._update_first_launch_highlight()
         dialog.present(self)
 
     def _about_settings_page(self):
@@ -2505,7 +2668,7 @@ class ChatWindow(Adw.ApplicationWindow):
         about.add(
             link_row(
                 "Created by Timothy Porter",
-                "Lopaca developer and maintainer",
+                "Lopaca developer and maintainer (2026-present)",
                 "https://github.com/portets",
             )
         )
@@ -2517,21 +2680,24 @@ class ChatWindow(Adw.ApplicationWindow):
         for title, notice in (
             (
                 "Lopaca",
-                "Copyright © (2026-Current) "
-                'Timothy Porter · <a href="https://www.gnu.org/licenses/agpl-3.0.en.html"> GNU '
-                "Affero General Public License v3.0</a>, provided without warranty or liability.",
+                "Copyright © Timothy Porter · "
+                '<a href="https://www.gnu.org/licenses/agpl-3.0.en.html"> GNU Affero General '
+                "Public License v3.0</a>",
             ),
             (
                 "Wikipedia knowledge packs",
-                "Text adapted and indexed from Wikipedia contributors under the "
-                '<a href="https://creativecommons.org/licenses/by-sa/4.0/">'
-                "Creative Commons Attribution-ShareAlike 4.0 International license</a>. "
-                "Article links provide source and contributor history.",
+                "Adapted from Wikipedia contributors · "
+                '<a href="https://creativecommons.org/licenses/by-sa/4.0/">CC BY-SA 4.0 License</a>'
             ),
             (
-                "llama-server (llama.cpp)",
+                "llama.cpp llama-server",
                 'Copyright © The ggml authors · <a href="https://github.com/ggml-org/llama.cpp/'
                 'blob/master/LICENSE">MIT License</a>',
+            ),
+            (
+                "Qwen Models",
+                'Copyright © Alibaba Cloud · <a href="https://huggingface.co/Qwen/Qwen3.8-27B/'
+                'blob/main/LICENSE">Apache 2.0 License</a>',
             ),
         ):
             licenses.add(Adw.ActionRow(title=title, subtitle=notice, use_markup=True))
@@ -2594,6 +2760,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.refresh_model_configuration()
 
     def refresh_model_configuration(self):
+        self._update_model_picker()
         if not hasattr(self, "_configured_server"):
             return
         config = self.controller.model_configuration()
@@ -2633,7 +2800,7 @@ class ChatWindow(Adw.ApplicationWindow):
             can_download = not (
                 self.controller.model_server.busy or self.controller.model_file_download
             )
-            server = "Click here to automatically download", "", can_download
+            server = "Click here to automatically download and set-up", "", can_download
 
         self._configured_server.set_activatable(can_download)
         self._server_download_arrow.set_visible(can_download)
@@ -2641,6 +2808,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._configured_server.set_title(title)
         self._configured_server.set_subtitle(subtitle)
         self._configured_server.set_sensitive(sensitive)
+        self._update_first_launch_highlight()
         self._update_download_indicator(
             self._server_download_indicator,
             "Downloading server",
@@ -2826,7 +2994,7 @@ class ChatWindow(Adw.ApplicationWindow):
         alert.present(self)
 
     def _model_settings_page(self):
-        page = Adw.PreferencesPage(title="Model", icon_name="network-server-symbolic")
+        page = Adw.PreferencesPage(name="model", title="Model", icon_name="network-server-symbolic")
         page.add_css_class("model-settings-page")
         page.connect("map", self._sync_native_scroll)
         config = dict(self.controller.store.load_app_settings().get("model_server", {}))

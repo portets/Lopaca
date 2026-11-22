@@ -119,16 +119,26 @@ class ModelServer:
         process = self.process
         return self._config if process is not None and process.poll() is None else None
 
-    def connect(self, config, *, startup=False, prepare=None, prepare_config=None, on_config=None):
+    def connect(
+        self,
+        config,
+        *,
+        startup=False,
+        prepare=None,
+        prepare_config=None,
+        on_config=None,
+        on_finished=None,
+    ):
         with self._lock:
             if self.busy or self._closed.is_set():
-                return
+                return False
             self.busy = True
         threading.Thread(
             target=self._connect,
-            args=(dict(config), startup, prepare, prepare_config, on_config),
+            args=(dict(config), startup, prepare, prepare_config, on_config, on_finished),
             daemon=True,
         ).start()
+        return True
 
     def disconnect(self, finished):
         """Unload the model served by our child process."""
@@ -171,7 +181,7 @@ class ModelServer:
         with socket.socket() as probe:
             return probe.connect_ex((address.hostname, address.port or 80)) == 0
 
-    def _connect(self, config, startup, prepare, prepare_config, on_config):
+    def _connect(self, config, startup, prepare, prepare_config, on_config, on_finished):
         args = None
         try:
             prepared = False
@@ -250,6 +260,8 @@ class ModelServer:
         finally:
             self.busy = False
             self.on_state(self.status, False)
+            if on_finished:
+                on_finished()
 
     def _wait_for_existing_server(self):
         self._state("Waiting for the existing server…")

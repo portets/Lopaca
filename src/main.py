@@ -160,9 +160,12 @@ class ChatController:
         self._disk_sizes, self._disk_total = {}, None
         self.connected = None
         self.was_connected = False
+        self.first_launch = False
         self._reported_server_version = None
         self._recommended_profile = None
         self._recommended_vision_precision = "FP16"
+        self.model_switch_target = None
+        self.switching_model = False
         self.model_file_download = None
         self._model_file_stop = threading.Event()
         self._connection_wakeup = threading.Event()
@@ -176,6 +179,7 @@ class ChatController:
         self.view = view
         self.store.ensure()
         app_settings = self.store.load_app_settings()
+        self.first_launch = app_settings.get("first_launch") is True
         self.chat_sort = app_settings["chat_sort"]
         threading.Thread(target=self._monitor_connection, daemon=True).start()
         chats = self.store.list()
@@ -254,7 +258,7 @@ class ChatController:
 
     def connect_model_server(self):
         self.cancel_chat_warm()
-        if self.busy or self._model_lock.locked():
+        if self.busy or self.switching_model or self._model_lock.locked():
             self.view._show_alert("Model is busy", "Wait for the current model request to finish.")
             return
         self._connect_configured_model(self.store.load_app_settings().get("model_server", {}))
@@ -270,10 +274,23 @@ class ChatController:
     def download_default_model(self):
         if self.connected or self.busy or self.model_server.busy or self.model_file_download:
             return
-        self._connect_default_model(self.store.load_app_settings().get("model_server", {}))
+        if self._connect_default_model(self.store.load_app_settings().get("model_server", {})):
+            self._finish_first_launch()
 
-    def _connect_default_model(self, config, model_key=None, *, installed=False):
-        self.model_server.connect(
+    def _finish_first_launch(self):
+        if not self.first_launch:
+            return
+        self.first_launch = False
+        settings = self.store.load_app_settings()
+        settings["first_launch"] = False
+        try:
+            self.store.save_app_settings(settings)
+        except OSError as exc:
+            self.view.notify(f"Could not save first-launch settings: {exc}")
+        self.view.update_first_launch()
+
+    def _connect_default_model(self, config, model_key=None, *, installed=False, on_finished=None):
+        return self.model_server.connect(
             {**config, "mmproj": ""},
             prepare=lambda stopped: default_model_configs(
                 self.store.root.parent,
@@ -283,6 +300,7 @@ class ChatController:
                 installed=installed,
             ),
             prepare_config=self._prepare_model_vision,
+            on_finished=on_finished,
             on_config=lambda paths: self.view.dispatch(
                 self._save_downloaded_model,
                 {
@@ -424,25 +442,97 @@ class ChatController:
 
     def _model_selection_busy(self):
         self.cancel_chat_warm()
-        if self.busy or self.model_server.busy or self._model_lock.locked():
+        if self.busy or self.model_server.busy or self.switching_model or self._model_lock.locked():
             self.view._show_alert("Model is busy", "Wait for the current model request to finish.")
             return True
         return False
+
+    def installed_models(self):
+        folder = self.store.root.parent
+        return tuple(key for key in MODEL_DOWNLOADS if model_path(folder, key).is_file())
+
+    def request_model_switch(self, key):
+        config = self.model_configuration()
+        if config is None or self.switching_model or key not in self.installed_models():
+            return
+        path = model_path(self.store.root.parent, key)
+        current = Path(config.get("model") or ".").expanduser()
+        self.model_switch_target = None if current == path else key
+        self.view.refresh_model_configuration()
+        self.view.update_send_button()
+        if self.model_switch_target is None:
+            self._drain_messages()
+
+    def try_model_switch(self):
+        """Start a queued switch only after the chat and the shared model lock are idle."""
+        key = self.model_switch_target
+        if key is None or self.switching_model:
+            return False
+        if self.busy or self.model_server.busy:
+            return True
+        config = self.model_configuration()
+        installed = self.installed_models()
+        if config is None or len(installed) < 2 or key not in installed:
+            self.model_switch_target = None
+            self.view.refresh_model_configuration()
+            self.view.update_send_button()
+            self._drain_messages()
+            return False
+        if not self._model_lock.acquire(blocking=False):
+            return True
+
+        self.switching_model = True
+        self.cancel_chat_warm()
+
+        def finished():
+            try:
+                connected, props = self._probe_connection()
+            finally:
+                self._model_lock.release()
+            self.view.dispatch(self._finish_model_switch, connected, props)
+
+        started = False
+        try:
+            started = self._connect_installed_model(key, config, on_finished=finished)
+        finally:
+            if not started:
+                self._model_lock.release()
+                self.switching_model = False
+                self.model_switch_target = None
+        self.view.refresh_model_configuration()
+        if not started:
+            self.view.update_send_button()
+            self._drain_messages()
+        return False
+
+    def _finish_model_switch(self, connected, props):
+        self.switching_model = False
+        self.model_switch_target = None
+        self._server_properties_changed(props or {}, reset_capacity=True)
+        self._connection_changed(connected)
+        self.view.refresh_model_configuration()
+        self.view.update_send_button()
 
     def select_model(self, key, active):
         config = self.model_configuration()
         if config is None or self._model_selection_busy():
             self.view.refresh_model_configuration()
             return
-        saved = self.store.load_app_settings().get("model_server", {})
         path = model_path(self.store.root.parent, key)
         if not active:
             if Path(config.get("model") or ".").expanduser() == path:
+                saved = self.store.load_app_settings().get("model_server", {})
                 self._unload_model(saved)
             return
         if not path.is_file():
             self.view.refresh_model_configuration()
             return
+        self._connect_installed_model(key, config)
+        self.view.refresh_model_configuration()
+
+    def _connect_installed_model(self, key, config, *, on_finished=None):
+        saved = self.store.load_app_settings().get("model_server", {})
+        path = model_path(self.store.root.parent, key)
         if Path(config.get("executable") or ".").expanduser().is_file():
             selected = {**saved, "model": str(path)}
             family = MODEL_DOWNLOADS[key].vision_family
@@ -451,14 +541,13 @@ class ChatController:
                 or family != model_vision_family(self.store.root.parent, saved.get("model"))
             ):
                 selected["mmproj"] = ""
-            self.model_server.connect(
+            return self.model_server.connect(
                 selected,
                 prepare_config=self._prepare_model_vision,
                 on_config=lambda paths: self.view.dispatch(self._save_downloaded_model, paths),
+                on_finished=on_finished,
             )
-        else:
-            self._connect_default_model(saved, key, installed=True)
-        self.view.refresh_model_configuration()
+        return self._connect_default_model(saved, key, installed=True, on_finished=on_finished)
 
     def _unload_model(self, config, *, delete=None):
         def unloaded():
@@ -478,7 +567,7 @@ class ChatController:
 
     def delete_model(self, key):
         path = model_path(self.store.root.parent, key)
-        if self.model_server.busy or self.model_file_download == key:
+        if self.model_server.busy or self.switching_model or self.model_file_download == key:
             return
         config = self.model_configuration()
         if config is None:
@@ -530,6 +619,9 @@ class ChatController:
             self.client.vision_enabled = False
         if connected:
             self.was_connected = True
+            self._finish_first_launch()
+        elif changed and self.first_launch:
+            self.view.update_first_launch()
         if changed and not self.busy:
             self.view.set_status(self.idle_status())
         if connected and not self.busy:
@@ -544,24 +636,34 @@ class ChatController:
             with suppress(OSError):
                 for folder in self.store.root.iterdir():
                     self.document_indexer.schedule(folder / "documents")
-            try:
-                connected = self.client.connected()
-            except Exception:
-                connected = False
-            if connected:
-                try:
-                    props = self.client.server_properties()
-                    self.view.dispatch(self._server_properties_changed, props)
-                except Exception:
-                    pass
-            # Refresh capacity before reconnecting can release queued prompts.
-            self.view.dispatch(self._connection_changed, connected)
+            if not self.switching_model:
+                process = self.model_server.process
+                connected, props = self._probe_connection()
+                self.view.dispatch(self._apply_connection_probe, process, connected, props)
             sizes, total = self.store.disk_usage()
             self.view.dispatch(self._update_disk_usage, sizes, total)
             self._connection_wakeup.wait(self.settings.connection_check_interval)
             self._connection_wakeup.clear()
 
-    def _server_properties_changed(self, props):
+    def _probe_connection(self):
+        try:
+            connected = self.client.connected()
+        except Exception:
+            return False, None
+        props = None
+        if connected:
+            with suppress(Exception):
+                props = self.client.server_properties()
+        return connected, props
+
+    def _apply_connection_probe(self, process, connected, props):
+        if self.switching_model or process is not self.model_server.process:
+            return
+        if props is not None:
+            self._server_properties_changed(props)
+        self._connection_changed(connected)
+
+    def _server_properties_changed(self, props, *, reset_capacity=False):
         config = self.model_server.running_config
         if config and config.get("backend") and not config.get("version"):
             version = props.get("build_info")
@@ -575,6 +677,9 @@ class ChatController:
         if isinstance(capacity, int) and capacity > 0:
             self.client.context_capacity = capacity
             self.view.set_context_capacity(capacity)
+        elif reset_capacity:
+            self.client.context_capacity = None
+            self.view.set_context_capacity(None)
         levels = props.get("chat_template_caps", {}).get("reasoning_effort_levels", [])
         levels = (
             list(dict.fromkeys(level for level in levels if isinstance(level, str)))
@@ -687,7 +792,13 @@ class ChatController:
 
     def _schedule_chat_warm(self):
         self.cancel_chat_warm()
-        if not self.chat or not self.connected or self.busy or self.model_server.busy:
+        if (
+            not self.chat
+            or not self.connected
+            or self.busy
+            or self.model_server.busy
+            or self.model_switch_target is not None
+        ):
             return
         chat = self.chat
         stop = self._chat_warm_stop = threading.Event()
@@ -973,9 +1084,9 @@ class ChatController:
         text = text.strip()
         if not text and not self.has_draft_attachments():
             return False
-        if self.model_server.busy and not self.busy:
+        if self.model_server.busy and not self.busy and self.model_switch_target is None:
             return False
-        if not self.connected:
+        if not self.connected and self.model_switch_target is None:
             if not self.model_file_download and not self.busy:
                 self.view.confirm_model_download()
             return False
@@ -985,6 +1096,7 @@ class ChatController:
         self._pending_messages.append((chat_id, text, False, attachments))
         if (
             self.busy
+            and self.model_switch_target is None
             and chat_id == self._generation_chat_id
             and self._generation_streaming
             and not self._generation_answer_complete
@@ -1119,6 +1231,7 @@ class ChatController:
             self.connected
             and not self.busy
             and not self.model_server.busy
+            and self.model_switch_target is None
             and self._pending_messages
         ):
             chat_id, text, steering, attachments = self._pending_messages[0]
