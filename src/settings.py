@@ -136,6 +136,19 @@ MODEL_DOWNLOADS = {
 }
 
 
+# Qwen publishes the llama-server-compatible Q8_0 GGUF for this embedding model.
+EMBEDDING_DOWNLOAD = ModelDownload(
+    "Qwen3-embedding 0.6B",
+    "Qwen",
+    "Q8_0",
+    "Qwen/Qwen3-Embedding-0.6B-GGUF",
+    "71a379860247873620c83349673f4bcbdbc24922",
+    "Qwen3-Embedding-0.6B-Q8_0.gguf",
+    639_150_016,
+    "a0e820fb3f8f448d3582862f9161bfaf58a63f89b46353f061e017597655821c",
+)
+
+
 @dataclass(frozen=True)
 class VisionDownload:
     repository: str

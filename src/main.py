@@ -57,15 +57,24 @@ from server_builds import (
     default_model_configs,
     detect_recommendation,
     detect_vision_precision,
+    embedding_path,
+    install_embedding,
     install_model,
     install_vision,
     managed_vision_file,
     model_download_path,
     model_path,
     model_vision_family,
+    vision_file_precision,
     vision_path,
 )
-from settings import CHAT_SETTING_DEFAULTS, MODEL_DOWNLOADS, MODEL_RECOMMENDATIONS, Settings
+from settings import (
+    CHAT_SETTING_DEFAULTS,
+    MODEL_DOWNLOADS,
+    MODEL_RECOMMENDATIONS,
+    VISION_DOWNLOADS,
+    Settings,
+)
 from storage import ChatStore, MemoryStore
 
 
@@ -167,6 +176,8 @@ class ChatController:
         self.model_switch_target = None
         self.switching_model = False
         self.model_file_download = None
+        self.embedding_download_active = False
+        self.vision_download_active = None
         self._model_file_stop = threading.Event()
         self._connection_wakeup = threading.Event()
         self.model_server = ModelServer(
@@ -226,6 +237,8 @@ class ChatController:
             self._connect_configured_model(config, startup=True)
             if pending:
                 self.download_model(pending)
+        if embedding_path(folder).with_suffix(".gguf.download").is_file():
+            self.download_embedding(automatic=True)
 
     def _set_model_recommendation(self, profile, vision_precision):
         self._recommended_profile = profile
@@ -290,8 +303,8 @@ class ChatController:
         self.view.update_first_launch()
 
     def _connect_default_model(self, config, model_key=None, *, installed=False, on_finished=None):
-        return self.model_server.connect(
-            {**config, "mmproj": ""},
+        started = self.model_server.connect(
+            {**config, "mmproj": "", "mmproj_manual": False},
             prepare=lambda stopped: default_model_configs(
                 self.store.root.parent,
                 stopped,
@@ -313,12 +326,16 @@ class ChatController:
                         "version",
                         "recommendation",
                         "mmproj",
+                        "mmproj_manual",
                         "vision_precision",
                     )
                     if key in paths
                 },
             ),
         )
+        if started and not installed:
+            self.download_embedding(automatic=True)
+        return started
 
     def _model_download_progress(self, stage, item, percent):
         self.view.dispatch(self.view.update_model_download, stage, item, percent)
@@ -329,24 +346,29 @@ class ChatController:
         family = model_vision_family(folder, model)
         if not family or not Path(model).expanduser().is_file():
             return config
-        precision = detect_vision_precision(config)
-        selected = {**config, "vision_family": family, "vision_precision": precision}
+        selected = {**config, "vision_family": family}
         projector = config.get("mmproj")
-        if projector and not managed_vision_file(folder, projector):
+        if family in config.get("vision_disabled", ()) or (
+            projector and not managed_vision_file(folder, projector)
+        ):
             return selected
-        path = vision_path(folder, family, precision)
-        if family not in config.get("vision_disabled", ()):
-            try:
-                path = install_vision(
-                    folder, family, precision, stopped, self._model_download_progress
-                )
-            except InterruptedError:
+        chosen = vision_file_precision(folder, family, projector)
+        # Preserve explicit file choices, but let automatic selections follow the new backend.
+        precision = (
+            chosen
+            if chosen and config.get("mmproj_manual")
+            else detect_vision_precision(config, fallback=chosen or "FP16")
+        )
+        selected["vision_precision"] = precision
+        try:
+            path = install_vision(folder, family, precision, stopped, self._model_download_progress)
+        except InterruptedError:
+            raise
+        except (OSError, ValueError, HTTPException) as exc:
+            if strict:
                 raise
-            except (OSError, ValueError, HTTPException) as exc:
-                if strict:
-                    raise
-                self.view.dispatch(self.view._show_alert, "Vision download failed", str(exc))
-                return {**selected, "mmproj": ""}
+            self.view.dispatch(self.view._show_alert, "Vision download failed", str(exc))
+            return {**selected, "mmproj": ""}
         return {**selected, "mmproj": str(path) if path.is_file() else ""}
 
     def _save_vision_settings(self, original, paths, update_preference=False):
@@ -361,7 +383,7 @@ class ChatController:
         if any(config.get(key) != value for key, value in changes.items()):
             self._save_downloaded_model(changes)
 
-    def select_vision(self, family, active):
+    def select_vision(self, family, active, *, on_config=None):
         config = self.model_configuration()
         if (
             not config
@@ -376,18 +398,187 @@ class ChatController:
             disabled.discard(family)
         else:
             disabled.add(family)
+
+        def save(paths):
+            self._save_vision_settings(config, paths, True)
+            if on_config is not None:
+                on_config()
+
         self.model_server.connect(
             {**config, "vision_disabled": sorted(disabled)},
             prepare_config=lambda config, stopped: self._prepare_model_vision(
                 config, stopped, strict=True
             ),
-            on_config=lambda paths: self.view.dispatch(
-                self._save_vision_settings,
-                config,
-                paths,
-                True,
-            ),
+            on_config=lambda paths: self.view.dispatch(save, paths),
         )
+        self.view.refresh_model_configuration()
+
+    def vision_file_jobs_busy(self):
+        return bool(
+            self.model_server.busy or self.model_file_download or self.vision_download_active
+        )
+
+    def download_vision(self, family):
+        if self.vision_file_jobs_busy() or self._model_file_stop.is_set():
+            return
+        config = self.model_configuration() or self.store.load_app_settings().get(
+            "model_server", {}
+        )
+        precision = config.get("vision_precision") or self._recommended_vision_precision
+        self.vision_download_active = (family, precision)
+        self.view.refresh_model_configuration()
+
+        def finished(_path):
+            self.vision_download_active = None
+            self.view.refresh_model_configuration()
+
+        self._download_model_asset(
+            lambda folder, stopped, progress: install_vision(
+                folder,
+                family,
+                detect_vision_precision(config, fallback=precision),
+                stopped,
+                progress,
+            ),
+            finished,
+            "Vision download failed",
+        )
+
+    def delete_vision(self, family):
+        if self.vision_file_jobs_busy():
+            return
+        folder = self.store.root.parent
+        paths = {vision_path(folder, family, precision) for precision in VISION_DOWNLOADS[family]}
+
+        def remove():
+            config = self.store.load_app_settings().get("model_server", {})
+            projector = Path(config.get("mmproj") or ".").expanduser()
+            custom = (
+                model_vision_family(folder, config.get("model")) == family
+                and config.get("mmproj")
+                and not managed_vision_file(folder, projector)
+            )
+            try:
+                if projector in paths:
+                    config["mmproj"] = ""
+                    config["mmproj_manual"] = False
+                if not custom:
+                    disabled = set(config.get("vision_disabled", ()))
+                    config["vision_disabled"] = sorted(disabled | {family})
+                    self.set_model_server_config(config)
+                if projector in paths:
+                    self.view.update_model_paths({"mmproj": ""})
+                for path in paths:
+                    path.unlink(missing_ok=True)
+                    path.with_suffix(".gguf.download").unlink(missing_ok=True)
+            except OSError as exc:
+                self.view._show_alert("Could not remove vision files", str(exc))
+            self.view.refresh_model_configuration()
+
+        running = self.model_server.running_config or {}
+        active_path = Path(running.get("mmproj") or ".").expanduser()
+        if active_path in paths and family not in running.get("vision_disabled", ()):
+            self.select_vision(family, False, on_config=remove)
+        else:
+            remove()
+
+    def set_embedding_setting(self, key, value):
+        settings = self.store.load_app_settings()
+        settings.setdefault("embedding_model", {})[key] = value
+        self.store.save_app_settings(settings)
+
+    def download_embedding(self, *, automatic=False):
+        stopped = self._model_file_stop.is_set
+        if self.embedding_download_active or stopped():
+            return
+        config = self.store.load_app_settings().get("embedding_model", {})
+        original_path = config.get("path", "")
+        if automatic:
+            if config.get("enabled") is False:
+                return
+            with suppress(RuntimeError):
+                if Path(original_path or ".").expanduser().is_file():
+                    return
+        self.embedding_download_active = True
+        self.view.refresh_model_configuration()
+
+        def finished(path):
+            self.embedding_download_active = False
+            current = self.store.load_app_settings().get("embedding_model", {}).get("path", "")
+            try:
+                if path is not None and current == original_path:
+                    self.set_embedding_setting("path", str(path))
+                    self.view.update_model_paths({"embedding_path": str(path)})
+            finally:
+                self.view.update_model_download("embedding", None, None)
+
+        self._download_model_asset(install_embedding, finished, "Embedding setup failed")
+
+    def _download_model_asset(self, install, apply, failure_title):
+        stopped = self._model_file_stop.is_set
+
+        def download():
+            try:
+                path = install(self.store.root.parent, stopped, self._model_download_progress)
+            except (OSError, ValueError, HTTPException) as exc:
+                result = None, str(exc)
+            else:
+                result = path, None
+            if not stopped():
+                self.view.dispatch(finished, *result)
+
+        def finished(path, error):
+            try:
+                apply(path)
+            except OSError as exc:
+                error = str(exc)
+            if error:
+                self.view._show_alert(failure_title, error)
+
+        threading.Thread(target=download, daemon=True).start()
+
+    def select_embedding(self, active):
+        settings = self.store.load_app_settings()
+        config = settings.setdefault("embedding_model", {})
+        path = None
+        if active:
+            current = Path(config.get("path") or ".")
+            with suppress(RuntimeError):
+                current = current.expanduser()
+            if not current.is_file():
+                path = embedding_path(self.store.root.parent)
+                if not path.is_file():
+                    self.view.refresh_model_configuration()
+                    return
+                config["path"] = str(path)
+        config["enabled"] = active
+        try:
+            self.store.save_app_settings(settings)
+        except OSError as exc:
+            self.view._show_alert("Could not save embedding settings", str(exc))
+        else:
+            if path is not None:
+                self.view.update_model_paths({"embedding_path": str(path)})
+        self.view.refresh_model_configuration()
+
+    def delete_embedding(self):
+        if self.embedding_download_active:
+            return
+        path = embedding_path(self.store.root.parent)
+        settings = self.store.load_app_settings()
+        config = settings.setdefault("embedding_model", {})
+        try:
+            selected = Path(config.get("path") or ".")
+            with suppress(RuntimeError):
+                selected = selected.expanduser()
+            if not config.get("path") or selected == path:
+                config.update(path="", enabled=False)
+                self.store.save_app_settings(settings)
+                self.view.update_model_paths({"embedding_path": ""})
+            path.unlink(missing_ok=True)
+            path.with_suffix(".gguf.download").unlink(missing_ok=True)
+        except OSError as exc:
+            self.view._show_alert("Could not remove embedding model", str(exc))
         self.view.refresh_model_configuration()
 
     def download_model(self, key):
@@ -541,6 +732,7 @@ class ChatController:
                 or family != model_vision_family(self.store.root.parent, saved.get("model"))
             ):
                 selected["mmproj"] = ""
+                selected["mmproj_manual"] = False
             return self.model_server.connect(
                 selected,
                 prepare_config=self._prepare_model_vision,

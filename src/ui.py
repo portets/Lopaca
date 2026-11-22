@@ -3,6 +3,7 @@
 import re
 import threading
 import time
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 
@@ -22,14 +23,18 @@ from model_server import DOWNLOADING_MODEL, SERVER_FIELDS
 from server_builds import (
     BACKEND_LABELS,
     cached_server_config,
+    embedding_launch_parameters,
+    embedding_path,
     managed_vision_file,
     model_path,
     model_vision_family,
+    vision_file_precision,
     vision_path,
 )
 from settings import (
     CHAT_SORT_OPTIONS,
     CONVERSATION_STYLE_OPTIONS,
+    EMBEDDING_DOWNLOAD,
     MODEL_DOWNLOADS,
     MODEL_RECOMMENDATIONS,
     VISION_DOWNLOADS,
@@ -2687,7 +2692,8 @@ class ChatWindow(Adw.ApplicationWindow):
             (
                 "Wikipedia knowledge packs",
                 "Adapted from Wikipedia contributors · "
-                '<a href="https://creativecommons.org/licenses/by-sa/4.0/">CC BY-SA 4.0 License</a>'
+                '<a href="https://creativecommons.org/licenses/by-sa/4.0/"'
+                ">CC BY-SA 4.0 License</a>",
             ),
             (
                 "llama.cpp llama-server",
@@ -2726,7 +2732,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.refresh_model_configuration()
 
     def update_model_download(self, stage, server, percent):
-        if stage == "vision" and percent is None:
+        if stage in ("vision", "embedding") and percent is None:
             self._model_download.pop(stage, None)
         else:
             self._model_download[stage] = server, percent
@@ -2743,7 +2749,8 @@ class ChatWindow(Adw.ApplicationWindow):
             "This may take a few minutes depending on your internet connection. Or go to "
             "Settings → Model → Advanced to manually configure.\n\n"
             f"Recommended model: {model.name} ({model.quantization}), "
-            f"about {model.size / 10**9:.1f} GB.",
+            f"about {model.size / 10**9:.1f} GB. "
+            f"The embedding model adds up to {EMBEDDING_DOWNLOAD.size / 10**9:.2f} GB.",
         )
         alert.add_response("cancel", "Cancel")
         alert.add_response("yes", "Yes")
@@ -2862,6 +2869,47 @@ class ChatWindow(Adw.ApplicationWindow):
                 indicator, "Downloading", in_progress, percent if key == downloading else None
             )
         self._refresh_vision_rows(config, rule, external)
+        self._refresh_embedding_row(folder)
+
+    def _refresh_embedding_row(self, folder):
+        filename = self._model_path_rows["embedding_path"][0].get_text()
+        active = self.controller.embedding_download_active
+        _, percent = self._model_download.get("embedding", (None, None))
+        self._embedding_parameters.set_visible(bool(filename.strip()))
+        selected = Path(filename)
+        with suppress(RuntimeError):
+            selected = selected.expanduser()
+        config = self.controller.store.load_app_settings().get("embedding_model", {})
+        row, download, switch, remove, indicator, handler = self._embedding_row
+        installed = embedding_path(folder).is_file()
+        available = selected.is_file()
+        if installed or available:
+            row.remove_css_class("dim-label")
+        else:
+            row.add_css_class("dim-label")
+        download.set_visible(not installed)
+        download.set_sensitive(not active)
+        remove.set_visible(installed)
+        remove.set_sensitive(not active)
+        switch.set_sensitive((installed or available) and not active)
+        with switch.handler_block(handler):
+            switch.set_active(available and config.get("enabled", True))
+        self._update_download_indicator(indicator, "Downloading", active, percent)
+
+    def _embedding_choice(self):
+        group = Adw.PreferencesGroup(title="Embedding")
+        group.add_css_class("model-settings-summary")
+        asset = EMBEDDING_DOWNLOAD
+        row = Adw.ActionRow(title=asset.name, subtitle=asset.quantization, use_markup=False)
+        self._embedding_row = self._model_row_controls(
+            row,
+            "Embedding Model",
+            self.controller.download_embedding,
+            self.controller.select_embedding,
+            lambda: self._confirm_model_removal(asset.name, self.controller.delete_embedding),
+        )
+        group.add(row)
+        return group
 
     def _refresh_vision_rows(self, config, rule, external):
         folder = self.controller.store.root.parent
@@ -2874,12 +2922,33 @@ class ChatWindow(Adw.ApplicationWindow):
             "vision_precision", self.controller._recommended_vision_precision
         )
         downloading, percent = self._model_download.get("vision", (None, None))
-        self._vision_group.set_visible(bool(families & VISION_DOWNLOADS.keys() or selected))
+        explicit = self.controller.vision_download_active
+        busy = self.controller.vision_file_jobs_busy()
         model_available = bool(selected and Path(config["model"]).expanduser().is_file())
-        for family, (row, switch, indicator, handler) in self._vision_rows.items():
-            row.set_visible(family in families or family == selected)
+        visible = False
+        for family, (
+            row,
+            download,
+            switch,
+            remove,
+            indicator,
+            handler,
+        ) in self._vision_rows.items():
+            installed = [
+                variant
+                for variant in VISION_DOWNLOADS[family]
+                if vision_path(folder, family, variant).is_file()
+            ]
+            row_visible = bool(family in families or family == selected or installed)
+            row.set_visible(row_visible)
+            visible |= row_visible
             compatible = family == selected and not external and model_available
-            switch.set_sensitive(compatible and not self.controller.model_server.busy)
+            custom = bool(compatible and projector and not managed_vision_file(folder, projector))
+            switch.set_sensitive(compatible and not busy and bool(installed or custom))
+            download.set_visible(not installed)
+            download.set_sensitive(not busy)
+            remove.set_visible(bool(installed))
+            remove.set_sensitive(not busy)
             if compatible:
                 row.remove_css_class("dim-label")
             else:
@@ -2892,22 +2961,21 @@ class ChatWindow(Adw.ApplicationWindow):
             )
             with switch.handler_block(handler):
                 switch.set_active(enabled)
-            in_progress = downloading is not None and downloading[0] == family
-            precision = downloading[1] if in_progress else default_precision
-            if compatible and projector and not managed_vision_file(folder, projector):
+            job = downloading or explicit
+            in_progress = job is not None and job[0] == family
+            precision = job[1] if in_progress else default_precision
+            if custom:
                 precision = "Custom file"
-            elif not in_progress and projector != str(vision_path(folder, family, precision)):
-                # If this family is already downloaded, show its available precision.
-                precision = next(
-                    (
-                        variant
-                        for variant in (precision, "FP16", "BF16")
-                        if vision_path(folder, family, variant).is_file()
-                    ),
-                    precision,
+            elif not in_progress:
+                chosen = vision_file_precision(folder, family, projector) if compatible else None
+                precision = chosen or (
+                    installed[0] if installed and precision not in installed else precision
                 )
             row.set_subtitle(precision)
-            self._update_download_indicator(indicator, "Downloading", in_progress, percent)
+            self._update_download_indicator(
+                indicator, "Downloading", in_progress, percent if job == downloading else None
+            )
+        self._vision_group.set_visible(visible)
 
     def _vision_choices(self):
         self._vision_group = Adw.PreferencesGroup(title="Vision")
@@ -2915,92 +2983,97 @@ class ChatWindow(Adw.ApplicationWindow):
         self._vision_rows = {}
         for family in reversed(VISION_DOWNLOADS):
             row = Adw.ActionRow(title=f"Qwen {family} Vision", use_markup=False)
-            row.add_css_class("knowledge-packs-row")
-            indicator = add_operation_indicator(row, visible=False)
-            switch = Gtk.Switch(valign=Gtk.Align.CENTER)
-            switch.add_css_class("knowledge-packs-switch")
-            handler = switch.connect(
-                "notify::active",
-                lambda button, _, family=family: self.controller.select_vision(
-                    family, button.get_active()
+            self._vision_rows[family] = self._model_row_controls(
+                row,
+                "Vision Files",
+                lambda family=family: self.controller.download_vision(family),
+                lambda active, family=family: self.controller.select_vision(family, active),
+                lambda family=family: self._confirm_model_removal(
+                    f"the downloaded Qwen {family} Vision files",
+                    lambda: self.controller.delete_vision(family),
                 ),
             )
-            row.add_suffix(switch)
             self._vision_group.add(row)
-            self._vision_rows[family] = row, switch, indicator, handler
         return self._vision_group
+
+    @staticmethod
+    def _model_row_controls(row, label, on_download, on_select, on_remove):
+        row.add_css_class("knowledge-packs-row")
+        indicator = add_operation_indicator(row, visible=False)
+        download = Gtk.Button(
+            icon_name="list-add-symbolic", valign=Gtk.Align.CENTER, tooltip_text=f"Download {label}"
+        )
+        download.add_css_class("knowledge-packs-button")
+        switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        switch.add_css_class("knowledge-packs-switch")
+        remove = Gtk.Button(
+            icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER, tooltip_text=f"Remove {label}"
+        )
+        remove.add_css_class("knowledge-packs-remove")
+        for widget in (switch, download, remove):
+            row.add_suffix(widget)
+        download.connect("clicked", lambda *_: on_download())
+        remove.connect("clicked", lambda *_: on_remove())
+        handler = switch.connect("notify::active", lambda button, _: on_select(button.get_active()))
+        return row, download, switch, remove, indicator, handler
 
     def _model_choices(self):
         group = Adw.PreferencesGroup(title="Configured Model")
         group.add_css_class("model-settings-summary")
         self._model_rows = {}
+
+        def model_key(role):
+            downloaded_server, _ = self._model_download.get("server", (None, None))
+            profile = (downloaded_server or {}).get(
+                "recommendation"
+            ) or self.controller.model_recommendation()
+            return getattr(MODEL_RECOMMENDATIONS[profile], role)
+
         for role in ("balanced", "faster", "better"):
             row = Adw.ActionRow(title=role.title(), use_markup=False)
-            row.add_css_class("knowledge-packs-row")
-            indicator = add_operation_indicator(row, visible=False)
-            download = Gtk.Button(
-                icon_name="list-add-symbolic",
-                valign=Gtk.Align.CENTER,
-                tooltip_text="Download Model",
+            self._model_rows[role] = self._model_row_controls(
+                row,
+                "Model",
+                lambda role=role: self.controller.download_model(model_key(role)),
+                lambda active, role=role: self.controller.select_model(model_key(role), active),
+                lambda role=role: self._confirm_model_delete(model_key(role)),
             )
-            download.add_css_class("knowledge-packs-button")
-            switch = Gtk.Switch(valign=Gtk.Align.CENTER)
-            switch.add_css_class("knowledge-packs-switch")
-            remove = Gtk.Button(
-                icon_name="user-trash-symbolic",
-                valign=Gtk.Align.CENTER,
-                tooltip_text="Remove Model",
-            )
-            remove.add_css_class("knowledge-packs-remove")
-
-            def model_key(role):
-                downloaded_server, _ = self._model_download.get("server", (None, None))
-                profile = (downloaded_server or {}).get(
-                    "recommendation"
-                ) or self.controller.model_recommendation()
-                return getattr(MODEL_RECOMMENDATIONS[profile], role)
-
-            download.connect(
-                "clicked", lambda _, role=role: self.controller.download_model(model_key(role))
-            )
-            handler = switch.connect(
-                "notify::active",
-                lambda button, _, role=role: self.controller.select_model(
-                    model_key(role), button.get_active()
-                ),
-            )
-            remove.connect(
-                "clicked", lambda _, role=role: self._confirm_model_delete(model_key(role))
-            )
-            row.add_suffix(switch)
-            row.add_suffix(download)
-            row.add_suffix(remove)
             group.add(row)
-            self._model_rows[role] = row, download, switch, remove, indicator, handler
         return group
 
     def _confirm_model_delete(self, key):
         asset = MODEL_DOWNLOADS[key]
+        self._confirm_model_removal(
+            f"{asset.name} ({asset.quantization})", lambda: self.controller.delete_model(key)
+        )
+
+    def _confirm_model_removal(self, name, remove):
         alert = Adw.AlertDialog(
             heading="Remove model?",
-            body=f"Remove {asset.name} ({asset.quantization}) from this computer?",
+            body=f"Remove {name} from this computer?",
         )
         alert.add_response("cancel", "Cancel")
         alert.add_response("delete", "Remove")
         alert.set_default_response("cancel")
         alert.set_close_response("cancel")
         alert.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
-        alert.connect("response::delete", lambda *_: self.controller.delete_model(key))
+        alert.connect("response::delete", lambda *_: remove())
         alert.present(self)
 
     def _model_settings_page(self):
         page = Adw.PreferencesPage(name="model", title="Model", icon_name="network-server-symbolic")
         page.add_css_class("model-settings-page")
         page.connect("map", self._sync_native_scroll)
-        config = dict(self.controller.store.load_app_settings().get("model_server", {}))
+        settings = self.controller.store.load_app_settings()
+        config = dict(settings.get("model_server", {}))
+        embedding = settings.get("embedding_model", {})
 
         def save(key, value):
             try:
+                if key == "embedding_path":
+                    self.controller.set_embedding_setting("path", value)
+                    self.refresh_model_configuration()
+                    return
                 current = self.controller.store.load_app_settings().get("model_server", {})
                 folder = self.controller.store.root.parent
                 if key == "executable" and value != current.get(key):
@@ -3017,6 +3090,8 @@ class ChatWindow(Adw.ApplicationWindow):
                 )
                 if clear_vision:
                     current["mmproj"] = ""
+                if key == "mmproj" or clear_vision:
+                    current["mmproj_manual"] = key == "mmproj" and bool(value)
                 self.controller.set_model_server_config({**current, key: value})
                 if clear_vision:
                     self.update_model_paths({"mmproj": ""})
@@ -3041,6 +3116,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._configured_server.connect("activated", lambda *_: self.confirm_model_download())
         page.add(self._model_choices())
         page.add(self._vision_choices())
+        page.add(self._embedding_choice())
         page.connect("map", lambda *_: self.refresh_model_configuration())
 
         advanced_group = Adw.PreferencesGroup()
@@ -3064,8 +3140,10 @@ class ChatWindow(Adw.ApplicationWindow):
             ("executable", "llama-server executable"),
             ("model", "Model file"),
             ("mmproj", "Vision file"),
+            ("embedding_path", "Embedding model file"),
         ):
-            row = Adw.EntryRow(title=title, text=config.get(key, ""))
+            value = embedding.get("path", "") if key == "embedding_path" else config.get(key, "")
+            row = Adw.EntryRow(title=title, text=value)
             row.add_css_class("model-settings-row")
             handler = row.connect(
                 "notify::text", lambda entry, _pspec, key=key: save(key, entry.get_text())
@@ -3149,26 +3227,11 @@ class ChatWindow(Adw.ApplicationWindow):
         )
         extra.add_css_class("model-settings-extra")
         advanced_content.append(extra)
-        text = Gtk.TextView(
-            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+        extra.add(
+            self._launch_parameters_box(config.get("extra", ""), lambda value: save("extra", value))
         )
-        text.add_css_class("model-settings-text")
-        text.add_css_class("prompt-view")
-        text.get_buffer().set_text(config.get("extra", ""))
-        text.get_buffer().connect(
-            "changed", lambda buffer: save("extra", buffer.get_text(*buffer.get_bounds(), False))
-        )
-        scroll = Gtk.ScrolledWindow(
-            min_content_height=95, max_content_height=200, propagate_natural_height=True, child=text
-        )
-        scroll.add_css_class("model-settings-scroll")
-        frame = Gtk.Frame(child=scroll)
-        frame.add_css_class("model-settings-frame")
-        frame.add_css_class("composer-frame")
-        extra.add(frame)
         actions = Adw.PreferencesGroup()
         actions.add_css_class("model-settings-actions")
-        advanced_content.append(actions)
         self._model_server_status = Gtk.Label(
             label=self.controller.model_server.status, wrap=True, xalign=0
         )
@@ -3184,8 +3247,42 @@ class ChatWindow(Adw.ApplicationWindow):
             "clicked", lambda *_: self.controller.connect_model_server()
         )
         actions.add(self._model_connect_button)
+        self._embedding_parameters = Adw.PreferencesGroup(title="Embedding Launch Parameters")
+        self._embedding_parameters.add_css_class("model-settings-extra")
+
+        def save_embedding_parameters(value):
+            try:
+                self.controller.set_embedding_setting("parameters", value)
+            except OSError as exc:
+                self._show_alert("Could not save settings", str(exc))
+
+        self._embedding_parameters.add(
+            self._launch_parameters_box(
+                embedding.get("parameters", embedding_launch_parameters()),
+                save_embedding_parameters,
+            )
+        )
+        advanced_content.append(self._embedding_parameters)
+        advanced_content.append(actions)
         self.refresh_model_configuration()
         return page
+
+    @staticmethod
+    def _launch_parameters_box(value, save):
+        text = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        text.add_css_class("model-settings-text")
+        text.add_css_class("prompt-view")
+        buffer = text.get_buffer()
+        buffer.set_text(value)
+        buffer.connect("changed", lambda buffer: save(buffer.get_text(*buffer.get_bounds(), False)))
+        scroll = Gtk.ScrolledWindow(
+            min_content_height=95, max_content_height=200, propagate_natural_height=True, child=text
+        )
+        scroll.add_css_class("model-settings-scroll")
+        frame = Gtk.Frame(child=scroll)
+        frame.add_css_class("model-settings-frame")
+        frame.add_css_class("composer-frame")
+        return frame
 
     def _show_memories(self, settings_dialog):
         toolbar = Adw.ToolbarView()

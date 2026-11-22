@@ -17,6 +17,7 @@ from tempfile import TemporaryDirectory
 from threading import Event, Lock
 
 from settings import (
+    EMBEDDING_DOWNLOAD,
     MODEL_DOWNLOADS,
     MODEL_FREE_VRAM_DISCOUNT_GIB,
     MODEL_RECOMMENDATIONS,
@@ -272,11 +273,16 @@ def detect_recommendation(backend=None):
     return recommendation_for("cpu", ())
 
 
-def detect_vision_precision(config):
+def detect_vision_precision(config, *, fallback="FP16"):
     """Use BF16 only for backends with a known native BF16 path."""
     backend = config.get("backend")
-    if not backend and not config.get("executable") and (arch := _server_arch()):
-        backend, _ = next(_candidates(arch))
+    if not backend:
+        if executable := config.get("executable"):
+            backend = _custom_server_backend(executable)
+        elif arch := _server_arch():
+            backend, _ = next(_candidates(arch))
+    if not backend:
+        return fallback
     if backend == "cpu":
         with suppress(OSError):
             flags = re.findall(
@@ -387,19 +393,38 @@ def _install_server(server, arch, backend, stopped, on_progress=None):
     return executable
 
 
-def _server_info(executable, option):
+def _server_info(executable, option, *, timeout=20):
     result = subprocess.run(
         [str(executable), option],
         cwd=executable.parent,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        timeout=20,
+        timeout=timeout,
         text=True,
         errors="replace",
     )
     if result.returncode:
         raise RuntimeError(result.stdout.strip()[-2000:] or f"llama-server {option} failed.")
     return result.stdout
+
+
+def _custom_server_backend(filename):
+    try:
+        executable = Path(filename).expanduser().resolve()
+        output = _server_info(executable, "--list-devices", timeout=3)
+    except OSError, RuntimeError, subprocess.TimeoutExpired:
+        return None
+    _, header, devices = output.partition("Available devices:")
+    if not header:
+        return None
+    names = [identifier for identifier, *_ in _DEVICE_LINE.findall(devices)]
+    if names and all(name.startswith("CUDA") for name in names):
+        return "cuda"
+    if names and all(name.startswith("Vulkan") for name in names):
+        return "vulkan"
+    if devices.strip() == "(none)":
+        return "cpu"
+    return None
 
 
 def _verify_devices(executable, backend, names):
@@ -480,24 +505,53 @@ def vision_path(folder, family, precision):
     return folder / "models" / f"qwen{family}-mmproj-{precision}.gguf"
 
 
+def vision_file_precision(folder, family, filename):
+    if filename:
+        path = Path(filename).expanduser()
+        for precision in VISION_DOWNLOADS[family]:
+            if path == vision_path(folder, family, precision):
+                return precision
+    return None
+
+
+def embedding_path(folder):
+    return folder / "models" / EMBEDDING_DOWNLOAD.filename
+
+
 def managed_vision_file(folder, filename):
-    path = Path(filename or ".").expanduser()
-    return any(
-        path == vision_path(folder, family, precision)
-        for family, variants in VISION_DOWNLOADS.items()
-        for precision in variants
-    )
+    return any(vision_file_precision(folder, family, filename) for family in VISION_DOWNLOADS)
 
 
 def install_model(folder, key, stopped, on_progress):
     asset = MODEL_DOWNLOADS[key]
-    model = model_path(folder, key)
+    return _install_model_asset(folder, asset, stopped, on_progress, "model", key)
+
+
+def install_embedding(folder, stopped, on_progress):
+    return _install_model_asset(folder, EMBEDDING_DOWNLOAD, stopped, on_progress, "embedding", None)
+
+
+def embedding_launch_parameters():
+    # Respect CPU affinity and leave capacity for the chat server and the UI.
+    try:
+        available = len(os.sched_getaffinity(0))
+    except AttributeError, OSError:
+        available = os.cpu_count() or 1
+    threads = max(1, min(10, available - 2))
+    return (
+        "--embedding --pooling last --device none --n-gpu-layers 0 "
+        f"--ctx-size 4096 --parallel 1 --threads {threads} --threads-batch {threads}"
+    )
+
+
+def _install_model_asset(folder, asset, stopped, on_progress, stage, item):
+    model = folder / "models" / asset.filename
     expected = {"size": asset.size, "sha256": asset.sha256, "stopped": stopped}
     if model.exists():
         if not matches_download(model, **expected):
             raise ValueError(f"The file at {model} differs from the default model.")
     else:
-        _download_gguf(model, asset.url, expected, on_progress, "model", key)
+        _download_gguf(model, asset.url, expected, on_progress, stage, item)
     return model
 
 
