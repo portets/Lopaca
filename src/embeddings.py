@@ -1,6 +1,7 @@
 """Local embedding inference and bounded in-memory recall."""
 
 import base64
+import hashlib
 import json
 import logging
 import math
@@ -9,15 +10,20 @@ import socket
 import struct
 import subprocess
 import threading
+import time
 from contextlib import suppress
 from http.client import HTTPConnection, HTTPException
 from pathlib import Path
 
+import thinking_classifier
 from model_server import ModelServer
 from server_builds import embedding_launch_parameters
 from settings import EMBEDDING_QUERY_INSTRUCTION
 
 _QUERY = f"Instruct: {EMBEDDING_QUERY_INSTRUCTION}\nQuery: "
+_THINKING_TIMEOUT = 0.3
+_THINKING_TIMEOUT_LIMIT = 2
+_THINKING_COOLDOWN = 60.0
 
 
 class RecallEmbeddings:
@@ -28,20 +34,35 @@ class RecallEmbeddings:
         self._session = None
         self._closed = False
 
-    def prepare(self, executable, filename, parameters, texts, *, group="memories"):
+    def prepare(self, executable, filename, parameters, texts, *, group="memories", defer=None):
         with self._lock:
-            if self._closed:
-                return None
             config = (executable, filename, parameters) if executable and filename else None
-            session = self._session
-            if session and session.config != config:
-                session.close()
-                self._session = session = None
-            if config and (texts or session):
-                if session is None:
-                    self._session = session = _EmbeddingSession(config)
-                session.warm(group, texts)
+            session = self._session_for(config, create=bool(texts))
+            if session:
+                if defer is None:
+                    session.warm(group, texts)
+                else:
+                    defer(lambda: session.warm(group, texts))
                 return session.match
+        return None
+
+    def _session_for(self, config, *, create):
+        if self._closed:
+            return None
+        if self._session and self._session.config != config:
+            self._session.close()
+            self._session = None
+        if self._session is None and config and create:
+            self._session = _EmbeddingSession(config)
+        return self._session
+
+    def thinking_vector(self, config, query):
+        with self._lock:
+            session = self._session_for(config, create=True)
+        if session:
+            session.warm("auto", (), start=True)
+            if session.classifier_ready:
+                return session.query_vector(query, for_thinking=True)
         return None
 
     def close(self):
@@ -64,6 +85,9 @@ class _EmbeddingSession:
         self._groups = {}
         self._last_query = None
         self._failed = False
+        self.classifier_ready = False
+        self._thinking_timeouts = 0
+        self._thinking_retry_at = 0.0
 
     def close(self):
         with self._lock:
@@ -78,7 +102,7 @@ class _EmbeddingSession:
                     target=ModelServer._stop_process, args=(process,), daemon=True
                 ).start()
 
-    def warm(self, group, texts):
+    def warm(self, group, texts, *, start=False):
         with self._lock:
             if self._failed or self._stopped.is_set():
                 return
@@ -88,12 +112,14 @@ class _EmbeddingSession:
                 self._process = None
             self._vectors = {text: v for text, v in self._vectors.items() if text in wanted}
             if not self._worker and (
-                wanted.difference(self._vectors) or (wanted and not self._process)
+                wanted.difference(self._vectors) or ((wanted or start) and not self._process)
             ):
                 self._worker = threading.Thread(target=self._prepare, daemon=True)
                 self._worker.start()
 
     def _start(self):
+        self.classifier_ready = False
+        self._last_query = None
         executable, filename, parameters = self.config
         executable = Path(executable).expanduser().resolve()
         model = Path(filename).expanduser().resolve()
@@ -140,8 +166,33 @@ class _EmbeddingSession:
                 break
             with suppress(OSError, HTTPException, ValueError):
                 if self._request("/health", timeout=0.2).get("status") == "ok":
-                    return
-        raise RuntimeError("The local embedding server did not become ready.")
+                    break
+        else:
+            raise RuntimeError("The local embedding server did not become ready.")
+        if self._process.poll() is not None:
+            raise RuntimeError("The local embedding server exited before it became ready.")
+        self.classifier_ready = self._supports_thinking_classifier(model, extra)
+
+    @staticmethod
+    def _supports_thinking_classifier(model, args):
+        if EMBEDDING_QUERY_INSTRUCTION != thinking_classifier.QUERY_INSTRUCTION:
+            return False
+        for index, arg in enumerate(args):
+            flag, equals, value = arg.partition("=")
+            if flag == "--override-kv":
+                return False
+            if flag == "--pooling":
+                pooling = [value] if equals else args[index + 1 : index + 2]
+                if pooling != ["last"]:
+                    return False
+        with suppress(OSError):
+            if model.stat().st_size == thinking_classifier.MODEL_SIZE:
+                with model.open("rb") as file:
+                    return (
+                        hashlib.file_digest(file, "sha256").hexdigest()
+                        == thinking_classifier.MODEL_SHA256
+                    )
+        return False
 
     def _request(self, endpoint, payload=None, *, timeout):
         if self._stopped.is_set():
@@ -213,7 +264,7 @@ class _EmbeddingSession:
                     self._failed = True
                 self.close()
 
-    def match(self, query, choices, *, minimum):
+    def match(self, query, choices, *, minimum, rerank_margin=None):
         if self._stopped.is_set() or not query.strip():
             return None
         with self._lock:
@@ -222,19 +273,43 @@ class _EmbeddingSession:
             ]
         if not candidates:
             return None
+        if rerank_margin is not None and (len(candidates) < 2 or candidates[0][0] != choices[0][0]):
+            return None  # Compare against the keyword winner only when its vector is ready.
+        vector = self.query_vector(query)
+        if vector is None:
+            return None
+        scores = [(key, math.sumprod(vector, value)) for key, value in candidates]
+        key, score = max(scores, key=lambda item: item[1])
+        if rerank_margin is not None:
+            minimum = max(minimum, scores[0][1] + rerank_margin)
+        return key if score >= minimum else None
+
+    def query_vector(self, query, *, for_thinking=False):
+        if self._stopped.is_set() or not query.strip():
+            return None
         query = _QUERY + query.strip()[-1500:]
         cached = self._last_query
         if cached is not None and cached[0] == query:
-            vector = cached[1]
-        else:
-            if not self._inference.acquire(blocking=False):
+            return cached[1]
+        if not self._inference.acquire(blocking=False):
+            return None
+        try:
+            if for_thinking and time.monotonic() < self._thinking_retry_at:
                 return None
-            try:
-                (vector,) = self._embed([query], timeout=0.2)
-                self._last_query = query, vector
-            except OSError, HTTPException, KeyError, TypeError, ValueError:
-                return None
-            finally:
-                self._inference.release()
-        key, value = max(candidates, key=lambda item: math.sumprod(vector, item[1]))
-        return key if math.sumprod(vector, value) >= minimum else None
+            (vector,) = self._embed([query], timeout=_THINKING_TIMEOUT if for_thinking else 0.2)
+            self._last_query = query, vector
+            if for_thinking:
+                self._thinking_timeouts = 0
+                self._thinking_retry_at = 0.0
+            return vector
+        except TimeoutError:
+            if for_thinking:
+                self._thinking_timeouts += 1
+                # A slow retry renews the cooldown until one request succeeds.
+                if self._thinking_timeouts >= _THINKING_TIMEOUT_LIMIT:
+                    self._thinking_retry_at = time.monotonic() + _THINKING_COOLDOWN
+            return None
+        except OSError, HTTPException, KeyError, TypeError, ValueError:
+            return None
+        finally:
+            self._inference.release()

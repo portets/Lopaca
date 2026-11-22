@@ -15,6 +15,7 @@ from contextlib import suppress
 from http.client import HTTPException
 from pathlib import Path
 
+import thinking_classifier
 from agentic import (
     CODING_INSTRUCTION,
     extract_commands,
@@ -74,6 +75,9 @@ from server_builds import (
 )
 from settings import (
     CHAT_SETTING_DEFAULTS,
+    EMBEDDING_DOCUMENT_CANDIDATES,
+    EMBEDDING_DOCUMENT_MARGIN,
+    EMBEDDING_DOCUMENT_MINIMUM,
     EMBEDDING_HISTORY_MINIMUM,
     EMBEDDING_HISTORY_WITH_KEYWORD_MINIMUM,
     EMBEDDING_MEMORY_MINIMUM,
@@ -574,6 +578,25 @@ class ChatController:
                 else EMBEDDING_HISTORY_MINIMUM
             )
             return match(query, choices, minimum=minimum)
+        return None
+
+    def _rerank_documents(self, config, query, passages, *, defer=None):
+        if self.stop_requested or config != self._embedding_configuration():
+            return None
+        choices = [
+            (index, f"{reference.split(', lines ', 1)[0]}\n{body[:1000]}")
+            for index, (reference, body) in enumerate(passages[:EMBEDDING_DOCUMENT_CANDIDATES])
+        ]
+        match = self.recall_embeddings.prepare(
+            *config, [text for _, text in choices], group="documents", defer=defer
+        )
+        if match:
+            return match(
+                query,
+                choices,
+                minimum=EMBEDDING_DOCUMENT_MINIMUM,
+                rerank_margin=EMBEDDING_DOCUMENT_MARGIN,
+            )
         return None
 
     def download_embedding(self, *, automatic=False, backend=None):
@@ -1582,6 +1605,29 @@ class ChatController:
                 return
         self.view.dispatch(self.finish_response, "", "", None)
 
+    def _select_auto_thinking(self, query, history, options, embedding_config):
+        eligible = embedding_config is not None and thinking_classifier.eligible_prompt(query)
+        if eligible and not self.stop_requested:
+            with suppress(Exception):
+                vector = self.recall_embeddings.thinking_vector(embedding_config, query)
+                if (
+                    vector is not None
+                    and not self.stop_requested
+                    and (choice := thinking_classifier.classify(vector))
+                ):
+                    self.client.last_auto_choice = choice
+                    return thinking_parameters(options[choice]), "embedding"
+
+        try:
+            thinking = self.client.select_thinking(
+                query, history, options, stopped=lambda: self.stop_requested
+            )
+        except Exception:
+            # Failed selection must not prevent a reply or change auxiliary requests.
+            self.client.last_auto_choice = None
+            return thinking_parameters(options["medium"]), "default"
+        return thinking, "model"
+
     def _respond(
         self,
         messages,
@@ -1599,17 +1645,17 @@ class ChatController:
         retrieved = []
         history = messages[:-1]
         previous_queries = [item["content"] for item in history if item["role"] == "user"]
+        embedding_config = self._embedding_configuration()
         thinking_parameters_for_reply = self._generation_thinking
         if thinking_parameters_for_reply is None:
-            options = self._generation_thinking_options
-            try:
-                thinking_parameters_for_reply = self.client.select_thinking(
-                    query, history, options, stopped=lambda: self.stop_requested
-                )
-            except Exception:
-                # Failed selection must not prevent a reply or change auxiliary requests.
-                thinking_parameters_for_reply = thinking_parameters(options["medium"])
-            print("Auto thinking:", thinking_parameters_for_reply, flush=True)
+            can_classify = not (attached or images) and messages[-1]["content"] == query
+            thinking_parameters_for_reply, selector = self._select_auto_thinking(
+                query,
+                history,
+                self._generation_thinking_options,
+                embedding_config if can_classify else None,
+            )
+            print("Auto thinking:", thinking_parameters_for_reply, f"({selector})", flush=True)
         if self.stop_requested:
             self.view.dispatch(self.finish_response, "", "", None)
             return
@@ -1652,13 +1698,19 @@ class ChatController:
             return expansion
 
         expand_query = expand if query_expansion else None
-        embedding_config = self._embedding_configuration()
         semantic_history = None
+        rerank_documents = None
+        deferred_embeddings = []
         if embedding_config:
 
             def semantic_history(choices, *, local, keyword_matches):
                 return self._semantic_history_recall(
                     embedding_config, query, choices, local=local, keyword_matches=keyword_matches
+                )
+
+            def rerank_documents(search_query, passages):
+                return self._rerank_documents(
+                    embedding_config, search_query, passages, defer=deferred_embeddings.append
                 )
 
         try:
@@ -1670,6 +1722,7 @@ class ChatController:
                 stopped=lambda: self.stop_requested,
                 previous_queries=previous_queries,
                 refresh=False,
+                rerank=rerank_documents,
             )
         except Exception as exc:
             if not self.stop_requested:
@@ -1867,6 +1920,11 @@ class ChatController:
             # Reactive mid-response rolls also need their new archive before queued input.
             self._post_response_condensing = True
             self._set_context_processing(True)
+        if not error and not self.stop_requested:
+            # Cold document candidates can wait until streaming and follow-up model work finish.
+            for warm in deferred_embeddings:
+                with suppress(RuntimeError):
+                    warm()
         clarification = clarification and memories_enabled()
         self.view.dispatch(
             self.finish_response,

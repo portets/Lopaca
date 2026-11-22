@@ -1695,7 +1695,15 @@ def _retrieval_query(query, previous_queries):
 
 
 def retrieve(
-    query, folder, settings, expand=None, stopped=lambda: False, previous_queries=(), refresh=True
+    query,
+    folder,
+    settings,
+    expand=None,
+    stopped=lambda: False,
+    previous_queries=(),
+    refresh=True,
+    *,
+    rerank=None,
 ):
     """Retrieve passages; background-indexed callers can skip the folder scan."""
     query = _retrieval_query(query, previous_queries)
@@ -1736,7 +1744,22 @@ def retrieve(
             if section:
                 reference += f", section: {section}"
             retrieved.append((reference, body))
-        return retrieved
+    # Filenames, quoted phrases and code-like tokens already have precise lexical matching.
+    if (
+        rerank
+        and len(retrieved) > 1
+        and not stopped()
+        and not re.search(r'[`"]', search_query)
+        and not any(
+            re.search(r"[_./:+#\d]|[a-z][A-Z]", term) for term in _TERM.findall(search_query)
+        )
+    ):
+        with suppress(Exception):
+            if (winner := rerank(search_query, retrieved)) is not None and 0 < winner < len(
+                retrieved
+            ):
+                retrieved.insert(0, retrieved.pop(winner))
+    return retrieved
 
 
 def format_context(retrieved, max_chars):
