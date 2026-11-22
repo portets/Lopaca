@@ -12,6 +12,7 @@ import uuid
 from collections import deque
 from concurrent.futures import Future, wait
 from contextlib import suppress
+from http.client import HTTPException
 from pathlib import Path
 
 from agentic import (
@@ -51,8 +52,20 @@ from rag import (
     read_document,
     retrieve,
 )
-from server_builds import default_model_configs, default_model_download_path, default_model_path
-from settings import CHAT_SETTING_DEFAULTS, Settings
+from server_builds import (
+    cached_server_config,
+    default_model_configs,
+    detect_recommendation,
+    detect_vision_precision,
+    install_model,
+    install_vision,
+    managed_vision_file,
+    model_download_path,
+    model_path,
+    model_vision_family,
+    vision_path,
+)
+from settings import CHAT_SETTING_DEFAULTS, MODEL_DOWNLOADS, MODEL_RECOMMENDATIONS, Settings
 from storage import ChatStore, MemoryStore
 
 
@@ -148,6 +161,10 @@ class ChatController:
         self.connected = None
         self.was_connected = False
         self._reported_server_version = None
+        self._recommended_profile = None
+        self._recommended_vision_precision = "FP16"
+        self.model_file_download = None
+        self._model_file_stop = threading.Event()
         self._connection_wakeup = threading.Event()
         self.model_server = ModelServer(
             settings.server_url,
@@ -174,17 +191,49 @@ class ChatController:
         self.open_chat(active_chat)
         config = app_settings.get("model_server", {})
         folder = self.store.root.parent
-        model = default_model_path(folder)
-        configured_model = config.get("model")
+        configured_model = Path(config.get("model") or ".").expanduser()
+        pending = app_settings.get("pending_model_download")
+        if pending not in MODEL_DOWNLOADS:
+            pending = None
+        threading.Thread(
+            target=lambda: self.view.dispatch(
+                self._set_model_recommendation,
+                detect_recommendation(config.get("backend")),
+                detect_vision_precision(config),
+            ),
+            daemon=True,
+        ).start()
+        partials = [
+            key
+            for key in MODEL_DOWNLOADS
+            if key != pending
+            and model_download_path(folder, key).is_file()
+            and (not config.get("model") or configured_model == model_path(folder, key))
+        ]
         if (
-            default_model_download_path(folder).is_file()
-            and not model.is_file()
-            and (not configured_model or Path(configured_model).expanduser() == model)
+            partials
+            and not pending
+            and config.get("model") != ""
+            and not configured_model.is_file()
             and (not config.get("executable") or config.get("backend"))
         ):
-            self._connect_default_model(config)
+            self._connect_default_model(config, partials[0] if len(partials) == 1 else None)
         else:
-            self.model_server.connect(config, startup=True)
+            self._connect_configured_model(config, startup=True)
+            if pending:
+                self.download_model(pending)
+
+    def _set_model_recommendation(self, profile, vision_precision):
+        self._recommended_profile = profile
+        self._recommended_vision_precision = vision_precision
+        self.view.refresh_model_configuration()
+
+    def model_recommendation(self):
+        config = self.model_configuration() or {}
+        for profile in (config.get("recommendation"), self._recommended_profile):
+            if profile in MODEL_RECOMMENDATIONS:
+                return profile
+        return next(reversed(MODEL_RECOMMENDATIONS))
 
     def set_model_server_config(self, config):
         settings = self.store.load_app_settings()
@@ -208,27 +257,254 @@ class ChatController:
         if self.busy or self._model_lock.locked():
             self.view._show_alert("Model is busy", "Wait for the current model request to finish.")
             return
-        self.model_server.connect(self.store.load_app_settings().get("model_server", {}))
+        self._connect_configured_model(self.store.load_app_settings().get("model_server", {}))
+
+    def _connect_configured_model(self, config, *, startup=False):
+        self.model_server.connect(
+            config,
+            startup=startup,
+            prepare_config=self._prepare_model_vision,
+            on_config=lambda paths: self.view.dispatch(self._save_vision_settings, config, paths),
+        )
 
     def download_default_model(self):
-        if self.connected or self.busy or self.model_server.busy:
+        if self.connected or self.busy or self.model_server.busy or self.model_file_download:
             return
         self._connect_default_model(self.store.load_app_settings().get("model_server", {}))
 
-    def _connect_default_model(self, config):
+    def _connect_default_model(self, config, model_key=None, *, installed=False):
         self.model_server.connect(
-            config,
+            {**config, "mmproj": ""},
             prepare=lambda stopped: default_model_configs(
                 self.store.root.parent,
                 stopped,
-                lambda stage, server, percent: self.view.dispatch(
-                    self.view.update_model_download, stage, server, percent
-                ),
+                self._model_download_progress,
+                model_key=model_key,
+                installed=installed,
             ),
-            on_config=lambda paths: self.view.dispatch(self._save_downloaded_model, paths),
+            prepare_config=self._prepare_model_vision,
+            on_config=lambda paths: self.view.dispatch(
+                self._save_downloaded_model,
+                {
+                    key: paths[key]
+                    for key in (
+                        "executable",
+                        "model",
+                        "backend",
+                        "devices",
+                        "version",
+                        "recommendation",
+                        "mmproj",
+                        "vision_precision",
+                    )
+                    if key in paths
+                },
+            ),
         )
 
+    def _model_download_progress(self, stage, item, percent):
+        self.view.dispatch(self.view.update_model_download, stage, item, percent)
+
+    def _prepare_model_vision(self, config, stopped, *, strict=False):
+        folder = self.store.root.parent
+        model = config.get("model")
+        family = model_vision_family(folder, model)
+        if not family or not Path(model).expanduser().is_file():
+            return config
+        precision = detect_vision_precision(config)
+        selected = {**config, "vision_family": family, "vision_precision": precision}
+        projector = config.get("mmproj")
+        if projector and not managed_vision_file(folder, projector):
+            return selected
+        path = vision_path(folder, family, precision)
+        if family not in config.get("vision_disabled", ()):
+            try:
+                path = install_vision(
+                    folder, family, precision, stopped, self._model_download_progress
+                )
+            except InterruptedError:
+                raise
+            except (OSError, ValueError, HTTPException) as exc:
+                if strict:
+                    raise
+                self.view.dispatch(self.view._show_alert, "Vision download failed", str(exc))
+                return {**selected, "mmproj": ""}
+        return {**selected, "mmproj": str(path) if path.is_file() else ""}
+
+    def _save_vision_settings(self, original, paths, update_preference=False):
+        config = self.store.load_app_settings().get("model_server", {})
+        changes = {}
+        if config.get("model") == original.get("model") and config.get("mmproj") == original.get(
+            "mmproj"
+        ):
+            changes = {key: paths[key] for key in ("mmproj", "vision_precision") if key in paths}
+        if update_preference:
+            changes["vision_disabled"] = paths["vision_disabled"]
+        if any(config.get(key) != value for key, value in changes.items()):
+            self._save_downloaded_model(changes)
+
+    def select_vision(self, family, active):
+        config = self.model_configuration()
+        if (
+            not config
+            or family != model_vision_family(self.store.root.parent, config.get("model"))
+            or self._model_selection_busy()
+        ):
+            self.view.refresh_model_configuration()
+            return
+        saved = self.store.load_app_settings().get("model_server", {})
+        disabled = set(saved.get("vision_disabled", ()))
+        if active:
+            disabled.discard(family)
+        else:
+            disabled.add(family)
+        self.model_server.connect(
+            {**config, "vision_disabled": sorted(disabled)},
+            prepare_config=lambda config, stopped: self._prepare_model_vision(
+                config, stopped, strict=True
+            ),
+            on_config=lambda paths: self.view.dispatch(
+                self._save_vision_settings,
+                config,
+                paths,
+                True,
+            ),
+        )
+        self.view.refresh_model_configuration()
+
+    def download_model(self, key):
+        if key not in MODEL_DOWNLOADS or self.model_file_download or self._model_file_stop.is_set():
+            return
+        settings = self.store.load_app_settings()
+        settings["pending_model_download"] = key
+        try:
+            self.store.save_app_settings(settings)
+        except OSError as exc:
+            self.view._show_alert("Could not start model download", str(exc))
+            return
+        self.model_file_download = key
+        self.view.refresh_model_configuration()
+        server = settings.get("model_server", {})
+
+        def download():
+            error = None
+            failure_title = "Model download failed"
+            folder = self.store.root.parent
+            stopped = self._model_file_stop.is_set
+            try:
+                if not model_path(folder, key).is_file():
+                    install_model(folder, key, stopped, self._model_download_progress)
+                self._model_download_progress("model", key, None)
+                family = MODEL_DOWNLOADS[key].vision_family
+                if family and family not in server.get("vision_disabled", ()):
+                    failure_title = "Vision download failed"
+                    hardware = server or cached_server_config(folder) or {}
+                    precision = detect_vision_precision(hardware)
+                    install_vision(
+                        folder, family, precision, stopped, self._model_download_progress
+                    )
+            except (OSError, ValueError, HTTPException) as exc:
+                error = str(exc)
+            if not self._model_file_stop.is_set():
+                self.view.dispatch(self._finish_model_download, key, failure_title, error)
+
+        threading.Thread(target=download, daemon=True).start()
+
+    def _finish_model_download(self, key, failure_title, error):
+        self.model_file_download = None
+        self.view.update_model_download("model", key, None)
+        settings = self.store.load_app_settings()
+        settings.pop("pending_model_download", None)
+        try:
+            self.store.save_app_settings(settings)
+        except OSError as exc:
+            self.view._show_alert("Could not save model settings", str(exc))
+        if error:
+            self.view._show_alert(failure_title, error)
+
+    def _model_selection_busy(self):
+        self.cancel_chat_warm()
+        if self.busy or self.model_server.busy or self._model_lock.locked():
+            self.view._show_alert("Model is busy", "Wait for the current model request to finish.")
+            return True
+        return False
+
+    def select_model(self, key, active):
+        config = self.model_configuration()
+        if config is None or self._model_selection_busy():
+            self.view.refresh_model_configuration()
+            return
+        saved = self.store.load_app_settings().get("model_server", {})
+        path = model_path(self.store.root.parent, key)
+        if not active:
+            if Path(config.get("model") or ".").expanduser() == path:
+                self._unload_model(saved)
+            return
+        if not path.is_file():
+            self.view.refresh_model_configuration()
+            return
+        if Path(config.get("executable") or ".").expanduser().is_file():
+            selected = {**saved, "model": str(path)}
+            family = MODEL_DOWNLOADS[key].vision_family
+            if str(path) != saved.get("model") and (
+                not family
+                or family != model_vision_family(self.store.root.parent, saved.get("model"))
+            ):
+                selected["mmproj"] = ""
+            self.model_server.connect(
+                selected,
+                prepare_config=self._prepare_model_vision,
+                on_config=lambda paths: self.view.dispatch(self._save_downloaded_model, paths),
+            )
+        else:
+            self._connect_default_model(saved, key, installed=True)
+        self.view.refresh_model_configuration()
+
+    def _unload_model(self, config, *, delete=None):
+        def unloaded():
+            try:
+                paths = {**config, "model": "", "mmproj": ""}
+                self.set_model_server_config(paths)
+                if delete:
+                    self._remove_model_files(delete)
+                self.view.update_model_paths(paths)
+            except OSError as exc:
+                self.view._show_alert("Could not unload model", str(exc))
+
+        if self.model_server.running_config is None:
+            unloaded()
+        else:
+            self.model_server.disconnect(lambda: self.view.dispatch(unloaded))
+
+    def delete_model(self, key):
+        path = model_path(self.store.root.parent, key)
+        if self.model_server.busy or self.model_file_download == key:
+            return
+        config = self.model_configuration()
+        if config is None:
+            return
+        saved = self.store.load_app_settings().get("model_server", {})
+        if Path(config.get("model") or ".").expanduser() == path:
+            if not self._model_selection_busy():
+                self._unload_model(saved, delete=key)
+            return
+        try:
+            if Path(saved.get("model") or ".").expanduser() == path:
+                paths = {**saved, "model": "", "mmproj": ""}
+                self.set_model_server_config(paths)
+                self.view.update_model_paths(paths)
+            self._remove_model_files(key)
+        except OSError as exc:
+            self.view._show_alert("Could not delete model", str(exc))
+        self.view.refresh_model_configuration()
+
+    def _remove_model_files(self, key):
+        folder = self.store.root.parent
+        model_path(folder, key).unlink(missing_ok=True)
+        model_download_path(folder, key).unlink(missing_ok=True)
+
     def _save_downloaded_model(self, paths):
+        paths = {key: value for key, value in paths.items() if key != "vision_family"}
         config = self.store.load_app_settings().get("model_server", {})
         try:
             self.set_model_server_config({**config, **paths})
@@ -697,8 +973,10 @@ class ChatController:
         text = text.strip()
         if not text and not self.has_draft_attachments():
             return False
+        if self.model_server.busy and not self.busy:
+            return False
         if not self.connected:
-            if not self.model_server.busy and not self.busy:
+            if not self.model_file_download and not self.busy:
                 self.view.confirm_model_download()
             return False
         chat_id = self.chat["id"]
@@ -837,7 +1115,12 @@ class ChatController:
         return messages
 
     def _drain_messages(self):
-        while self.connected and not self.busy and self._pending_messages:
+        while (
+            self.connected
+            and not self.busy
+            and not self.model_server.busy
+            and self._pending_messages
+        ):
             chat_id, text, steering, attachments = self._pending_messages[0]
             if not self.store.folder(chat_id).exists():
                 self._pending_messages.popleft()

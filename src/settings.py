@@ -19,6 +19,214 @@ CONVERSATION_STYLE_OPTIONS = (
 
 
 @dataclass(frozen=True)
+class ModelDownload:
+    name: str
+    publisher: str
+    quantization: str
+    repository: str
+    revision: str
+    filename: str
+    size: int
+    sha256: str
+    minimum_cuda_compute: int = 0
+    vision_family: str = ""
+
+    @property
+    def url(self):
+        return f"https://huggingface.co/{self.repository}/resolve/{self.revision}/{self.filename}"
+
+
+_UNSLOTH_9B = "unsloth/Qwen3.5-9B-GGUF"
+_UNSLOTH_9B_REVISION = "3885219b6810b007914f3a7950a8d1b469d598a5"
+_UNSLOTH_27B = "unsloth/Qwen3.8-27B-GGUF"
+_UNSLOTH_27B_REVISION = "4af51b3542f775b0a8e4b310bfb3f17e01c306c9"
+
+MODEL_DOWNLOADS = {
+# curl -L https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/raw/main/Qwen3.5-9B-UD-Q4_K_XL.gguf
+# to get size and sha256, change blob to raw in url
+    "27b-nvfp4": ModelDownload(
+        "Qwen 3.8 27B",
+        "portets",
+        "NVFP4 QAD",
+        "portets/Qwen3.8-27b-NVFP4-QAD",
+        "b420f63af95a528bc20322821b68278d945e31dd",
+        "Qwen3.8-27B-NVFP4-QAD.gguf",
+        18_993_871_040,
+        "0b3882065b71d2c0e292f45ba45bc52e4ab413b10770fdaea1bc410dd0499681",
+        minimum_cuda_compute=100,
+        vision_family="3.8",
+    ),
+    "9b-q4": ModelDownload(
+        "Qwen 3.5 9B",
+        "Unsloth",
+        "UD-Q4_K_XL",
+        _UNSLOTH_9B,
+        _UNSLOTH_9B_REVISION,
+        "Qwen3.5-9B-UD-Q4_K_XL.gguf",
+        5_966_095_584,
+        "6f5d30666c2d8ae16a306e616d95341dcf3cc46810df84d7e6f5a7d1e4c1b293",
+        vision_family="3.5",
+    ),
+    "9b-q3": ModelDownload(
+        "Qwen 3.5 9B",
+        "Unsloth",
+        "UD-Q3_K_XL",
+        _UNSLOTH_9B,
+        _UNSLOTH_9B_REVISION,
+        "Qwen3.5-9B-UD-Q3_K_XL.gguf",
+        5_053_834_464,
+        "aae0879e1be99ce93f0d56217f8185a399e25ad68a8ebbc095f362706283062f",
+        vision_family="3.5",
+    ),
+    "27b-q8": ModelDownload(
+        "Qwen 3.8 27B",
+        "Unsloth",
+        "UD-Q8_K_L",
+        _UNSLOTH_27B,
+        _UNSLOTH_27B_REVISION,
+        "Qwen3.8-27B-UD-Q8_K_L.gguf",
+        28_045_695_904,
+        "2a13bba36d2efa213f9275abc430c40e4d914b145bfde976f30f1bb5b7e23ac2",
+        vision_family="3.8",
+    ),
+    "27b-q6": ModelDownload(
+        "Qwen 3.8 27B",
+        "Unsloth",
+        "UD-Q6_K_M",
+        _UNSLOTH_27B,
+        _UNSLOTH_27B_REVISION,
+        "Qwen3.8-27B-UD-Q6_K_M.gguf",
+        23_087_180_704,
+        "3e253088108e612dac4fe845d73945234afb4e7095638711402b8317f8f65ca7",
+        vision_family="3.8",
+    ),
+    "27b-q4m": ModelDownload(
+        "Qwen 3.8 27B",
+        "Unsloth",
+        "UD-Q4_K_M",
+        _UNSLOTH_27B,
+        _UNSLOTH_27B_REVISION,
+        "Qwen3.8-27B-UD-Q4_K_M.gguf",
+        16_564_259_744,
+        "1bce504dfecd84153666928a41d8a66706f0158d3a317bc5196b72819d7dc529",
+        vision_family="3.8",
+    ),
+    "27b-q4s": ModelDownload(
+        "Qwen 3.8 27B",
+        "Unsloth",
+        "UD-Q4_K_S",
+        _UNSLOTH_27B,
+        _UNSLOTH_27B_REVISION,
+        "Qwen3.8-27B-UD-Q4_K_S.gguf",
+        15_358_213_024,
+        "75bc9c8adba2842e72f0ab5201aaa07133c5010b566305c09187fcbdcd364017",
+        vision_family="3.8",
+    ),
+    "27b-q2": ModelDownload(
+        "Qwen 3.8 27B",
+        "Unsloth",
+        "UD-Q2_K_XL",
+        _UNSLOTH_27B,
+        _UNSLOTH_27B_REVISION,
+        "Qwen3.8-27B-UD-Q2_K_XL.gguf",
+        9_948_666_784,
+        "18f1187f38e7994b05c08cb45c674b90b7f17523687c83a4614fe493f7ea739d",
+        vision_family="3.8",
+    ),
+}
+
+
+@dataclass(frozen=True)
+class VisionDownload:
+    repository: str
+    revision: str
+    size: int
+    sha256: str
+
+    def url(self, precision):
+        variant = "F16" if precision == "FP16" else precision
+        return f"https://huggingface.co/{self.repository}/resolve/{self.revision}/mmproj-{variant}.gguf"
+
+
+# These projectors match the Qwen 3.5 9B and Qwen 3.8 27B architectures above.
+VISION_DOWNLOADS = {
+    "3.5": {
+        "FP16": VisionDownload(
+            _UNSLOTH_9B,
+            _UNSLOTH_9B_REVISION,
+            918_166_080,
+            "f70dc3509053962b0d0d3ee8a7eacebf5d60aa560cad78254ae8698516ae029f",
+        ),
+        "BF16": VisionDownload(
+            _UNSLOTH_9B,
+            _UNSLOTH_9B_REVISION,
+            921_705_024,
+            "853698ce7aa6c7ba732478bad280240969ddf7b0fcbf93900046f63903a83383",
+        ),
+    },
+    "3.8": {
+        "FP16": VisionDownload(
+            _UNSLOTH_27B,
+            _UNSLOTH_27B_REVISION,
+            927_607_488,
+            "cbb841a9ee0636b2ec172f5bb8df2ea8dfeb01e90fe7c6126581d662a0b4e43e",
+        ),
+        "BF16": VisionDownload(
+            _UNSLOTH_27B,
+            _UNSLOTH_27B_REVISION,
+            931_146_432,
+            "83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53",
+        ),
+    },
+}
+
+
+@dataclass(frozen=True)
+class ModelRecommendation:
+    balanced: str
+    faster: str
+    better: str
+    backends: tuple[str, ...] = ()
+    vram_gib: int = 0
+    cuda_compute: int = 0
+
+
+# First match wins. Discounts are for reported VRAM minor discrepancies.
+MODEL_TOTAL_VRAM_DISCOUNT_GIB = 1
+MODEL_FREE_VRAM_DISCOUNT_GIB = 2
+MODEL_RECOMMENDATIONS = {
+    "blackwell": ModelRecommendation(
+        balanced="27b-nvfp4",
+        faster="27b-q2",
+        better="27b-q8",
+        backends=("cuda",),
+        vram_gib=12,
+        cuda_compute=100,
+    ),
+    "gpu-12gb": ModelRecommendation(
+        balanced="27b-q4m",
+        faster="27b-q2",
+        better="27b-q6",
+        backends=("cuda", "vulkan"),
+        vram_gib=12,
+    ),
+    "gpu-8gb": ModelRecommendation(
+        balanced="27b-q2",
+        faster="9b-q4",
+        better="27b-q4s",
+        backends=("cuda", "vulkan"),
+        vram_gib=8,
+    ),
+    # Includes CPU, unknown VRAM, and GPUs under 8 GiB.
+    "small": ModelRecommendation(
+        balanced="9b-q4",
+        faster="9b-q3",
+        better="27b-q4s",
+    ),
+}
+
+
+@dataclass(frozen=True)
 class Settings:
     # Model connection and generation.
     server_url: str = "http://localhost:9931/v1"

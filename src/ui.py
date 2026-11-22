@@ -19,8 +19,21 @@ from markdown_ui import (
     load_picture,
 )
 from model_server import DOWNLOADING_MODEL, SERVER_FIELDS
-from server_builds import BACKEND_LABELS, cached_server_config, default_model_path
-from settings import CHAT_SORT_OPTIONS, CONVERSATION_STYLE_OPTIONS
+from server_builds import (
+    BACKEND_LABELS,
+    cached_server_config,
+    managed_vision_file,
+    model_path,
+    model_vision_family,
+    vision_path,
+)
+from settings import (
+    CHAT_SORT_OPTIONS,
+    CONVERSATION_STYLE_OPTIONS,
+    MODEL_DOWNLOADS,
+    MODEL_RECOMMENDATIONS,
+    VISION_DOWNLOADS,
+)
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
@@ -1020,6 +1033,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.transcript_scroll = Gtk.ScrolledWindow()
         self.transcript_scroll.add_css_class("main-transcript-scroll")
         self.transcript_scroll.add_css_class("transcript-scroll")
+        self.transcript_scroll.add_css_class("undershoot-bottom")
         self.transcript_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.transcript_scroll.set_child(TranscriptViewport(child=self.transcript))
         self.transcript_scroll.set_vexpand(True)
@@ -2530,7 +2544,9 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def update_model_server(self, text, busy):
         if text != DOWNLOADING_MODEL or not busy:
-            self._model_download = {}
+            if not self.controller.model_file_download:
+                self._model_download.pop("model", None)
+            self._model_download.pop("server", None)
         activity = (text if text == DOWNLOADING_MODEL else "Connecting to model") if busy else ""
         if self._model_server_activity != activity:
             self._model_server_activity = activity
@@ -2544,10 +2560,15 @@ class ChatWindow(Adw.ApplicationWindow):
         self.refresh_model_configuration()
 
     def update_model_download(self, stage, server, percent):
-        self._model_download[stage] = server, percent
+        if stage == "vision" and percent is None:
+            self._model_download.pop(stage, None)
+        else:
+            self._model_download[stage] = server, percent
         self.refresh_model_configuration()
 
     def confirm_model_download(self):
+        rule = MODEL_RECOMMENDATIONS[self.controller.model_recommendation()]
+        model = MODEL_DOWNLOADS[rule.balanced]
         alert = Adw.AlertDialog(
             follows_content_size=False,
             content_width=480,
@@ -2555,7 +2576,8 @@ class ChatWindow(Adw.ApplicationWindow):
             body="No model loaded, would you like Lopaca to download and configure a model? "
             "This may take a few minutes depending on your internet connection. Or go to "
             "Settings → Model → Advanced to manually configure.\n\n"
-            "The model download is about 16.6 GB.",
+            f"Recommended model: {model.name} ({model.quantization}), "
+            f"about {model.size / 10**9:.1f} GB.",
         )
         alert.add_response("cancel", "Cancel")
         alert.add_response("yes", "Yes")
@@ -2566,8 +2588,9 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def update_model_paths(self, paths):
         for key, (row, handler) in getattr(self, "_model_path_rows", {}).items():
-            with row.handler_block(handler):
-                row.set_text(paths[key])
+            if key in paths:
+                with row.handler_block(handler):
+                    row.set_text(paths[key])
         self.refresh_model_configuration()
 
     def refresh_model_configuration(self):
@@ -2577,8 +2600,6 @@ class ChatWindow(Adw.ApplicationWindow):
         external = config is None
         config = config or {}
         downloaded_server, server_percent = self._model_download.get("server", (None, None))
-        _, model_percent = self._model_download.get("model", (None, None))
-        downloading_model = model_percent is not None
         folder = self.controller.store.root.parent
         server_config = downloaded_server or config
         if (
@@ -2588,11 +2609,9 @@ class ChatWindow(Adw.ApplicationWindow):
         ):
             server_config = cached_server_config(folder) or config
         executable = server_config.get("executable")
-        model = config.get("model")
         backend = BACKEND_LABELS.get(server_config.get("backend"))
         manual = "Manually configured by user"
         can_download = False
-        can_download_model = False
         server_available = bool(executable and backend and Path(executable).expanduser().is_file())
         downloading_server = server_percent is not None or (
             "server" not in self._model_download
@@ -2611,46 +2630,200 @@ class ChatWindow(Adw.ApplicationWindow):
             subtitle = " | ".join(filter(None, [version, backend]))
             server = "llama.cpp", subtitle, True
         else:
-            can_download = not self.controller.model_server.busy
+            can_download = not (
+                self.controller.model_server.busy or self.controller.model_file_download
+            )
             server = "Click here to automatically download", "", can_download
-
-        auto_model = default_model_path(folder)
-        if downloading_model:
-            model_summary = "Qwen 3.8 27b", "Unsloth | Q4_K_M", True
-        elif external or (model and Path(model).expanduser() != auto_model):
-            model_summary = manual, "", False
-        elif auto_model.is_file():
-            model_summary = "Qwen 3.8 27b", "Unsloth | Q4_K_M", True
-        elif server_available and not downloading_server:
-            can_download_model = not self.controller.model_server.busy
-            model_summary = "Click here to automatically download", "", can_download_model
-        else:
-            model_summary = "Model not found", "", False
 
         self._configured_server.set_activatable(can_download)
         self._server_download_arrow.set_visible(can_download)
-        self._configured_model.set_activatable(can_download_model)
-        self._model_download_arrow.set_visible(can_download_model)
-        for (label, spinner), active, text, percent in (
-            (
-                self._server_download_indicator,
-                downloading_server,
-                "Downloading server",
-                server_percent,
-            ),
-            (self._model_download_indicator, downloading_model, "Downloading model", model_percent),
-        ):
-            label.set_label(f"{text}: {percent}%" if percent is not None else f"{text}…")
-            label.set_visible(active)
-            spinner.set_visible(active)
-            spinner.set_spinning(active)
-        for row, (title, subtitle, sensitive) in (
-            (self._configured_server, server),
-            (self._configured_model, model_summary),
-        ):
-            row.set_title(title)
-            row.set_subtitle(subtitle)
-            row.set_sensitive(sensitive)
+        title, subtitle, sensitive = server
+        self._configured_server.set_title(title)
+        self._configured_server.set_subtitle(subtitle)
+        self._configured_server.set_sensitive(sensitive)
+        self._update_download_indicator(
+            self._server_download_indicator,
+            "Downloading server",
+            downloading_server,
+            server_percent,
+        )
+        self._refresh_model_rows(config, downloaded_server, external)
+
+    @staticmethod
+    def _update_download_indicator(indicator, text, active, percent):
+        label, spinner = indicator
+        label.set_label(f"{text}: {percent}%" if percent is not None else f"{text}…")
+        label.set_visible(active)
+        spinner.set_visible(active)
+        spinner.set_spinning(active)
+
+    def _refresh_model_rows(self, config, downloaded_server, external):
+        profile = (downloaded_server or {}).get(
+            "recommendation"
+        ) or self.controller.model_recommendation()
+        rule = MODEL_RECOMMENDATIONS[profile]
+        folder = self.controller.store.root.parent
+        selected = Path(config.get("model") or ".").expanduser()
+        downloading, percent = self._model_download.get("model", (None, None))
+        file_job = self.controller.model_file_download
+        setup_busy = self.controller.model_server.busy
+        for role, widgets in self._model_rows.items():
+            row, download, switch, remove, indicator, handler = widgets
+            key = getattr(rule, role)
+            asset = MODEL_DOWNLOADS[key]
+            path = model_path(folder, key)
+            installed = path.is_file()
+            active = installed and path == selected
+            in_progress = percent is not None if key == downloading else key == file_job
+            row.set_subtitle(
+                f"{asset.name} · {asset.publisher} | {asset.quantization}"
+                f" · {asset.size / 10**9:.1f} GB"
+            )
+            if installed:
+                row.remove_css_class("dim-label")
+            else:
+                row.add_css_class("dim-label")
+            download.set_sensitive(not installed and not setup_busy and not file_job)
+            download.set_visible(not installed)
+            switch.set_sensitive(installed and not setup_busy and not external)
+            remove.set_visible(installed)
+            remove.set_sensitive(installed and not in_progress and not setup_busy and not external)
+            with switch.handler_block(handler):
+                switch.set_active(active)
+            self._update_download_indicator(
+                indicator, "Downloading", in_progress, percent if key == downloading else None
+            )
+        self._refresh_vision_rows(config, rule, external)
+
+    def _refresh_vision_rows(self, config, rule, external):
+        folder = self.controller.store.root.parent
+        families = {
+            MODEL_DOWNLOADS[key].vision_family for key in (rule.balanced, rule.faster, rule.better)
+        }
+        selected = model_vision_family(folder, config.get("model"))
+        projector = config.get("mmproj")
+        default_precision = config.get(
+            "vision_precision", self.controller._recommended_vision_precision
+        )
+        downloading, percent = self._model_download.get("vision", (None, None))
+        self._vision_group.set_visible(bool(families & VISION_DOWNLOADS.keys() or selected))
+        model_available = bool(selected and Path(config["model"]).expanduser().is_file())
+        for family, (row, switch, indicator, handler) in self._vision_rows.items():
+            row.set_visible(family in families or family == selected)
+            compatible = family == selected and not external and model_available
+            switch.set_sensitive(compatible and not self.controller.model_server.busy)
+            if compatible:
+                row.remove_css_class("dim-label")
+            else:
+                row.add_css_class("dim-label")
+            enabled = bool(
+                compatible
+                and projector
+                and family not in config.get("vision_disabled", ())
+                and Path(projector).expanduser().is_file()
+            )
+            with switch.handler_block(handler):
+                switch.set_active(enabled)
+            in_progress = downloading is not None and downloading[0] == family
+            precision = downloading[1] if in_progress else default_precision
+            if compatible and projector and not managed_vision_file(folder, projector):
+                precision = "Custom file"
+            elif not in_progress and projector != str(vision_path(folder, family, precision)):
+                # If this family is already downloaded, show its available precision.
+                precision = next(
+                    (
+                        variant
+                        for variant in (precision, "FP16", "BF16")
+                        if vision_path(folder, family, variant).is_file()
+                    ),
+                    precision,
+                )
+            row.set_subtitle(precision)
+            self._update_download_indicator(indicator, "Downloading", in_progress, percent)
+
+    def _vision_choices(self):
+        self._vision_group = Adw.PreferencesGroup(title="Vision")
+        self._vision_group.add_css_class("model-settings-summary")
+        self._vision_rows = {}
+        for family in reversed(VISION_DOWNLOADS):
+            row = Adw.ActionRow(title=f"Qwen {family} Vision", use_markup=False)
+            row.add_css_class("knowledge-packs-row")
+            indicator = add_operation_indicator(row, visible=False)
+            switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+            switch.add_css_class("knowledge-packs-switch")
+            handler = switch.connect(
+                "notify::active",
+                lambda button, _, family=family: self.controller.select_vision(
+                    family, button.get_active()
+                ),
+            )
+            row.add_suffix(switch)
+            self._vision_group.add(row)
+            self._vision_rows[family] = row, switch, indicator, handler
+        return self._vision_group
+
+    def _model_choices(self):
+        group = Adw.PreferencesGroup(title="Configured Model")
+        group.add_css_class("model-settings-summary")
+        self._model_rows = {}
+        for role in ("balanced", "faster", "better"):
+            row = Adw.ActionRow(title=role.title(), use_markup=False)
+            row.add_css_class("knowledge-packs-row")
+            indicator = add_operation_indicator(row, visible=False)
+            download = Gtk.Button(
+                icon_name="list-add-symbolic",
+                valign=Gtk.Align.CENTER,
+                tooltip_text="Download Model",
+            )
+            download.add_css_class("knowledge-packs-button")
+            switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+            switch.add_css_class("knowledge-packs-switch")
+            remove = Gtk.Button(
+                icon_name="user-trash-symbolic",
+                valign=Gtk.Align.CENTER,
+                tooltip_text="Remove Model",
+            )
+            remove.add_css_class("knowledge-packs-remove")
+
+            def model_key(role):
+                downloaded_server, _ = self._model_download.get("server", (None, None))
+                profile = (downloaded_server or {}).get(
+                    "recommendation"
+                ) or self.controller.model_recommendation()
+                return getattr(MODEL_RECOMMENDATIONS[profile], role)
+
+            download.connect(
+                "clicked", lambda _, role=role: self.controller.download_model(model_key(role))
+            )
+            handler = switch.connect(
+                "notify::active",
+                lambda button, _, role=role: self.controller.select_model(
+                    model_key(role), button.get_active()
+                ),
+            )
+            remove.connect(
+                "clicked", lambda _, role=role: self._confirm_model_delete(model_key(role))
+            )
+            row.add_suffix(switch)
+            row.add_suffix(download)
+            row.add_suffix(remove)
+            group.add(row)
+            self._model_rows[role] = row, download, switch, remove, indicator, handler
+        return group
+
+    def _confirm_model_delete(self, key):
+        asset = MODEL_DOWNLOADS[key]
+        alert = Adw.AlertDialog(
+            heading="Remove model?",
+            body=f"Remove {asset.name} ({asset.quantization}) from this computer?",
+        )
+        alert.add_response("cancel", "Cancel")
+        alert.add_response("delete", "Remove")
+        alert.set_default_response("cancel")
+        alert.set_close_response("cancel")
+        alert.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        alert.connect("response::delete", lambda *_: self.controller.delete_model(key))
+        alert.present(self)
 
     def _model_settings_page(self):
         page = Adw.PreferencesPage(title="Model", icon_name="network-server-symbolic")
@@ -2661,43 +2834,45 @@ class ChatWindow(Adw.ApplicationWindow):
         def save(key, value):
             try:
                 current = self.controller.store.load_app_settings().get("model_server", {})
+                folder = self.controller.store.root.parent
                 if key == "executable" and value != current.get(key):
                     current.pop("backend", None)
                     current.pop("devices", None)
                     current.pop("version", None)
+                    current.pop("recommendation", None)
+                    current.pop("vision_precision", None)
+                clear_vision = (
+                    key == "model"
+                    and managed_vision_file(folder, current.get("mmproj"))
+                    and model_vision_family(folder, value)
+                    != model_vision_family(folder, current.get("model"))
+                )
+                if clear_vision:
+                    current["mmproj"] = ""
                 self.controller.set_model_server_config({**current, key: value})
-                if key in ("executable", "model"):
+                if clear_vision:
+                    self.update_model_paths({"mmproj": ""})
+                elif key in ("executable", "model", "mmproj"):
                     self.refresh_model_configuration()
             except OSError as exc:
                 self._show_alert("Could not save settings", str(exc))
 
-        for title, attribute in (
-            ("Configured Server", "_configured_server"),
-            ("Configured Model", "_configured_model"),
-        ):
-            section = Adw.PreferencesGroup(title=title)
-            section.add_css_class("model-settings-summary")
-            row = Adw.ActionRow(use_markup=False)
-            row.add_css_class("model-settings-summary-row")
-            section.add(row)
-            page.add(section)
-            setattr(self, attribute, row)
+        section = Adw.PreferencesGroup(title="Configured Server")
+        section.add_css_class("model-settings-summary")
+        self._configured_server = Adw.ActionRow(use_markup=False)
+        self._configured_server.add_css_class("model-settings-summary-row")
+        section.add(self._configured_server)
+        page.add(section)
         self._server_download_arrow = Gtk.Image(
             icon_name="go-next-symbolic", valign=Gtk.Align.CENTER
         )
         self._configured_server.add_suffix(self._server_download_arrow)
-        self._model_download_arrow = Gtk.Image(
-            icon_name="go-next-symbolic", valign=Gtk.Align.CENTER
-        )
-        self._configured_model.add_suffix(self._model_download_arrow)
         self._server_download_indicator = add_operation_indicator(
             self._configured_server, visible=False
         )
-        self._model_download_indicator = add_operation_indicator(
-            self._configured_model, visible=False
-        )
         self._configured_server.connect("activated", lambda *_: self.confirm_model_download())
-        self._configured_model.connect("activated", lambda *_: self.confirm_model_download())
+        page.add(self._model_choices())
+        page.add(self._vision_choices())
         page.connect("map", lambda *_: self.refresh_model_configuration())
 
         advanced_group = Adw.PreferencesGroup()
@@ -2717,7 +2892,11 @@ class ChatWindow(Adw.ApplicationWindow):
         paths.add_css_class("model-settings-paths")
         advanced_content.append(paths)
         self._model_path_rows = {}
-        for key, title in (("executable", "llama-server executable"), ("model", "Model file")):
+        for key, title in (
+            ("executable", "llama-server executable"),
+            ("model", "Model file"),
+            ("mmproj", "Vision file"),
+        ):
             row = Adw.EntryRow(title=title, text=config.get(key, ""))
             row.add_css_class("model-settings-row")
             handler = row.connect(
@@ -3610,6 +3789,7 @@ class Lopaca(Adw.Application):
 
     def do_shutdown(self):
         self.controller.cancel_chat_warm()
+        self.controller._model_file_stop.set()
         self.controller.model_server.close()
         Adw.Application.do_shutdown(self)
 

@@ -54,6 +54,30 @@ def launch_command(config, server_url):
     if any(arg.split("=", 1)[0] in reserved for arg in extra):
         raise ValueError("Use the model field for --model. Host and port are managed by Lopaca.")
     args = [str(executable.resolve()), "--model", str(model.resolve())]
+    family = config.get("vision_family")
+    vision = config.get("mmproj")
+    if family:
+        # A managed model's projector source comes from the Vision settings.
+        source_flags = {"-mm", "--mmproj", "-mmu", "--mmproj-url"}
+        toggle_flags = {"--mmproj-auto", "--no-mmproj", "--no-mmproj-auto"}
+        remaining = []
+        extra_args = iter(extra)
+        for arg in extra_args:
+            flag, equals, _ = arg.partition("=")
+            if flag in source_flags:
+                if not equals:
+                    next(extra_args, None)
+            elif flag not in toggle_flags:
+                remaining.append(arg)
+        extra = remaining
+        if family in config.get("vision_disabled", ()) or not vision:
+            args.append("--no-mmproj")
+            vision = None
+    if vision:
+        projector = Path(vision).expanduser()
+        if not projector.is_file():
+            raise ValueError(f"The vision file does not exist or is not a file.\nPath: {projector}")
+        args.extend(("--mmproj", str(projector.resolve())))
     for key, _title, _hint in SERVER_FIELDS:
         value = str(config.get(key, "")).strip()
         if value:
@@ -95,14 +119,43 @@ class ModelServer:
         process = self.process
         return self._config if process is not None and process.poll() is None else None
 
-    def connect(self, config, *, startup=False, prepare=None, on_config=None):
+    def connect(self, config, *, startup=False, prepare=None, prepare_config=None, on_config=None):
         with self._lock:
             if self.busy or self._closed.is_set():
                 return
             self.busy = True
         threading.Thread(
-            target=self._connect, args=(dict(config), startup, prepare, on_config), daemon=True
+            target=self._connect,
+            args=(dict(config), startup, prepare, prepare_config, on_config),
+            daemon=True,
         ).start()
+
+    def disconnect(self, finished):
+        """Unload the model served by our child process."""
+        with self._lock:
+            if self.busy or self._closed.is_set():
+                return
+            self.busy = True
+
+        def unload():
+            try:
+                process = self.process
+                if process is not None and process.poll() is None:
+                    self._state("Stopping llama-server…")
+                    self._expected_exits.add(process)
+                    self._stop_process(process)
+                self.process = self._config = None
+                if not self._closed.is_set():
+                    finished()
+                self._state("Model unloaded")
+            except OSError as exc:
+                if not self._closed.is_set():
+                    self.on_error(str(exc))
+            finally:
+                self.busy = False
+                self.on_state(self.status, False)
+
+        threading.Thread(target=unload, daemon=True).start()
 
     def _health(self):
         try:
@@ -118,21 +171,24 @@ class ModelServer:
         with socket.socket() as probe:
             return probe.connect_ex((address.hostname, address.port or 80)) == 0
 
-    def _connect(self, config, startup, prepare=None, on_config=None):
+    def _connect(self, config, startup, prepare, prepare_config, on_config):
         args = None
         try:
-            if (
-                prepare is None
-                and self.process is not None
-                and self.process.poll() is None
-                and config != self._config
-            ):
-                # Validate first: an incomplete edit must not stop a working model.
-                launch_command(config, self.url)
-                self._state("Restarting llama-server…")
-                self._expected_exits.add(self.process)
-                self._stop_process(self.process)
-                self.process = None
+            prepared = False
+            if prepare is None and self.running_config is not None:
+                if prepare_config:
+                    self._state("Preparing model configuration…")
+                    config = prepare_config(config, self._closed.is_set)
+                    prepared = True
+                if self._closed.is_set():
+                    return
+                if config != self._config:
+                    # Validate first: an incomplete edit must not stop a working model.
+                    launch_command(config, self.url)
+                    self._state("Restarting llama-server…")
+                    self._expected_exits.add(self.process)
+                    self._stop_process(self.process)
+                    self.process = None
             self._state("Checking for an existing server…")
             try:
                 if self._health():
@@ -143,7 +199,7 @@ class ModelServer:
             if self._port_occupied():
                 self._wait_for_existing_server()
                 return
-            if startup and not config.get("executable"):
+            if startup and not (config.get("executable") and config.get("model")):
                 self._state("No server configured")
                 return
 
@@ -158,6 +214,10 @@ class ModelServer:
                     self._wait_for_existing_server()
                     return
                 selected = {**config, **(installed or {})}
+                if prepare_config and not prepared:
+                    selected = prepare_config(selected, self._closed.is_set)
+                if self._closed.is_set():
+                    return
                 args = launch_command(selected, self.url)
                 try:
                     if not self._launch(args, selected):
@@ -171,8 +231,8 @@ class ModelServer:
                     )
                     self._state(DOWNLOADING_MODEL)
                     continue
-                if installed and on_config:
-                    on_config(installed)
+                if on_config:
+                    on_config(selected)
                 self._state("Connected")
                 return
             if last_error and not self._closed.is_set():
@@ -222,6 +282,15 @@ class ModelServer:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                env=(
+                    {
+                        key: value
+                        for key, value in os.environ.items()
+                        if key not in {"LLAMA_ARG_MMPROJ", "LLAMA_ARG_MMPROJ_URL"}
+                    }
+                    if config.get("vision_family")
+                    else None
+                ),
             )
             self._config = config
         reader = threading.Thread(target=self._read_output, args=(process,), daemon=True)

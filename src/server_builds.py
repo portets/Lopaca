@@ -2,17 +2,27 @@
 
 import ctypes as c
 import logging
+import os
 import platform
 import re
+import shlex
 import struct
 import subprocess
 import tarfile
 from concurrent.futures import ThreadPoolExecutor
-from itertools import chain
+from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Event
+from threading import Event, Lock
 
+from settings import (
+    MODEL_DOWNLOADS,
+    MODEL_FREE_VRAM_DISCOUNT_GIB,
+    MODEL_RECOMMENDATIONS,
+    MODEL_TOTAL_VRAM_DISCOUNT_GIB,
+    VISION_DOWNLOADS,
+)
 from web import DownloadChecksumError, download_verified_file, matches_download
 
 _RELEASE = "b12359"
@@ -64,16 +74,8 @@ _SERVER_LIBRARY = re.compile(
     r"|libllama(?:-server-impl|-common)?|libmtmd)\.so(?:\.\d+)*"
 )
 _DEVICE_LINE = re.compile(
-    r"^\s*((?:CUDA|Vulkan)\d+): (.+) \(\d+ MiB, \d+ MiB free\)\s*$", re.MULTILINE
+    r"^\s*((?:CUDA|Vulkan)\d+): (.+) \((?:(\d+) MiB, )?(\d+) MiB free\)\s*$", re.MULTILINE
 )
-
-_MODEL_NAME = "Qwen3.8-27B-UD-Q4_K_M.gguf"
-_MODEL_URL = (
-    "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/"
-    f"4af51b3542f775b0a8e4b310bfb3f17e01c306c9/{_MODEL_NAME}?download=true"
-)
-_MODEL_SIZE = 16_564_259_744
-_MODEL_SHA256 = "1bce504dfecd84153666928a41d8a66706f0158d3a317bc5196b72819d7dc529"
 
 BACKEND_LABELS = {
     "cuda-13.5": "CUDA 13",
@@ -81,17 +83,68 @@ BACKEND_LABELS = {
     "vulkan": "Vulkan",
     "cpu": "CPU",
 }
+_VISION_DOWNLOAD_LOCK = Lock()
 
 
-def _cuda_devices():
+@dataclass(frozen=True)
+class GpuMemory:
+    compute: int = 0
+    total_mib: int | None = None
+    free_mib: int | None = None
+
+    def qualifies(self, vram_gib, compute):
+        memory = self.total_mib
+        discount = MODEL_TOTAL_VRAM_DISCOUNT_GIB
+        if memory is None:
+            memory = self.free_mib
+            discount = MODEL_FREE_VRAM_DISCOUNT_GIB
+        required = max(0, vram_gib - discount) * 1024
+        return self.compute >= compute and memory is not None and memory >= required
+
+
+def recommendation_for(backend, devices):
+    kind = "cuda" if backend.startswith("cuda") else backend
+    return next(
+        key
+        for key, rule in MODEL_RECOMMENDATIONS.items()
+        if not rule.backends
+        or (
+            kind in rule.backends
+            and any(device.qualifies(rule.vram_gib, rule.cuda_compute) for device in devices)
+        )
+    )
+
+
+def _nvidia_board_memory(driver, device):
+    """CUDA can report less than the board total because of driver reservations."""
+    try:
+        nvml = c.CDLL("libnvidia-ml.so.1")
+        bus = c.create_string_buffer(32)
+        if driver.cuDeviceGetPCIBusId(bus, len(bus), device) or nvml.nvmlInit_v2():
+            return None
+        try:
+            handle = c.c_void_p()
+            memory = (c.c_ulonglong * 3)()  # nvmlMemory_t: total, free, used in bytes
+            if not nvml.nvmlDeviceGetHandleByPciBusId_v2(bus, c.byref(handle)) and not (
+                nvml.nvmlDeviceGetMemoryInfo(handle, c.byref(memory))
+            ):
+                return memory[0] // 1024**2 or None
+        finally:
+            nvml.nvmlShutdown()
+    except OSError, AttributeError:
+        pass
+    return None
+
+
+def _cuda_devices(*, memory=True):
     """Query the installed NVIDIA driver without requiring CUDA Toolkit or nvidia-smi."""
     driver = c.CDLL("libcuda.so.1")
     version, count = c.c_int(), c.c_int()
     if driver.cuInit(0) or driver.cuDriverGetVersion(c.byref(version)):
-        return 0, []
+        return 0, {}
     if driver.cuDeviceGetCount(c.byref(count)):
-        return 0, []
-    devices = []
+        return 0, {}
+    devices = {}
     for index in range(count.value):
         device, major, minor = c.c_int(), c.c_int(), c.c_int()
         name = c.create_string_buffer(256)
@@ -101,8 +154,25 @@ def _cuda_devices():
             or driver.cuDeviceGetAttribute(c.byref(major), 75, device)
             or driver.cuDeviceGetAttribute(c.byref(minor), 76, device)
         ):
+            if not memory:
+                return version.value, {}
             continue
-        devices.append((name.value.decode(errors="replace"), 10 * major.value + minor.value))
+        name = name.value.decode(errors="replace")
+        compute = 10 * major.value + minor.value
+        if not memory:
+            devices[name] = GpuMemory(compute=compute)
+            continue
+        total = c.c_size_t()
+        mib = None
+        if hasattr(driver, "cuDeviceTotalMem_v2") and not driver.cuDeviceTotalMem_v2(
+            c.byref(total), device
+        ):
+            mib = total.value // 1024**2 or None
+        board_mib = _nvidia_board_memory(driver, device)
+        # A large discrepancy can indicate a partition or a capped CUDA device.
+        if board_mib and (mib is None or 0 <= board_mib - mib <= 512):
+            mib = board_mib
+        devices[name] = GpuMemory(compute=compute, total_mib=mib)
     return version.value, devices
 
 
@@ -119,21 +189,34 @@ class _VulkanInstanceInfo(c.Structure):
     ]
 
 
-def _discrete_vulkan_names():
+class _VulkanMemoryHeap(c.Structure):
+    _fields_ = [("size", c.c_uint64), ("flags", c.c_uint32)]
+
+
+class _VulkanMemoryProperties(c.Structure):
+    _fields_ = [
+        ("type_count", c.c_uint32),
+        ("types", c.c_uint32 * 64),
+        ("heap_count", c.c_uint32),
+        ("heaps", _VulkanMemoryHeap * 16),
+    ]
+
+
+def _discrete_vulkan_devices():
     """Use the system Vulkan loader so enumeration works without vulkaninfo."""
     loader = c.CDLL("libvulkan.so.1")
     info = _VulkanInstanceInfo(s_type=1)  # VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
     instance = c.c_void_p()
     if loader.vkCreateInstance(c.byref(info), None, c.byref(instance)):
-        return set()
+        return {}
     try:
         count = c.c_uint32()
         if loader.vkEnumeratePhysicalDevices(instance, c.byref(count), None):
-            return set()
+            return {}
         devices = (c.c_void_p * count.value)()
         if loader.vkEnumeratePhysicalDevices(instance, c.byref(count), devices):
-            return set()
-        discrete, other = set(), set()
+            return {}
+        discrete, other = {}, set()
         for handle in devices[: count.value]:
             # VkPhysicalDeviceProperties starts with five 32-bit fields and deviceName[256].
             # Reserve aligned space for the trailing UUID, limits and sparse properties.
@@ -141,14 +224,24 @@ def _discrete_vulkan_names():
             loader.vkGetPhysicalDeviceProperties(c.c_void_p(handle), c.byref(properties))
             *_, kind, raw_name = struct.unpack_from("=5I256s", properties)
             name = raw_name.split(b"\0", 1)[0].decode(errors="replace")
-            (discrete if kind == 2 else other).add(name)  # VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
-        return discrete - other
+            if kind == 2:  # VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+                memory = _VulkanMemoryProperties()
+                loader.vkGetPhysicalDeviceMemoryProperties(c.c_void_p(handle), c.byref(memory))
+                # Vulkan can expose multiple heaps backed by the same VRAM.
+                total = max(
+                    (heap.size for heap in memory.heaps[: memory.heap_count] if heap.flags & 1),
+                    default=0,
+                )
+                discrete[name] = GpuMemory(total_mib=total // 1024**2 or None)
+            else:
+                other.add(name)
+        return {name: memory for name, memory in discrete.items() if name not in other}
     finally:
         loader.vkDestroyInstance(instance, None)
 
 
 def _candidates(arch):
-    version, cuda = 0, []
+    version, cuda = 0, {}
     try:
         version, cuda = _cuda_devices()
     except (OSError, AttributeError) as exc:
@@ -159,15 +252,60 @@ def _candidates(arch):
         ("cuda-13.5", 13050, 75, 999),
         ("cuda-12.8", 12080, 50, 120),
     ):
-        names = {name for name, capability in cuda if low <= capability <= high}
+        names = {name: memory for name, memory in cuda.items() if low <= memory.compute <= high}
         if (arch, backend) in _ASSETS and version >= minimum and names:
             yield backend, names
     try:
-        if names := _discrete_vulkan_names():
+        if names := _discrete_vulkan_devices():
             yield "vulkan", names
     except (OSError, AttributeError) as exc:
         logging.debug("Vulkan probe unavailable: %s", exc)
-    yield "cpu", set()
+    yield "cpu", {}
+
+
+def detect_recommendation(backend=None):
+    arch = _server_arch()
+    if arch is not None:
+        for candidate, devices in _candidates(arch):
+            if backend is None or candidate == backend:
+                return recommendation_for(candidate, devices.values())
+    return recommendation_for("cpu", ())
+
+
+def detect_vision_precision(config):
+    """Use BF16 only for backends with a known native BF16 path."""
+    backend = config.get("backend")
+    if not backend and not config.get("executable") and (arch := _server_arch()):
+        backend, _ = next(_candidates(arch))
+    if backend == "cpu":
+        with suppress(OSError):
+            flags = re.findall(
+                r"^(?:flags|Features)\s*:\s*(.+)$",
+                Path("/proc/cpuinfo").read_text(),
+                re.MULTILINE,
+            )
+            if flags and all(
+                {"avx512_bf16", "amx_bf16", "bf16"} & set(row.split()) for row in flags
+            ):
+                return "BF16"
+    if backend and backend.startswith("cuda"):
+        with suppress(OSError, AttributeError, ValueError):
+            overrides = {arg.split("=", 1)[0] for arg in shlex.split(config.get("extra", ""))}
+            if not overrides & {
+                "--no-mmproj-offload",
+                "--device",
+                "-dev",
+                "--mmproj-device",
+                "-mmdev",
+                "--rpc",
+            } and not any(
+                os.environ.get(key)
+                for key in ("LLAMA_ARG_DEVICE", "LLAMA_ARG_MMPROJ_OFFLOAD", "MTMD_BACKEND_DEVICE")
+            ):
+                _, devices = _cuda_devices(memory=False)
+                if devices and all(gpu.compute >= 80 for gpu in devices.values()):
+                    return "BF16"
+    return "FP16"
 
 
 def _extract(archive_path, root, destination, allowed, required):
@@ -269,18 +407,30 @@ def _verify_devices(executable, backend, names):
     if "Available devices:" not in output:
         raise RuntimeError(output.strip()[-2000:] or "Device enumeration failed.")
     if backend == "cpu":
-        return []
+        return [], recommendation_for(backend, ())
     prefix = "CUDA" if backend.startswith("cuda") else "Vulkan"
-    devices = [
-        identifier
-        for identifier, description in _DEVICE_LINE.findall(output)
+    devices = {
+        identifier: GpuMemory(
+            compute=names[description.strip()].compute,
+            total_mib=names[description.strip()].total_mib or (int(total) if total else None),
+            free_mib=int(free),
+        )
+        for identifier, description, total, free in _DEVICE_LINE.findall(output)
         if identifier.startswith(prefix) and description.strip() in names
-    ]
+    }
     if not devices:
         raise RuntimeError(
             f"No compatible {BACKEND_LABELS[backend]} device reported by llama-server."
         )
-    return devices
+    recommendation = recommendation_for(backend, devices.values())
+    rule = MODEL_RECOMMENDATIONS[recommendation]
+    if rule.cuda_compute:
+        devices = {
+            identifier: gpu
+            for identifier, gpu in devices.items()
+            if gpu.qualifies(rule.vram_gib, rule.cuda_compute)
+        }
+    return list(devices), recommendation
 
 
 def _server_path(server, arch, backend):
@@ -306,38 +456,83 @@ def cached_server_config(folder):
     return None
 
 
-def default_model_path(folder):
-    return folder / "models" / _MODEL_NAME
+def model_path(folder, key):
+    return folder / "models" / MODEL_DOWNLOADS[key].filename
 
 
-def default_model_download_path(folder):
-    return default_model_path(folder).with_suffix(".gguf.download")
+def model_download_path(folder, key):
+    return model_path(folder, key).with_suffix(".gguf.download")
 
 
-def _install_model(folder, stopped, on_progress):
-    model = default_model_path(folder)
-    model.parent.mkdir(parents=True, exist_ok=True)
-    expected = {"size": _MODEL_SIZE, "sha256": _MODEL_SHA256, "stopped": stopped}
+def model_vision_family(folder, filename):
+    path = Path(filename or ".").expanduser()
+    return next(
+        (
+            asset.vision_family
+            for key, asset in MODEL_DOWNLOADS.items()
+            if model_path(folder, key) == path
+        ),
+        "",
+    )
+
+
+def vision_path(folder, family, precision):
+    return folder / "models" / f"qwen{family}-mmproj-{precision}.gguf"
+
+
+def managed_vision_file(folder, filename):
+    path = Path(filename or ".").expanduser()
+    return any(
+        path == vision_path(folder, family, precision)
+        for family, variants in VISION_DOWNLOADS.items()
+        for precision in variants
+    )
+
+
+def install_model(folder, key, stopped, on_progress):
+    asset = MODEL_DOWNLOADS[key]
+    model = model_path(folder, key)
+    expected = {"size": asset.size, "sha256": asset.sha256, "stopped": stopped}
     if model.exists():
         if not matches_download(model, **expected):
             raise ValueError(f"The file at {model} differs from the default model.")
     else:
-        partial = default_model_download_path(folder)
-        resuming = partial.is_file()
-        report = _report_progress(on_progress, "model")
-        try:
-            download_verified_file(_MODEL_URL, partial, on_progress=report, **expected)
-        except DownloadChecksumError:
-            if not resuming:
-                raise
-            download_verified_file(
-                _MODEL_URL,
-                partial,
-                on_progress=_report_progress(on_progress, "model"),
-                **expected,
-            )
-        partial.rename(model)
+        _download_gguf(model, asset.url, expected, on_progress, "model", key)
     return model
+
+
+def install_vision(folder, family, precision, stopped, on_progress):
+    asset = VISION_DOWNLOADS[family][precision]
+    path = vision_path(folder, family, precision)
+    item = (family, precision)
+    # Connecting and downloading another model can request the same projector.
+    with _VISION_DOWNLOAD_LOCK:
+        if stopped():
+            raise InterruptedError("Download cancelled.")
+        if not path.is_file() or path.stat().st_size != asset.size:
+            expected = {"size": asset.size, "sha256": asset.sha256, "stopped": stopped}
+            try:
+                _download_gguf(path, asset.url(precision), expected, on_progress, "vision", item)
+            finally:
+                on_progress("vision", item, None)
+    return path
+
+
+def _download_gguf(path, url, expected, on_progress, stage, item):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_suffix(".gguf.download")
+    resuming = partial.is_file()
+    try:
+        download_verified_file(
+            url, partial, on_progress=_report_progress(on_progress, stage, item), **expected
+        )
+    except DownloadChecksumError:
+        if not resuming:
+            raise
+        download_verified_file(
+            url, partial, on_progress=_report_progress(on_progress, stage, item), **expected
+        )
+    partial.replace(path)
 
 
 def _report_progress(callback, stage, server=None):
@@ -354,17 +549,17 @@ def _report_progress(callback, stage, server=None):
     return report
 
 
-def _verified_servers(folder, arch, stopped, on_progress):
+def _verified_servers(folder, arch, candidates, stopped, on_progress):
     verified = False
     failures = []
-    for backend, names in _candidates(arch):
+    for backend, names in candidates:
         if stopped():
             return
         try:
             executable = _install_server(
                 folder / "server", arch, backend, stopped, _report_progress(on_progress, "server")
             )
-            devices = _verify_devices(executable, backend, names)
+            devices, recommendation = _verify_devices(executable, backend, names)
             version = re.search(
                 r"^version: (.+)", _server_info(executable, "--version"), re.MULTILINE
             )
@@ -384,6 +579,7 @@ def _verified_servers(folder, arch, stopped, on_progress):
             "executable": str(executable),
             "backend": backend,
             "devices": devices,
+            "recommendation": recommendation,
             "version": version[1].strip() if version else "",
         }
         verified = True
@@ -395,31 +591,69 @@ def _verified_servers(folder, arch, stopped, on_progress):
         )
 
 
-def default_model_configs(folder, stopped, on_progress=lambda *_: None):
-    """Download the model alongside server setup and share it across backend fallbacks."""
+def default_model_configs(folder, stopped, on_progress, *, model_key=None, installed=False):
+    """Start both downloads together when the hardware identifies a model."""
     arch = _server_arch()
     if arch is None:
         raise ValueError("Automatic setup requires Linux x64 or arm64.")
-
+    candidates = tuple(_candidates(arch))
+    backend, devices = candidates[0]
+    recommendation = recommendation_for(backend, devices.values())
+    predicted = model_key or MODEL_RECOMMENDATIONS[recommendation].balanced
+    required_compute = MODEL_DOWNLOADS[model_key].minimum_cuda_compute if model_key else 0
+    servers = _verified_servers(folder, arch, candidates, stopped, on_progress)
+    if required_compute:
+        servers = (
+            server
+            for server in servers
+            if MODEL_RECOMMENDATIONS[server["recommendation"]].cuda_compute >= required_compute
+        )
     cancel_model = Event()
 
-    def prepare_model():
-        model = _install_model(folder, lambda: stopped() or cancel_model.is_set(), on_progress)
-        if not stopped():
-            on_progress("model", None, None)
+    def download(key, cancelled):
+        model = install_model(folder, key, cancelled, on_progress)
+        on_progress("model", key, None)
         return model
 
-    servers = _verified_servers(folder, arch, stopped, on_progress)
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-download") as downloads:
-        model_download = downloads.submit(prepare_model)
+        pending = None
+        # If only the server can report VRAM, wait for its probe before transferring a model.
+        memory_known = all(gpu.total_mib is not None for gpu in devices.values())
+        if (
+            not installed
+            and (model_key or memory_known)
+            and MODEL_RECOMMENDATIONS[recommendation].cuda_compute >= required_compute
+        ):
+            pending = downloads.submit(
+                download, predicted, lambda: stopped() or cancel_model.is_set()
+            )
         try:
-            first_server = next(servers, None)
-            if first_server is None:
+            first = next(servers, None)
+            if stopped():
                 return
-            model = model_download.result()
+            if first is None:
+                raise RuntimeError("This model requires a compatible Blackwell or newer CUDA GPU.")
+            key = model_key or MODEL_RECOMMENDATIONS[first["recommendation"]].balanced
+            if pending is not None and key == predicted:
+                model = pending.result()
+            else:
+                cancel_model.set()
+                if pending is not None:
+                    with suppress(InterruptedError, OSError, ValueError):
+                        pending.result()
+                    on_progress("model", predicted, None)
+                model = model_path(folder, key) if installed else download(key, stopped)
         finally:
             cancel_model.set()
-    for server in chain((first_server,), servers):
+
+    if stopped():
+        return
+    yield {**first, "model": str(model)}
+    for server in servers:
         if stopped():
             return
+        fallback = model_key or MODEL_RECOMMENDATIONS[server["recommendation"]].balanced
+        if fallback != key:
+            key = fallback
+            model = download(key, stopped)
         yield {**server, "model": str(model)}

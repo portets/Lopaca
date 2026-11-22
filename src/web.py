@@ -5,8 +5,12 @@ import http.client
 import shutil
 import socket
 import ssl
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from ipaddress import ip_address
+from itertools import islice
+from threading import Event
 from time import monotonic
 from urllib.parse import quote, urljoin, urlsplit
 from urllib.request import Request, urlopen
@@ -19,6 +23,11 @@ KNOWLEDGE_CATALOG_URL = (
 )
 _CATALOG_SIZE_LIMIT = 4 * 1024**2
 _DOWNLOAD_DISK_RESERVE = 64 * 1024**2
+_RANGE_SIZE = 4 * 1024**2
+_RANGE_WORKER_COUNTS = (4, 8, 16, 32)
+_RANGE_SAMPLE_SIZE = _RANGE_WORKER_COUNTS[-1] * _RANGE_SIZE
+_RANGE_MINIMUM_SIZE = 32 * 1024**2
+_RANGE_SAMPLES_BETWEEN_PROBES = 16
 _REDIRECTS = {301, 302, 303, 307, 308}
 _SOCKET_TIMEOUT = 5
 _DOWNLOAD_TIMEOUT = 15
@@ -54,6 +63,97 @@ class DownloadChecksumError(ValueError):
     pass
 
 
+class _RangeUnavailableError(Exception):
+    pass
+
+
+def _read_range(url, start, end, size, stopped):
+    if stopped():
+        raise InterruptedError("Download cancelled.")
+    request = Request(url, headers={"Range": f"bytes={start}-{end}"})
+    with urlopen(request, timeout=15) as response:
+        if (
+            response.status != 206
+            or response.headers.get("Content-Range") != f"bytes {start}-{end}/{size}"
+        ):
+            raise _RangeUnavailableError
+        length = end - start + 1
+        data = bytearray()
+        while len(data) < length:
+            if stopped():
+                raise InterruptedError("Download cancelled.")
+            block = response.read(min(1024**2, length - len(data)))
+            if not block:
+                raise OSError("Download range ended early.")
+            data.extend(block)
+        return data
+
+
+def _range_concurrency():
+    """Compare equal-size samples and recheck periodically or after a slowdown."""
+    preferred = _RANGE_WORKER_COUNTS[0]
+    while True:
+        speeds = {preferred: (yield preferred)}
+        for workers in _RANGE_WORKER_COUNTS:
+            if workers not in speeds:
+                speeds[workers] = yield workers
+
+        # A small speed difference does not justify extra connections and buffers.
+        cutoff = max(speeds.values()) * 0.85
+        preferred = next(workers for workers in _RANGE_WORKER_COUNTS if speeds[workers] >= cutoff)
+        for _ in range(_RANGE_SAMPLES_BETWEEN_PROBES):
+            speed = yield preferred
+            if speed < speeds[preferred] * 0.6:
+                break
+
+
+def _download_ranges(url, path, size, offset, digest, stopped, on_progress):
+    """Append completed ranges in order so the staged file always remains resumable."""
+    cancelled = Event()
+
+    def fetch(start, end):
+        return _read_range(url, start, end, size, lambda: stopped() or cancelled.is_set())
+
+    concurrency = _range_concurrency()
+    workers = next(concurrency)
+    with (
+        ThreadPoolExecutor(max_workers=_RANGE_WORKER_COUNTS[-1]) as pool,
+        path.open("ab") as stream,
+    ):
+        try:
+            while offset < size:
+                sample_start = offset
+                sample_end = min(offset + _RANGE_SAMPLE_SIZE, size)
+                ranges = (
+                    (start, min(start + _RANGE_SIZE, sample_end) - 1)
+                    for start in range(offset, sample_end, _RANGE_SIZE)
+                )
+                started_at = monotonic()
+                pending = deque(pool.submit(fetch, *span) for span in islice(ranges, workers))
+                while pending:
+                    try:
+                        block = pending.popleft().result()
+                    except OSError, http.client.HTTPException, _RangeUnavailableError:
+                        if stopped():
+                            raise InterruptedError("Download cancelled.") from None
+                        # The sequential downloader can resume from this prefix.
+                        return offset
+                    if stopped():
+                        raise InterruptedError("Download cancelled.")
+                    if (span := next(ranges, None)) is not None:
+                        pending.append(pool.submit(fetch, *span))
+                    stream.write(block)
+                    digest.update(block)
+                    offset += len(block)
+                    if on_progress:
+                        on_progress(offset, size)
+                elapsed = monotonic() - started_at
+                workers = concurrency.send((offset - sample_start) / max(elapsed, 0.001))
+        finally:
+            cancelled.set()
+    return offset
+
+
 def download_verified_file(url, path, *, size, sha256, on_progress=None, stopped=lambda: False):
     """Resume a staged download and check its advertised size and checksum."""
     offset = path.stat().st_size if path.exists() else 0
@@ -66,6 +166,8 @@ def download_verified_file(url, path, *, size, sha256, on_progress=None, stopped
     digest = _hash_file(path, stopped) if offset else hashlib.sha256()
     if stopped():
         raise InterruptedError("Download cancelled.")
+    if size - offset >= _RANGE_MINIMUM_SIZE:
+        offset = _download_ranges(url, path, size, offset, digest, stopped, on_progress)
     if offset < size:
         headers = {"Range": f"bytes={offset}-"} if offset else {}
         with urlopen(Request(url, headers=headers), timeout=60) as response:
