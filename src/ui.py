@@ -20,11 +20,10 @@ from markdown_ui import (
     append_markdown,
     load_picture,
 )
-from model_server import DOWNLOADING_MODEL, SERVER_FIELDS
+from model_server import DOWNLOADING_MODEL, SAMPLING_FIELDS, SERVER_FIELDS, server_parameters
 from server_builds import (
     BACKEND_LABELS,
     cached_server_config,
-    embedding_auto_download_allowed,
     embedding_launch_parameters,
     embedding_path,
     legacy_embedding_file,
@@ -617,9 +616,6 @@ window.lopaca-main, .transcript-scroll, .transcript {
     /* Theme defaults; add overrides here when needed. */
 }
 .model-settings-browse {
-    /* Theme defaults; add overrides here when needed. */
-}
-.model-settings-check {
     /* Theme defaults; add overrides here when needed. */
 }
 .settings-subpage-toolbar {
@@ -2856,7 +2852,7 @@ class ChatWindow(Adw.ApplicationWindow):
         if not model_path(folder, rule.balanced).is_file():
             downloads.append(f"{model.name} ({model.quantization}) · {model.size / 10**9:.2f} GB")
         family = model.vision_family
-        if family and family not in config.get("vision_disabled", ()):
+        if rule.vision and family and family not in config.get("vision_disabled", ()):
             precision = self.controller._recommended_vision_precision
             vision = VISION_DOWNLOADS[family][precision]
             if not vision_path(folder, family, precision).is_file():
@@ -2867,7 +2863,7 @@ class ChatWindow(Adw.ApplicationWindow):
         if (
             embedding.get("enabled") is not False
             and not embedding_path(folder).is_file()
-            and embedding_auto_download_allowed()
+            and rule.embedding
         ):
             selected = Path(embedding.get("path") or ".")
             with suppress(RuntimeError):
@@ -2983,6 +2979,28 @@ class ChatWindow(Adw.ApplicationWindow):
             server_percent,
         )
         self._refresh_model_rows(config, downloaded_server, external)
+        self._refresh_model_parameter_defaults()
+
+    def _model_parameter_config(self, config):
+        profile = self.controller.model_recommendation()
+        balanced = MODEL_RECOMMENDATIONS[profile].balanced
+        model = config.get("model") or MODEL_DOWNLOADS[balanced].filename
+        return {**config, "recommendation": profile, "model": model}
+
+    def _refresh_model_parameter_defaults(self):
+        if not getattr(self, "_model_parameter_rows", None):
+            return
+        config = self._model_parameter_config(
+            self.controller.store.load_app_settings().get("model_server", {})
+        )
+        identity = config["recommendation"], config["model"]
+        if identity == self._model_parameter_identity:
+            return
+        self._model_parameter_identity = identity
+        values = server_parameters(config)
+        for key, (row, handler) in self._model_parameter_rows.items():
+            with row.handler_block(handler):
+                row.set_text(str(values[key]))
 
     @staticmethod
     def _update_download_indicator(indicator, text, active, percent):
@@ -3380,33 +3398,29 @@ class ChatWindow(Adw.ApplicationWindow):
 
         reasoning_handler = preserve.connect("notify::active", save_reasoning)
         reasoning.add(preserve)
-        options = Adw.PreferencesGroup(
-            title="Launch Parameters",
-            description="Leave fields blank to use Lopaca and llama-server defaults. "
-            "Press connect to apply new settings.",
-        )
-        options.add_css_class("model-settings-options")
-        advanced_content.append(options)
-        for key, title, hint in SERVER_FIELDS:
-            row = Adw.EntryRow(title=title, text=str(config.get(key, "")))
-            row.add_css_class("model-settings-row")
-            row.set_tooltip_text(f"--{key}: {hint}")
-            row.connect("notify::text", lambda entry, _pspec, key=key: save(key, entry.get_text()))
-            options.add(row)
-        for key, title in (
-            ("flash-attn", "Enable Flash Attention"),
-            ("fit", "Fit to Device Memory"),
+        self._model_parameter_rows = {}
+        defaults = self._model_parameter_config(config)
+        self._model_parameter_identity = defaults["recommendation"], defaults["model"]
+        values = server_parameters(defaults)
+        for heading, fields in (
+            ("Launch Parameters", SERVER_FIELDS),
+            ("Sampling Parameters", SAMPLING_FIELDS),
         ):
-            row = Adw.ActionRow(
-                title=title, subtitle=f"Pass --{key} on; unchecked uses server defaults"
+            options = Adw.PreferencesGroup(
+                title=heading,
+                description="Clear a field to use its default. Press Connect to apply changes.",
             )
-            row.add_css_class("model-settings-row")
-            check = Gtk.CheckButton(active=bool(config.get(key, False)), valign=Gtk.Align.CENTER)
-            check.add_css_class("model-settings-check")
-            check.connect("toggled", lambda button, key=key: save(key, button.get_active()))
-            row.add_suffix(check)
-            row.set_activatable_widget(check)
-            options.add(row)
+            options.add_css_class("model-settings-options")
+            advanced_content.append(options)
+            for key, title, hint in fields:
+                row = Adw.EntryRow(title=title, text=str(values[key]))
+                row.add_css_class("model-settings-row")
+                row.set_tooltip_text(f"--{key}: {hint}")
+                handler = row.connect(
+                    "notify::text", lambda entry, _pspec, key=key: save(key, entry.get_text())
+                )
+                self._model_parameter_rows[key] = row, handler
+                options.add(row)
 
         extra = Adw.PreferencesGroup(
             title="Additional Launch Parameters",

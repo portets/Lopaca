@@ -61,11 +61,8 @@ from rag import (
 )
 from server_builds import (
     cached_server_config,
-    custom_server_backend,
     default_model_configs,
-    detect_recommendation,
     detect_vision_precision,
-    embedding_auto_download_allowed,
     embedding_path,
     install_embedding,
     install_model,
@@ -75,6 +72,7 @@ from server_builds import (
     model_download_path,
     model_path,
     model_vision_family,
+    recommendation_for_config,
     vision_file_precision,
     vision_path,
 )
@@ -237,7 +235,7 @@ class ChatController:
         threading.Thread(
             target=lambda: self.view.dispatch(
                 self._set_model_recommendation,
-                detect_recommendation(config.get("backend")),
+                recommendation_for_config(config),
                 detect_vision_precision(config),
             ),
             daemon=True,
@@ -307,9 +305,9 @@ class ChatController:
                 if embedding_path(folder).with_suffix(".gguf.download").is_file() or (
                     legacy_embedding_file(embedding.get("path"))
                 ):
-                    backend = paths.get("backend") or custom_server_backend(paths["executable"])
+                    profile = recommendation_for_config(paths)
                     self.view.dispatch(
-                        lambda: self.download_embedding(automatic=True, backend=backend or "cpu")
+                        lambda: self.download_embedding(automatic=True, profile=profile)
                     )
 
         self.model_server.connect(
@@ -420,7 +418,7 @@ class ChatController:
                 }
             )
             if not installed:
-                self.download_embedding(automatic=True, backend=paths["backend"])
+                self.download_embedding(automatic=True, profile=paths["recommendation"])
 
         return self.model_server.connect(
             {**config, "mmproj": "", "mmproj_manual": False},
@@ -450,8 +448,11 @@ class ChatController:
     def _prepare_model_vision(self, config, stopped, *, strict=False):
         folder = self.store.root.parent
         model = config.get("model")
+        if not model or not Path(model).expanduser().is_file():
+            return config
+        config = {**config, "recommendation": recommendation_for_config(config)}
         family = model_vision_family(folder, model)
-        if not family or not Path(model).expanduser().is_file():
+        if not family:
             return config
         selected = {**config, "vision_family": family}
         projector = config.get("mmproj")
@@ -460,6 +461,10 @@ class ChatController:
         ):
             return selected
         chosen = vision_file_precision(folder, family, projector)
+        if not strict and not MODEL_RECOMMENDATIONS[config["recommendation"]].vision:
+            if chosen and Path(projector).expanduser().is_file():
+                return {**selected, "vision_precision": chosen}
+            return {**selected, "mmproj": ""}
         # Preserve explicit file choices, but let automatic selections follow the new backend.
         precision = (
             chosen
@@ -690,16 +695,15 @@ class ChatController:
         if self.memories.path.is_file():
             self.recall_embeddings.schedule(self.memories.path, "memories")
 
-    def download_embedding(self, *, automatic=False, backend=None):
+    def download_embedding(self, *, automatic=False, profile=None):
         stopped = self._model_file_stop.is_set
         if self.embedding_download_active or stopped():
             return
         config = self.store.load_app_settings().get("embedding_model", {})
         original_path = config.get("path", "")
         if automatic:
-            if config.get("enabled") is False or not embedding_auto_download_allowed(
-                backend or "cpu"
-            ):
+            rule = MODEL_RECOMMENDATIONS[profile or self.model_recommendation()]
+            if config.get("enabled") is False or not rule.embedding:
                 return
             with suppress(RuntimeError):
                 path = Path(original_path or ".").expanduser()
@@ -833,7 +837,9 @@ class ChatController:
                     )
                 self._model_download_progress("model", key, None)
                 family = MODEL_DOWNLOADS[key].vision_family
-                if family and family not in server.get("vision_disabled", ()):
+                if family and family not in server.get("vision_disabled", ()) and (
+                    MODEL_RECOMMENDATIONS[recommendation_for_config(server)].vision
+                ):
                     failure_title = "Vision download failed"
                     hardware = server or cached_server_config(folder) or {}
                     precision = detect_vision_precision(hardware)
@@ -1054,6 +1060,7 @@ class ChatController:
     def _connection_changed(self, connected):
         changed = self.connected is None or self.connected != connected
         self.connected = connected
+        self.client.use_server_sampling = bool(connected and self.model_server.running_config)
         if not connected:
             self.client.vision_enabled = False
         if connected:

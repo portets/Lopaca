@@ -1,6 +1,6 @@
 """Runtime settings for Lopaca."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 APP_DIR = Path.home() / ".local" / "share" / "lopaca"
@@ -158,7 +158,6 @@ EMBEDDING_DOWNLOAD = ModelDownload(
     "421a27e58d165478cc7acb984a688c2aa41404968b0203e7cd743ece44c54340",
 )
 EMBEDDING_LEGACY_Q8 = ("Qwen3-Embedding-0.6B-Q8_0.gguf", 639_150_016)
-EMBEDDING_CPU_AUTO_DOWNLOAD_MIN_RAM_GIB = 22 # for cpu-only main models
 EMBEDDING_QUERY_INSTRUCTION = (
     "Given a search query, retrieve relevant passages that answer the query"
 )
@@ -209,6 +208,57 @@ VISION_DOWNLOADS = {
 }
 
 
+# llama-server b12359 launch defaults. Set tier-specific changes in launch_parameters below.
+SERVER_LAUNCH_DEFAULTS = {
+    "ctx-size": 0,
+    "n-gpu-layers": "auto",
+    "threads": -1,
+    "threads-batch": -1,
+    "batch-size": 2048,
+    "ubatch-size": 512,
+    "parallel": -1,
+    "cache-ram": 8192,
+    "flash-attn": "auto",
+    "fit": "on",
+    "fit-ctx": 4096,
+    "fit-target": 1024,
+    "reasoning": "auto",
+    "reasoning-effort": "default",
+    "reasoning-budget": -1,
+    "spec-type": "none",
+    "spec-draft-n-max": 3,
+}
+
+DEFAULT_TEMPERATURE = 0.7  # Lopaca's existing default for other models and external servers.
+SERVER_SAMPLING_DEFAULTS = {
+    "temperature": DEFAULT_TEMPERATURE,
+    "top_p": 0.95,
+    "top_k": 40,
+    "min_p": 0.05,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0,
+}
+# Match model filenames by family and parameter count, across quantizations.
+MODEL_SAMPLING_DEFAULTS = {
+    "qwen3.8-27b": {
+        "temperature": 0.9,
+        "top_p": 0.9,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.5,
+        "repetition_penalty": 1.0,
+    },
+    "qwen3.5-9b": {
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.5,
+        "repetition_penalty": 1.0,
+    },
+}
+
+
 @dataclass(frozen=True)
 class ModelRecommendation:
     balanced: str
@@ -218,9 +268,14 @@ class ModelRecommendation:
     vram_gib: int = 0
     cuda_compute: int = 0
     ram_gib: int = 0
+    vision: bool = True
+    embedding: bool = True
+    launch_parameters: dict[str, int | float | str] = field(default_factory=dict)
 
 
 # First match wins. Discounts are for reported VRAM and RAM minor discrepancies.
+# Vision and embedding control automatic setup. Users can install either manually.
+# Example tier override: launch_parameters={"ctx-size": 65536, "fit-target": 512}.
 MODEL_TOTAL_VRAM_DISCOUNT_GIB = 1
 MODEL_FREE_VRAM_DISCOUNT_GIB = 2
 MODEL_TOTAL_RAM_DISCOUNT_GIB = 2
@@ -229,6 +284,8 @@ MODEL_RECOMMENDATIONS = {
         balanced="27b-nvfp4",
         faster="27b-q2",
         better="27b-q8",
+        vision=True,
+        embedding=True,
         backends=("cuda",),
         vram_gib=12,
         cuda_compute=100,
@@ -237,6 +294,8 @@ MODEL_RECOMMENDATIONS = {
         balanced="27b-q4m",
         faster="27b-q2",
         better="27b-q6",
+        vision=True,
+        embedding=True,
         backends=("cuda", "vulkan"),
         vram_gib=12,
     ),
@@ -244,6 +303,8 @@ MODEL_RECOMMENDATIONS = {
         balanced="27b-q2",
         faster="9b-q4",
         better="27b-q4s",
+        vision=True,
+        embedding=True,
         backends=("cuda", "vulkan"),
         vram_gib=8,
     ),
@@ -252,6 +313,8 @@ MODEL_RECOMMENDATIONS = {
         balanced="9b-q4",
         faster="9b-q3",
         better="27b-q4s",
+        vision=True,
+        embedding=True,
         ram_gib=32,
     ),
     # Includes remainder.
@@ -259,6 +322,8 @@ MODEL_RECOMMENDATIONS = {
         balanced="9b-q4",
         faster="9b-q3",
         better="9b-q5",
+        vision=True,
+        embedding=False,
     ),
 }
 
@@ -269,7 +334,7 @@ class Settings:
     server_url: str = "http://localhost:9931/v1"
     api_key: str = "sk-no-key-required"
     model: str = "local-model"
-    temperature: float = 0.7
+    temperature: float = DEFAULT_TEMPERATURE
     # None lets llama-server use its configured generation limit.
     max_tokens: int | None = None
     request_timeout: int = 600

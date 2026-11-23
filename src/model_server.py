@@ -16,20 +16,36 @@ from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from settings import (
+    MODEL_RECOMMENDATIONS,
+    MODEL_SAMPLING_DEFAULTS,
+    SERVER_LAUNCH_DEFAULTS,
+    SERVER_SAMPLING_DEFAULTS,
+)
+
 DOWNLOADING_MODEL = "Downloading model"
 _GPU_LAYERS = re.compile(r"\boffloaded (\d+)/\d+ layers to GPU\b")
 
-# Blank values inherit llama-server defaults, rather than model-specific presets.
 SERVER_FIELDS = (
     ("ctx-size", "Context size", "Tokens; 0 uses the model default"),
     ("n-gpu-layers", "GPU layers", "Number of layers, auto or all"),
-    ("threads", "CPU threads", "Generation threads"),
-    ("threads-batch", "Prefill threads", "Prompt-processing threads"),
+    ("threads", "CPU threads", "Generation threads; -1 uses automatic detection"),
+    ("threads-batch", "Prefill threads", "Prompt-processing threads; -1 follows CPU threads"),
     ("batch-size", "Batch size", "Logical prompt batch size"),
     ("ubatch-size", "Micro batch size", "Physical prompt batch size"),
-    ("parallel", "Parallel slots", "Maximum simultaneous requests"),
+    ("parallel", "Parallel slots", "Maximum simultaneous requests; -1 uses automatic detection"),
+    ("cache-ram", "Prompt cache RAM", "MiB; 0 disables the cache and -1 removes its limit"),
+    ("flash-attn", "Flash Attention", "on, off or auto"),
+    ("fit", "Fit to device memory", "on or off"),
+    ("fit-ctx", "Minimum fitted context", "Minimum context size in tokens when fitting"),
+    ("fit-target", "Fit memory margin", "MiB to leave free per device; use commas for each device"),
+    ("reasoning", "Reasoning", "on, off or auto"),
     ("reasoning-budget", "Reasoning budget", "Server default thinking token budget"),
     ("reasoning-effort", "Reasoning effort", "Server default; requires model support"),
+    ("spec-type", "Speculative decoding", "none, draft-mtp or another supported mode"),
+    ("spec-draft-n-max", "Maximum drafted tokens", "Tokens predicted per speculative step"),
+)
+SAMPLING_FIELDS = (
     ("temp", "Temperature", "Sampling temperature"),
     ("top-p", "Top P", "Nucleus sampling threshold"),
     ("top-k", "Top K", "Candidate token count"),
@@ -37,6 +53,35 @@ SERVER_FIELDS = (
     ("presence-penalty", "Presence penalty", "Penalty for previously used tokens"),
     ("repeat-penalty", "Repeat penalty", "Repetition penalty"),
 )
+
+_SAMPLING_FLAGS = {
+    "temperature": "temp", "top_p": "top-p", "top_k": "top-k", "min_p": "min-p",
+    "presence_penalty": "presence-penalty", "repetition_penalty": "repeat-penalty",
+}
+
+
+def server_parameters(config):
+    """Resolve defaults, the hardware tier, then saved settings for UI and argv."""
+    model = Path(config.get("model") or "").name.casefold()
+    sampling = next(
+        (values for prefix, values in MODEL_SAMPLING_DEFAULTS.items() if model.startswith(prefix)),
+        {},
+    )
+    parameters = dict(SERVER_LAUNCH_DEFAULTS)
+    sampling = SERVER_SAMPLING_DEFAULTS | sampling
+    parameters.update(
+        (_SAMPLING_FLAGS[name], value) for name, value in sampling.items()
+    )
+    if rule := MODEL_RECOMMENDATIONS.get(config.get("recommendation")):
+        parameters.update(rule.launch_parameters)
+    for key in parameters.keys() & config.keys():
+        value = config[key]
+        # Older settings stored the Flash Attention and Fit checkboxes as booleans.
+        if key in ("flash-attn", "fit") and isinstance(value, bool):
+            value = "on" if value else ""
+        if value is not None and str(value).strip():
+            parameters[key] = value
+    return parameters
 
 
 def launch_command(config, server_url):
@@ -80,13 +125,8 @@ def launch_command(config, server_url):
         if not projector.is_file():
             raise ValueError(f"The vision file does not exist or is not a file.\nPath: {projector}")
         args.extend(("--mmproj", str(projector.resolve())))
-    for key, _title, _hint in SERVER_FIELDS:
-        value = str(config.get(key, "")).strip()
-        if value:
-            args.extend(("--" + key, value))
-    for key in ("flash-attn", "fit"):
-        if config.get(key, False):
-            args.extend(("--" + key, "on"))
+    for key, value in server_parameters(config).items():
+        args.extend(("--" + key, str(value).strip()))
     devices = config.get("devices")
     if (
         devices

@@ -225,6 +225,7 @@ class LlamaClient:
         self.active_response = None
         self.context_capacity = None
         self.vision_enabled = False
+        self.use_server_sampling = False
         self.last_context_used = None
         self.last_auto_choice = None
         self._context_exhausted = False
@@ -876,12 +877,13 @@ class LlamaClient:
             "tool_choice": "auto",
             "stream": True,
             "return_progress": True,
-            "temperature": self.settings.temperature,
             "stream_options": {"include_usage": True},
             "timings_per_token": True,
             "chat_template_kwargs": {"preserve_thinking": preserve_thinking},
             "reasoning_budget_message": f" -\n{budget_message}" if budget_message else "",
         }
+        if not self.use_server_sampling:
+            body["temperature"] = self.settings.temperature
         body["chat_template_kwargs"].update(thinking.get("chat_template_kwargs", {}))
         body.update(
             {key: value for key, value in thinking.items() if key != "chat_template_kwargs"}

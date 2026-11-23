@@ -17,7 +17,6 @@ from tempfile import TemporaryDirectory
 from threading import Event, Lock
 
 from settings import (
-    EMBEDDING_CPU_AUTO_DOWNLOAD_MIN_RAM_GIB,
     EMBEDDING_DOWNLOAD,
     EMBEDDING_LEGACY_Q8,
     MODEL_DOWNLOADS,
@@ -125,14 +124,6 @@ def total_ram_gib():
     with suppress(AttributeError, OSError, ValueError):
         return max(0, os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // (1 << 30))
     return 0
-
-
-def embedding_auto_download_allowed(backend=None):
-    if total_ram_gib() >= EMBEDDING_CPU_AUTO_DOWNLOAD_MIN_RAM_GIB:
-        return True
-    if backend is None and (arch := _server_arch()):
-        backend, _ = next(_candidates(arch))
-    return bool(backend and (backend.startswith("cuda") or backend == "vulkan"))
 
 
 def _nvidia_board_memory(driver, device):
@@ -287,9 +278,20 @@ def detect_recommendation(backend=None):
     arch = _server_arch()
     if arch is not None:
         for candidate, devices in _candidates(arch):
-            if backend is None or candidate == backend:
+            if backend is None or candidate == backend or (
+                backend == "cuda" and candidate.startswith("cuda")
+            ):
                 return recommendation_for(candidate, devices.values())
     return recommendation_for("cpu", ())
+
+
+def recommendation_for_config(config):
+    if (profile := config.get("recommendation")) in MODEL_RECOMMENDATIONS:
+        return profile
+    backend = config.get("backend")
+    if not backend and (executable := config.get("executable")):
+        backend = custom_server_backend(executable) or "cpu"
+    return detect_recommendation(backend)
 
 
 def detect_vision_precision(config, *, fallback="FP16"):
