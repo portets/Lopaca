@@ -196,6 +196,7 @@ class _EmbeddingSession:
         if not rows or not self.available:
             return rows
         normalized = " " + " ".join(re.findall(r"\w+", query.casefold())) + " "
+        terms = _query_literals(query)
         exact = _exact_patterns(query)
         protected_sources = set()
         choices = []
@@ -210,7 +211,9 @@ class _EmbeddingSession:
                 anchor = key[0] not in protected_sources and any(
                     (name := " ".join(re.findall(r"\w+", value.casefold())))
                     and f" {name} " in normalized
-                    for value in names
+                    # A single title word like "compound" can name an unrelated article.
+                    and (index == 0 or " " in name or terms == {name})
+                    for index, value in enumerate(names)
                 )
                 if anchor:
                     protected_sources.add(key[0])
@@ -580,6 +583,11 @@ _RECALL_CUTOFFS = {
     "memories": (0.45, 0.56, 0.62),
     "history": (0.55, 0.54, 0.63),
 }
+_EXPLICIT_HISTORY_RECALL = re.compile(
+    r"\b(?:what did (?:i|we|you) (?:say|decide|choose|agree|discuss)|"
+    r"remind me (?:what|which|where|when|how))\b",
+    re.IGNORECASE,
+)
 
 
 def _vector_model(db):
@@ -697,6 +705,9 @@ def _rank_vectors(db, query, vector, rows, scope, limit, excluded, stopped):
             kept.remove(winner)
             kept.insert(0, winner)
     add_threshold = max(filter_at, add_with_keywords_at if kept else add_at)
+    if scope == "history" and not kept and _EXPLICIT_HISTORY_RECALL.search(query):
+        # Explicit recall can use the lower semantic-only cutoff without broadening ordinary chat.
+        add_threshold = add_at
     if not shortlist:
         return kept
     replaced_score = -math.inf
