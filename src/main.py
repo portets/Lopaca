@@ -61,12 +61,14 @@ from rag import (
 )
 from server_builds import (
     cached_server_config,
+    custom_asset_info,
     default_model_configs,
     detect_vision_precision,
     embedding_path,
     install_embedding,
     install_model,
     install_vision,
+    managed_server_file,
     managed_vision_file,
     model_download_path,
     model_path,
@@ -84,6 +86,8 @@ from settings import (
     Settings,
 )
 from storage import ChatStore, MemoryStore
+
+CUSTOM_MODEL_FILE_KINDS = ("executable", "model", "mmproj")
 
 
 def build_system_prompt(agent_mode, style="neutral", *, memories=False):
@@ -140,7 +144,9 @@ class ChatController:
         self.settings, self.store, self.client = settings, ChatStore(), LlamaClient(settings)
         self.memories = MemoryStore(self.store.root.parent / "memories.sqlite", settings)
         self.recall_embeddings = RecallEmbeddings(
-            lambda session: self.view.dispatch(self._embedding_changed, session)
+            lambda session: self.view.dispatch(self._embedding_changed, session),
+            server_busy=lambda: self.model_server.busy,
+            legacy_executables=self._legacy_embedding_executables,
         )
         self._indexed_embedding_session = None
         self.knowledge = KnowledgeStore()
@@ -213,11 +219,11 @@ class ChatController:
         app_settings = self.store.load_app_settings()
         try:
             app_settings = self._apply_advanced_model_settings(app_settings)
+            self._register_existing_model_files(app_settings)
         except OSError as exc:
             self.view._show_alert("Could not save model settings", str(exc))
         self.first_launch = app_settings.get("first_launch") is True
         self.chat_sort = app_settings["chat_sort"]
-        self._refresh_embedding_indexes()
         threading.Thread(target=self._monitor_connection, daemon=True).start()
         chats = self.store.list()
         for chat in chats:
@@ -280,6 +286,163 @@ class ChatController:
         settings = self.store.load_app_settings()
         settings["model_server"] = config
         self.store.save_app_settings(settings)
+
+    def _is_managed_asset(self, kind, path):
+        folder = self.store.root.parent
+        if kind == "executable":
+            return managed_server_file(folder, path)
+        if kind == "mmproj":
+            return managed_vision_file(folder, path)
+        path = Path(path).expanduser()
+        return any(path == model_path(folder, key) for key in MODEL_DOWNLOADS)
+
+    def _register_existing_model_files(self, settings):
+        config = settings.get("model_server", {})
+        assets = settings.setdefault("custom_model_files", {})
+        changed = assets.pop("path", None) is not None
+        embedding = settings.get("embedding_model", {})
+        if (filename := embedding.get("path")):
+            bundled = embedding_path(self.store.root.parent)
+            if Path(filename).expanduser() != bundled:
+                embedding["path"] = str(bundled) if bundled.is_file() else ""
+                changed = True
+        for kind in CUSTOM_MODEL_FILE_KINDS:
+            path = config.get(kind)
+            if path and not self._is_managed_asset(kind, path):
+                entries = assets.setdefault(kind, {})
+                if path in entries:
+                    continue
+                with suppress(OSError):
+                    entries[path] = {
+                        **custom_asset_info(kind, Path(path).expanduser(), inspect=False),
+                        "added": time.time_ns(),
+                    }
+                    if kind == "executable":
+                        entries[path].update(
+                            (key, config[key]) for key in ("version", "backend", "recommendation")
+                            if config.get(key)
+                        )
+                    changed = True
+        if changed:
+            self.store.save_app_settings(settings)
+
+    def custom_model_files(self):
+        return self.store.load_app_settings().get("custom_model_files", {})
+
+    def managed_model_server_config(self, settings):
+        folder = self.store.root.parent
+        saved = settings.get("managed_model_server", {})
+        path = saved.get("executable")
+        return saved if path and Path(path).is_file() else cached_server_config(folder)
+
+    def add_custom_model_file(self, kind, filename, finished):
+        if kind not in CUSTOM_MODEL_FILE_KINDS:
+            finished()
+            return
+        path = str(Path(filename).expanduser().absolute())
+        if self._is_managed_asset(kind, path) or path in self.custom_model_files().get(kind, {}):
+            finished()
+            return
+
+        def done(info, error):
+            try:
+                if error:
+                    self.view._show_alert("Could not add file", error)
+                else:
+                    settings = self.store.load_app_settings()
+                    entries = settings.setdefault("custom_model_files", {}).setdefault(kind, {})
+                    entries.setdefault(path, {**info, "added": time.time_ns()})
+                    self.store.save_app_settings(settings)
+            except OSError as exc:
+                self.view._show_alert("Could not save model settings", str(exc))
+            finally:
+                finished()
+
+        def probe():
+            try:
+                info = custom_asset_info(kind, path)
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+                self.view.dispatch(done, None, str(exc))
+            else:
+                self.view.dispatch(done, info, None)
+
+        threading.Thread(target=probe, daemon=True).start()
+
+    def select_custom_model_file(self, kind, path, active, *, remove=False):
+        if (
+            kind not in CUSTOM_MODEL_FILE_KINDS
+            or self.model_setup_busy()
+            or self._model_selection_busy()
+        ):
+            return
+        settings = self._settings_for_model_change()
+        if settings is None:
+            return
+        config = settings.setdefault("model_server", {})
+        entries = settings.get("custom_model_files", {}).get(kind, {})
+        if path not in entries or (active and not Path(path).expanduser().is_file()):
+            return
+        if self.model_configuration() is None and (active or not remove):
+            return
+        switching = active or config.get(kind) == path
+        if switching and kind == "mmproj" and active and not config.get("model"):
+            return
+        if switching and kind == "model" and active:
+            self.request_model_switch(path)
+            return
+        if switching and kind == "executable":
+            if managed_server_file(self.store.root.parent, config.get("executable")):
+                settings["managed_model_server"] = {
+                    key: config.get(key)
+                    for key in ("executable", "backend", "devices", "version", "recommendation")
+                }
+            server = entries[path] | {"executable": path} if active else (
+                self.managed_model_server_config(settings) or {"executable": ""}
+            )
+            for key in ("executable", "backend", "devices", "version", "recommendation"):
+                config[key] = server.get(key) or ("" if key == "executable" else None)
+        elif kind == "mmproj":
+            self._set_custom_projector(config, path, active, switching, remove)
+        elif switching:
+            config.update(model="", mmproj="", mmproj_manual=False)
+        if remove:
+            entries.pop(path)
+        try:
+            self.store.save_app_settings(settings)
+        except OSError as exc:
+            self.view._show_alert("Could not save model settings", str(exc))
+            return
+        if switching and kind == "executable":
+            self._refresh_embedding_indexes()
+        if switching and config.get("model") and config.get("executable"):
+            self._connect_configured_model(config)
+        elif switching and self.model_server.running_config is not None:
+            self.model_server.disconnect(lambda: self.view.dispatch(
+                self.view.refresh_model_configuration
+            ))
+        self.view.refresh_model_configuration()
+
+    def _set_custom_projector(self, config, path, active, switching, remove):
+        projectors = config.setdefault("custom_projectors", {})
+        model = config.get("model")
+        if remove:
+            for name in [name for name, projector in projectors.items() if projector == path]:
+                projectors.pop(name)
+        if not switching:
+            return
+        if active:
+            projectors[model] = path
+        else:
+            projectors.pop(model, None)
+        config.update(mmproj=path if active else "", mmproj_manual=active)
+        family = model_vision_family(self.store.root.parent, model)
+        if family:
+            disabled = set(config.get("vision_disabled", ()))
+            if active:
+                disabled.discard(family)
+            else:
+                disabled.add(family)
+            config["vision_disabled"] = sorted(disabled)
 
     def save_advanced_model_settings(self, section, changes):
         # Save edits now and apply them at the next connection or model settings change.
@@ -443,6 +606,11 @@ class ChatController:
 
     def _connect_default_model(self, config, model_key=None, *, installed=False, on_finished=None):
         self.download_cancels["model"].clear()
+        path = config.get("model")
+        custom_model = path if (
+            not model_key and path and not self._is_managed_asset("model", path)
+            and Path(path).expanduser().is_file()
+        ) else None
 
         def prepare(stopped):
             cancelled = self.download_cancels["model"].is_set
@@ -452,6 +620,7 @@ class ChatController:
                     lambda: stopped() or cancelled(),
                     self._model_download_progress,
                     model_key=model_key,
+                    custom_model=custom_model,
                     installed=installed,
                     discard=cancelled,
                 )
@@ -481,7 +650,7 @@ class ChatController:
                 self.download_embedding(automatic=True, profile=paths["recommendation"])
 
         return self.model_server.connect(
-            {**config, "mmproj": "", "mmproj_manual": False},
+            config if custom_model else {**config, "mmproj": "", "mmproj_manual": False},
             prepare=prepare,
             prepare_config=self._prepare_model_vision,
             on_finished=on_finished,
@@ -511,6 +680,10 @@ class ChatController:
         if not model or not Path(model).expanduser().is_file():
             return config
         config = {**config, "recommendation": recommendation_for_config(config)}
+        if (projector := config.get("custom_projectors", {}).get(model)) and (
+            Path(projector).expanduser().is_file()
+        ):
+            config.update(mmproj=projector, mmproj_manual=True)
         family = model_vision_family(folder, model)
         if not family:
             return config
@@ -551,7 +724,10 @@ class ChatController:
         if config.get("model") == original.get("model") and config.get("mmproj") == original.get(
             "mmproj"
         ):
-            changes = {key: paths[key] for key in ("mmproj", "vision_precision") if key in paths}
+            changes = {
+                key: paths[key] for key in ("mmproj", "mmproj_manual", "vision_precision")
+                if key in paths
+            }
         if update_preference:
             changes["vision_disabled"] = paths["vision_disabled"]
         if any(config.get(key) != value for key, value in changes.items()):
@@ -572,18 +748,27 @@ class ChatController:
             return
         saved = settings.get("model_server", {})
         disabled = set(saved.get("vision_disabled", ()))
+        selected = dict(saved)
         if active:
             disabled.discard(family)
+            if not managed_vision_file(self.store.root.parent, selected.get("mmproj")):
+                selected.update(mmproj="", mmproj_manual=False)
+            selected["custom_projectors"] = {
+                model: projector for model, projector in saved.get("custom_projectors", {}).items()
+                if model != selected.get("model")
+            }
         else:
             disabled.add(family)
 
         def save(paths):
+            if active and selected["custom_projectors"] != saved.get("custom_projectors", {}):
+                self._save_downloaded_model({"custom_projectors": selected["custom_projectors"]})
             self._save_vision_settings(saved, paths, True)
             if on_config is not None:
                 on_config()
 
         self.model_server.connect(
-            {**saved, "vision_disabled": sorted(disabled)},
+            {**selected, "vision_disabled": sorted(disabled)},
             prepare_config=lambda config, stopped: self._prepare_model_vision(
                 config, stopped, strict=True
             ),
@@ -623,7 +808,6 @@ class ChatController:
                         vision_precision=vision_file_precision(folder, family, path),
                     )
                 self.set_model_server_config({**saved, **changes})
-                self.view.update_model_paths(changes)
                 running = self.model_server.running_config or {}
                 if (
                     "mmproj" in changes and running.get("model") == saved.get("model")
@@ -675,8 +859,6 @@ class ChatController:
                     disabled = set(config.get("vision_disabled", ()))
                     config["vision_disabled"] = sorted(disabled | {family})
                     self.set_model_server_config(config)
-                if projector in paths:
-                    self.view.update_model_paths({"mmproj": ""})
                 for path in paths:
                     path.unlink(missing_ok=True)
                     path.with_suffix(".gguf.download").unlink(missing_ok=True)
@@ -706,18 +888,33 @@ class ChatController:
         embedding = settings.get("embedding_model", {})
         executable = settings.get("model_server", {}).get("executable")
         filename = embedding.get("path")
-        if embedding.get("enabled") is False or not executable or not filename:
+        if embedding.get("enabled") is False or not filename:
             return None
         with suppress(OSError, RuntimeError):
-            if (
-                Path(executable).expanduser().is_file()
-                and Path(filename).expanduser().is_file()
+            folder = self.store.root.parent
+            bundled = embedding_path(folder)
+            managed = self.managed_model_server_config(settings)
+            if managed:
+                executable = managed["executable"]
+            if Path(filename).expanduser() == bundled and (
+                executable and bundled.is_file() and Path(executable).expanduser().is_file()
             ):
-                return executable, filename, embedding.get("parameters")
+                return executable, str(bundled), embedding.get("parameters")
         return None
 
+    def _legacy_embedding_executables(self):
+        settings = self.store.load_app_settings()
+        return (
+            *settings.get("custom_model_files", {}).get("executable", {}),
+            settings.get("model_server", {}).get("executable"),
+            *(self.store.root.parent / "server").glob("*/llama-server"),
+        )
+
     def _refresh_embedding_indexes(self):
-        session = self.recall_embeddings.configure(self._embedding_configuration())
+        config = self._embedding_configuration()
+        if config and (not self.connected or self.model_server.busy):
+            return
+        session = self.recall_embeddings.configure(config)
         if session is self._indexed_embedding_session:
             return
         self._indexed_embedding_session = session
@@ -783,7 +980,6 @@ class ChatController:
             try:
                 if path is not None and current == original_path:
                     self.set_embedding_setting("path", str(path), enable=True)
-                    self.view.update_model_paths({"embedding_path": str(path)})
             finally:
                 self.view.update_model_download("embedding", None, None)
 
@@ -833,17 +1029,12 @@ class ChatController:
             self.view.refresh_model_configuration()
             return
         config = settings.get("embedding_model", {}) | drafts.get("embedding_model", {})
-        path = None
         if active:
-            current = Path(config.get("path") or ".")
-            with suppress(RuntimeError):
-                current = current.expanduser()
-            if not current.is_file():
-                path = embedding_path(self.store.root.parent)
-                if not path.is_file():
-                    self.view.refresh_model_configuration()
-                    return
-                config["path"] = str(path)
+            path = embedding_path(self.store.root.parent)
+            if not path.is_file():
+                self.view.refresh_model_configuration()
+                return
+            config["path"] = str(path)
         config["enabled"] = active
         try:
             settings = self._merge_advanced_model_settings(settings)
@@ -854,8 +1045,6 @@ class ChatController:
         else:
             if reconnect:
                 self._connect_configured_model(server)
-            if path is not None:
-                self.view.update_model_paths({"embedding_path": str(path)})
             self._refresh_embedding_indexes()
         self.view.refresh_model_configuration()
 
@@ -873,7 +1062,6 @@ class ChatController:
                 config.update(path="", enabled=False)
                 self.store.save_app_settings(settings)
                 self._refresh_embedding_indexes()
-                self.view.update_model_paths({"embedding_path": ""})
             path.unlink(missing_ok=True)
             path.with_suffix(".gguf.download").unlink(missing_ok=True)
         except OSError as exc:
@@ -963,13 +1151,31 @@ class ChatController:
 
     def installed_models(self):
         folder = self.store.root.parent
-        return tuple(key for key in MODEL_DOWNLOADS if model_path(folder, key).is_file())
+        return tuple(key for key in MODEL_DOWNLOADS if model_path(folder, key).is_file()) + tuple(
+            path for path in self.custom_model_files().get("model", {})
+            if Path(path).expanduser().is_file()
+        )
+
+    def installed_model_path(self, key):
+        return model_path(self.store.root.parent, key) if key in MODEL_DOWNLOADS else (
+            Path(key).expanduser()
+        )
+
+    def custom_models_in_order(self, keys, entries):
+        def added(key):
+            if key in entries:
+                return entries[key]["added"]
+            with suppress(OSError):
+                return self.installed_model_path(key).stat().st_mtime_ns
+            return 0
+
+        return tuple(sorted(keys, key=added))
 
     def request_model_switch(self, key, *, reload=False):
         config = self.model_configuration()
         if config is None or key not in self.installed_models():
             return
-        path = model_path(self.store.root.parent, key)
+        path = self.installed_model_path(key)
         current = Path(config.get("model") or ".").expanduser()
         owned = self.model_server.running_config is not None
         self.model_switch_target = None if current == path and owned and not reload else key
@@ -1038,7 +1244,7 @@ class ChatController:
         if config is None or self._model_selection_busy():
             self.view.refresh_model_configuration()
             return
-        path = model_path(self.store.root.parent, key)
+        path = self.installed_model_path(key)
         if not active:
             if Path(config.get("model") or ".").expanduser() == path:
                 saved = self.store.load_app_settings().get("model_server", {})
@@ -1057,11 +1263,11 @@ class ChatController:
         if settings is None:
             return False
         saved = settings.get("model_server", {})
-        path = model_path(self.store.root.parent, key)
+        path = self.installed_model_path(key)
         executable = saved.get("executable")
         if executable and ("executable" in draft or Path(executable).expanduser().is_file()):
             selected = {**saved, "model": str(path)}
-            family = MODEL_DOWNLOADS[key].vision_family
+            family = MODEL_DOWNLOADS[key].vision_family if key in MODEL_DOWNLOADS else None
             if not draft.get("mmproj_manual") and str(path) != saved.get("model") and (
                 not family
                 or family != model_vision_family(self.store.root.parent, saved.get("model"))
@@ -1074,7 +1280,13 @@ class ChatController:
                 on_config=lambda paths: self.view.dispatch(self._save_downloaded_model, paths),
                 on_finished=on_finished,
             )
-        return self._connect_default_model(saved, key, installed=True, on_finished=on_finished)
+        if key in MODEL_DOWNLOADS:
+            return self._connect_default_model(saved, key, installed=True, on_finished=on_finished)
+        self.set_model_server_config({
+            **saved, "model": str(path), "mmproj": "", "mmproj_manual": False,
+        })
+        self.view.refresh_model_configuration()
+        return False
 
     def _unload_model(self, config, *, delete=None):
         def unloaded():
@@ -1083,7 +1295,7 @@ class ChatController:
                 self.set_model_server_config(paths)
                 if delete:
                     self._remove_model_files(delete)
-                self.view.update_model_paths(paths)
+                self.view.refresh_model_configuration()
             except OSError as exc:
                 self.view._show_alert("Could not unload model", str(exc))
 
@@ -1108,7 +1320,6 @@ class ChatController:
             if Path(saved.get("model") or ".").expanduser() == path:
                 paths = {**saved, "model": "", "mmproj": ""}
                 self.set_model_server_config(paths)
-                self.view.update_model_paths(paths)
             self._remove_model_files(key)
         except OSError as exc:
             self.view._show_alert("Could not delete model", str(exc))
@@ -1121,13 +1332,20 @@ class ChatController:
 
     def _save_downloaded_model(self, paths):
         paths = {key: value for key, value in paths.items() if key != "vision_family"}
-        config = self.store.load_app_settings().get("model_server", {})
+        settings = self.store.load_app_settings()
+        config = settings.get("model_server", {}) | paths
+        settings["model_server"] = config
+        if managed_server_file(self.store.root.parent, config.get("executable")):
+            settings["managed_model_server"] = {
+                key: config.get(key)
+                for key in ("executable", "backend", "devices", "version", "recommendation")
+            }
         try:
-            self.set_model_server_config({**config, **paths})
+            self.store.save_app_settings(settings)
         except OSError as exc:
             self.view._show_alert("Could not save model paths", str(exc))
         else:
-            self.view.update_model_paths(paths)
+            self.view.refresh_model_configuration()
 
     def _model_server_changed(self, text, busy):
         self.view.dispatch(self.view.update_model_server, text, busy)
@@ -1148,6 +1366,7 @@ class ChatController:
         if connected:
             self.was_connected = True
             self._finish_first_launch()
+            self._refresh_embedding_indexes()
         elif changed and self.first_launch:
             self.view.update_first_launch()
         if changed and not self.busy:
@@ -1162,7 +1381,6 @@ class ChatController:
     def _monitor_connection(self):
         while True:
             with suppress(OSError):
-                self._refresh_embedding_indexes()
                 for folder in self.store.root.iterdir():
                     self.document_indexer.schedule(folder / "documents")
             if not self.switching_model:
@@ -1592,23 +1810,31 @@ class ChatController:
 
     def change_memory(self, memory_id, text, core, *, delete=False):
         """Apply a manual edit; return the saved record so the UI can reflect validation."""
-        self.memories.apply(
+        adding = memory_id is None and not delete
+        text = " ".join(text.split())
+        accepted = self.memories.apply(
             [
                 {
-                    "action": "delete" if delete else "update",
+                    "action": "delete" if delete else "add" if adding else "update",
                     "id": memory_id,
                     "text": text,
                     "kind": "core" if core else "casual",
                     "evidence": text or "Delete memory",
+                    **({"search_terms": text[:200]} if adding else {}),
                 }
             ],
             text or "Delete memory",
             "manual",
             {memory_id},
         )
-        self._schedule_memory_vectors()
-        if not delete:
-            return next((record for record in self.list_memories() if record[0] == memory_id), None)
+        if accepted:
+            self._schedule_memory_vectors()
+        if not delete and (accepted or not adding):
+            return next(
+                (record for record in self.list_memories()
+                 if (record[1] == text if adding else record[0] == memory_id)),
+                None,
+            )
         return None
 
     def set_memory_core(self, memory_id, core):

@@ -501,6 +501,118 @@ def cached_server_config(folder):
     return None
 
 
+def managed_server_file(folder, filename):
+    path = Path(filename or ".").expanduser()
+    return any(
+        path == _server_path(folder / "server", arch, backend) for arch, backend in _ASSETS
+    )
+
+
+_GGUF_SCALARS = struct.Struct("<I")
+_GGUF_VALUE_SIZES = (1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8)
+_GGUF_PRECISION = {
+    0: "F32", 1: "FP16", 2: "Q4_0", 3: "Q4_1", 7: "Q8_0", 8: "Q5_0", 9: "Q5_1",
+    10: "Q2_K", 11: "Q3_K_S", 12: "Q3_K_M", 13: "Q3_K_L", 14: "Q4_K_S", 15: "Q4_K_M",
+    16: "Q5_K_S", 17: "Q5_K_M", 18: "Q6_K", 19: "IQ2_XXS", 20: "IQ2_XS", 21: "Q2_K_S",
+    22: "IQ3_XS", 23: "IQ3_XXS", 24: "IQ1_S", 25: "IQ4_NL", 26: "IQ3_S", 27: "IQ3_M",
+    28: "IQ2_S", 29: "IQ2_M", 30: "IQ4_XS", 31: "IQ1_M", 32: "BF16", 36: "TQ1_0",
+    37: "TQ2_0", 38: "MXFP4_MOE", 39: "NVFP4", 40: "Q1_0", 41: "Q2_0", 42: "F8_E4M3",
+}
+
+
+def _gguf_labels(path, *, validate):
+    """Read display strings from a bounded prefix without loading any tensor data."""
+    labels = {}
+    with path.open("rb") as source:
+        data = source.read(256 * 1024)
+    if data[:4] != b"GGUF" or len(data) < 24:
+        if validate:
+            raise ValueError("The selected file does not have a valid GGUF header.")
+        return labels
+    offset = 24
+
+    def integer(fmt):
+        nonlocal offset
+        value, = fmt.unpack_from(data, offset)
+        offset += fmt.size
+        return value
+
+    length = struct.Struct("<Q")
+
+    def string():
+        nonlocal offset
+        size = integer(length)
+        if size > len(data) - offset:
+            raise ValueError("String extends beyond the metadata prefix.")
+        value = data[offset:offset + size].decode("utf-8", "replace")
+        offset += size
+        return value
+
+    with suppress(ValueError, IndexError, struct.error):
+        for _ in range(min(4096, length.unpack_from(data, 16)[0])):
+            key = string()
+            kind = integer(_GGUF_SCALARS)
+            if kind == 8:
+                value = string()
+                if key in (
+                    "general.name", "general.basename", "general.organization", "general.author",
+                    "general.quantized_by",
+                ):
+                    labels[key] = value[:160]
+            elif kind == 4 and key == "general.file_type":
+                labels["quantization"] = _GGUF_PRECISION.get(integer(_GGUF_SCALARS), "")
+            elif kind == 9:
+                item_kind = integer(_GGUF_SCALARS)
+                count = integer(length)
+                if item_kind == 8:
+                    for _ in range(min(count, len(data) // length.size)):
+                        string()
+                else:
+                    size = _GGUF_VALUE_SIZES[item_kind]
+                    if not size:
+                        break
+                    offset += size * count
+            else:
+                offset += _GGUF_VALUE_SIZES[kind]
+    return labels
+
+
+def custom_asset_info(kind, filename, *, inspect=True):
+    path = Path(filename)
+    if kind == "executable":
+        if not inspect:
+            return {"name": "llama.cpp"}
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise ValueError("Choose an executable llama-server file.")
+        version = re.search(
+            r"^version: (.+)", _server_info(path, "--version", timeout=4), re.MULTILINE
+        )
+        if not version:
+            raise ValueError("The selected executable did not report a llama-server version.")
+        backend = custom_server_backend(path)
+        return {
+            "name": "llama.cpp",
+            "version": version[1].strip(),
+            "backend": backend,
+            "recommendation": detect_recommendation(backend or "cpu"),
+        }
+    if inspect and (not path.is_file() or path.suffix.casefold() != ".gguf"):
+        raise ValueError("Choose a local GGUF file.")
+    labels = _gguf_labels(path, validate=inspect) if path.is_file() else {}
+    stem = re.sub(r"-\d{5}-of-\d{5}$", "", path.stem)
+    quant = re.search(r"(?i)(?:^|[-_.])(NVFP4|IQ\d[\w]*|Q\d[\w]*|BF16|FP16|F16|F32)$", stem)
+    name = labels.get("general.name") or labels.get("general.basename") or path.stem
+    quantization = quant[1].upper() if quant else labels.get("quantization", "")
+    return {
+        "name": name,
+        "publisher": next((labels[key] for key in (
+            "general.quantized_by", "general.organization", "general.author"
+        ) if labels.get(key)), ""),
+        "quantization": "FP16" if quantization == "F16" else quantization,
+        "size": path.stat().st_size if path.is_file() else 0,
+    }
+
+
 def model_path(folder, key):
     return folder / "models" / MODEL_DOWNLOADS[key].filename
 
@@ -692,7 +804,8 @@ def _verified_servers(folder, arch, candidates, stopped, on_progress):
 
 
 def default_model_configs(
-    folder, stopped, on_progress, *, model_key=None, installed=False, discard=lambda: False,
+    folder, stopped, on_progress, *, model_key=None, custom_model=None, installed=False,
+    discard=lambda: False,
 ):
     """Start both downloads together when the hardware identifies a model."""
     arch = _server_arch()
@@ -704,6 +817,10 @@ def default_model_configs(
     predicted = model_key or MODEL_RECOMMENDATIONS[recommendation].balanced
     required_compute = MODEL_DOWNLOADS[model_key].minimum_cuda_compute if model_key else 0
     servers = _verified_servers(folder, arch, candidates, stopped, on_progress)
+    if custom_model:
+        for server in servers:
+            yield {**server, "model": custom_model}
+        return
     if required_compute:
         servers = (
             server

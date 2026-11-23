@@ -65,11 +65,13 @@ def _vector_options(args):
 class RecallEmbeddings:
     """Keep one local embedding session and discard it when its configuration changes."""
 
-    def __init__(self, on_state_changed=None):
+    def __init__(self, on_state_changed=None, *, server_busy=None, legacy_executables=None):
         self._lock = threading.Lock()
         self._session = None
         self._closed = False
         self._on_state_changed = on_state_changed
+        self._server_busy = server_busy
+        self._legacy_executables = legacy_executables or tuple
 
     def configure(self, config):
         with self._lock:
@@ -79,7 +81,9 @@ class RecallEmbeddings:
                 self._session.close()
                 self._session = None
             if self._session is None and config:
-                self._session = _EmbeddingSession(config, self._on_state_changed)
+                self._session = _EmbeddingSession(
+                    config, self._on_state_changed, self._server_busy, self._legacy_executables()
+                )
             if self._session and self._session.available:
                 return self._session
         return None
@@ -98,9 +102,11 @@ class RecallEmbeddings:
 
 
 class _EmbeddingSession:
-    def __init__(self, config, on_state_changed=None):
+    def __init__(self, config, on_state_changed=None, server_busy=None, legacy_executables=()):
         self.config = config
         self._on_state_changed = on_state_changed
+        self._server_busy = server_busy or (lambda: False)
+        self._legacy_executables = legacy_executables
         self._stopped = threading.Event()
         self._background_allowed = threading.Event()
         self._background_allowed.set()
@@ -294,10 +300,16 @@ class _EmbeddingSession:
             raise RuntimeError("The local embedding server did not become ready.")
         if self._process.poll() is not None:
             raise RuntimeError("The local embedding server exited before it became ready.")
-        self.classifier_ready = self._supports_thinking_classifier(model, extra)
+        with model.open("rb") as file:
+            digest = hashlib.file_digest(file, "sha256").hexdigest()
+        self.classifier_ready = self._supports_thinking_classifier(digest, extra)
+        self._set_vector_identity(model, digest, executable, extra, parameters)
+        if self._on_state_changed:
+            self._on_state_changed(self)
+
+    def _set_vector_identity(self, model, digest, executable, extra, parameters):
         stat = model.stat()
-        # Include configuration that can change vector geometry, even for a custom GGUF.
-        identity = (
+        legacy_identity = (
             "passage-v1",
             str(model),
             stat.st_ino,
@@ -305,27 +317,29 @@ class _EmbeddingSession:
             stat.st_size,
             stat.st_mtime_ns,
             stat.st_ctime_ns,
-            str(executable),
         )
 
-        def fingerprint(options):
-            return hashlib.sha256(repr((*identity, options)).encode()).hexdigest()
+        def fingerprint(identity):
+            return hashlib.sha256(repr(identity).encode()).hexdigest()
 
         vector_options = _vector_options(extra)
-        self._vector_model = fingerprint(vector_options)
-        self._compatible_vector_models = {self._vector_model, fingerprint(extra)}
+        self._vector_model = fingerprint(("passage-v2", digest, vector_options))
+        option_variants = [vector_options, extra]
         if not parameters:
             # Older versions stored auto-detected thread counts in the fingerprint.
-            # Adopt those vectors without making existing indexes run a full backfill.
-            self._compatible_vector_models.update(
-                fingerprint([*vector_options, "--threads", str(n), "--threads-batch", str(n)])
-                for n in range(1, 11)
+            option_variants.extend(
+                [*vector_options, "--threads", str(n), "--threads-batch", str(n)]
+                for n in range(1, 25)
             )
-        if self._on_state_changed:
-            self._on_state_changed(self)
+        executables = {str(Path(path).expanduser().resolve())
+                       for path in (executable, *self._legacy_executables) if path}
+        self._compatible_vector_models = {self._vector_model} | {
+            fingerprint((*legacy_identity, path, options))
+            for path in executables for options in option_variants
+        }
 
     @staticmethod
-    def _supports_thinking_classifier(model, args):
+    def _supports_thinking_classifier(digest, args):
         if EMBEDDING_QUERY_INSTRUCTION != thinking_classifier.QUERY_INSTRUCTION:
             return False
         for index, arg in enumerate(args):
@@ -336,14 +350,7 @@ class _EmbeddingSession:
                 pooling = [value] if equals else args[index + 1 : index + 2]
                 if pooling != ["last"]:
                     return False
-        with suppress(OSError):
-            if model.stat().st_size == thinking_classifier.MODEL_SIZE:
-                with model.open("rb") as file:
-                    return (
-                        hashlib.file_digest(file, "sha256").hexdigest()
-                        == thinking_classifier.MODEL_SHA256
-                    )
-        return False
+        return digest == thinking_classifier.MODEL_SHA256
 
     def _request(self, endpoint, payload=None, *, timeout):
         if self._stopped.is_set():
@@ -377,9 +384,11 @@ class _EmbeddingSession:
 
     def _prepare(self):
         try:
+            if not self._wait_for_chat_server():
+                return
             if self._process is None or self._process.poll() is not None:
                 self._start()
-            while self.available:
+            while self._wait_for_chat_server():
                 with self._lock:
                     if self._knowledge_pending:
                         knowledge = list(self._knowledge_pending)[:4]
@@ -424,6 +433,11 @@ class _EmbeddingSession:
                 if self._on_state_changed:
                     self._on_state_changed(self)
 
+    def _wait_for_chat_server(self):
+        while self.available and self._server_busy():
+            self._stopped.wait(0.1)
+        return self.available
+
     def _embed_knowledge(self, texts):
         try:
             vectors = self._embed_passages(texts)
@@ -460,12 +474,12 @@ class _EmbeddingSession:
 
         for batch in batches():
             # Give interactive requests first use of the CPU between embedding batches.
-            while self.available:
+            while self._wait_for_chat_server():
                 self._background_allowed.wait()
                 with self._inference:
                     if not self.available:
                         return None
-                    if not self._background_allowed.is_set():
+                    if self._server_busy() or not self._background_allowed.is_set():
                         continue
                     generated = self._embed(list(batch.values()), timeout=10)
                     break

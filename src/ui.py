@@ -32,7 +32,7 @@ from server_builds import (
     cached_server_config,
     embedding_launch_parameters,
     embedding_path,
-    managed_vision_file,
+    managed_server_file,
     model_path,
     model_vision_family,
     vision_file_precision,
@@ -512,12 +512,12 @@ window.lopaca-main, .transcript-scroll, .transcript {
 
 /* Settings pages and shared settings controls */
 preferencespage button,
-preferencespage row.activatable:not(.model-settings-row):not(.memories-row),
+preferencespage row.activatable:not(.settings-edit-entry):not(.memories-row),
 popover.menu modelbutton {
     transition: box-shadow 120ms ease-out, background-color 120ms ease-out;
 }
 preferencespage button:active,
-preferencespage row.activatable:not(.model-settings-row):not(.memories-row):active,
+preferencespage row.activatable:not(.settings-edit-entry):not(.memories-row):active,
 popover.menu modelbutton:active {
     box-shadow: inset 0 0 0 1px alpha(@window_fg_color, 0.18);
     transition-duration: 45ms;
@@ -602,10 +602,10 @@ button.edit-button-pressed {
 .model-settings-summary {
     /* Theme defaults; add overrides here when needed. */
 }
-.model-settings-summary-row {
-    /* Theme defaults; add overrides here when needed. */
+.list-add-controls {
+    margin-top: 6px;
 }
-.model-settings-paths {
+.model-settings-summary-row {
     /* Theme defaults; add overrides here when needed. */
 }
 .model-settings-advanced-group {
@@ -641,16 +641,13 @@ button.edit-button-pressed {
 .model-settings-row {
     /* Theme defaults; add overrides here when needed. */
 }
-.model-settings-row .edit-icon {
+.settings-edit-entry .edit-icon {
     opacity: 0;
     -gtk-icon-size: 1px;
     min-width: 0;
     min-height: 0;
     padding: 0;
     margin: 0;
-}
-.model-settings-browse {
-    /* Theme defaults; add overrides here when needed. */
 }
 .settings-subpage-toolbar {
     /* Theme defaults; add overrides here when needed. */
@@ -694,16 +691,10 @@ button.edit-button-pressed {
 .memories-row {
     /* Theme defaults; add overrides here when needed. */
 }
-.memories-entry {
-    /* Theme defaults; add overrides here when needed. */
-}
 .memories-core-button {
     /* Theme defaults; add overrides here when needed. */
 }
-.memories-edit {
-    /* Theme defaults; add overrides here when needed. */
-}
-.memories-delete {
+.list-remove-button {
     /* Theme defaults; add overrides here when needed. */
 }
 
@@ -1301,21 +1292,27 @@ class ChatWindow(Adw.ApplicationWindow):
         self._model_picker.set_visible(len(keys) > 1)
         if len(keys) < 2:
             return
-        profile = self.controller.model_recommendation()
+        rule = MODEL_RECOMMENDATIONS[self.controller.model_recommendation()]
         roles = {}
-        for rule in (*MODEL_RECOMMENDATIONS.values(), MODEL_RECOMMENDATIONS[profile]):
-            roles.update({rule.balanced: "Balanced", rule.faster: "Faster", rule.better: "Better"})
+        for role in ("balanced", "faster", "better"):
+            roles.setdefault(getattr(rule, role), role.title())
+        entries = self.controller.custom_model_files().get("model", {})
+        keys = tuple(key for key in roles if key in keys) + self.controller.custom_models_in_order(
+            (key for key in keys if key not in roles), entries
+        )
         labels = tuple(
-            f"{roles.get(key, 'Installed')}: {MODEL_DOWNLOADS[key].name} · "
-            f"{MODEL_DOWNLOADS[key].quantization}"
+            f"{roles.get(key, 'Custom')}: {asset.name} · {asset.quantization}"
+            if (asset := MODEL_DOWNLOADS.get(key)) else
+            f"Custom: {entries[key]['name']}"
+            + (f" · {entries[key]['quantization']}" if entries[key]["quantization"] else "")
             for key in keys
         )
         config = self.controller.model_configuration()
         key = self.controller.model_switch_target
         if key is None and config:
-            folder = self.controller.store.root.parent
             path = Path(config.get("model") or ".").expanduser()
-            key = next((key for key in keys if model_path(folder, key) == path), None)
+            key = next((key for key in keys if self.controller.installed_model_path(key) == path),
+                       None)
         with self._model_dropdown.handler_block(self._model_handler):
             if keys != self._model_keys or labels != self._model_labels:
                 self._model_dropdown.set_model(Gtk.StringList.new(labels))
@@ -2805,10 +2802,23 @@ class ChatWindow(Adw.ApplicationWindow):
             dialog.add(self._knowledge_settings_page(dialog))
             dialog.add(self._about_settings_page())
             self._app_settings_dialog = dialog
-            dialog.connect("notify::visible-page", lambda *_: self._update_setup_highlights())
+            dialog.connect("notify::visible-page", self._settings_tab_changed)
             dialog.connect("closed", self._app_settings_closed)
             self._update_setup_highlights()
         dialog.present(self)
+
+    def _settings_tab_changed(self, dialog, _property):
+        if page := dialog.get_visible_page():
+            if hasattr(page, "scroll_to_top"):
+                page.scroll_to_top()
+            else:
+                child = page.get_first_child()
+                while child and not isinstance(child, Gtk.ScrolledWindow):
+                    child = child.get_first_child()
+                if child:
+                    adjustment = child.get_vadjustment()
+                    adjustment.set_value(adjustment.get_lower())
+        self._update_setup_highlights()
 
     def _about_settings_page(self):
         def link_row(title, subtitle, url):
@@ -2932,9 +2942,14 @@ class ChatWindow(Adw.ApplicationWindow):
         settings = self.controller.store.load_app_settings()
         config = settings.get("model_server", {})
         downloads = []
-        if not model_path(folder, rule.balanced).is_file():
+        selected = config.get("model")
+        custom_model = bool(
+            selected and selected in settings.get("custom_model_files", {}).get("model", {})
+            and Path(selected).expanduser().is_file()
+        )
+        if not custom_model and not model_path(folder, rule.balanced).is_file():
             downloads.append(f"{model.name} ({model.quantization}) · {model.size / 10**9:.2f} GB")
-        family = model.vision_family
+        family = None if custom_model else model.vision_family
         if rule.vision and family and family not in config.get("vision_disabled", ()):
             precision = self.controller._recommended_vision_precision
             vision = VISION_DOWNLOADS[family][precision]
@@ -2990,17 +3005,6 @@ class ChatWindow(Adw.ApplicationWindow):
         self._model_setup_dialog = alert
         alert.choose(self, None, chosen)
 
-    def update_model_paths(self, paths):
-        drafts = self.controller.store.load_app_settings().get("advanced_model_settings", {})
-        for key, (row, handler) in getattr(self, "_model_path_rows", {}).items():
-            if key in paths:
-                section = "embedding_model" if key == "embedding_path" else "model_server"
-                draft = drafts.get(section, {})
-                field = "path" if key == "embedding_path" else key
-                with row.handler_block(handler):
-                    row.set_text(draft.get(field, paths[key]) or "")
-        self.refresh_model_configuration()
-
     def refresh_model_configuration(self):
         self._update_model_picker()
         if not hasattr(self, "_configured_server"):
@@ -3008,31 +3012,20 @@ class ChatWindow(Adw.ApplicationWindow):
         config = self.controller.model_configuration()
         external = config is None
         config = config or {}
+        settings = self.controller.store.load_app_settings()
         downloaded_server, server_percent = self._model_download.get("server", (None, None))
         folder = self.controller.store.root.parent
-        server_config = downloaded_server or config
-        if (
-            not external
-            and not server_config.get("executable")
-            and "server" not in self._model_download
-        ):
-            server_config = cached_server_config(folder) or config
-        executable = server_config.get("executable")
-        backend = BACKEND_LABELS.get(server_config.get("backend"))
-        model = config.get("model")
-        manual = bool(
-            (executable and not backend)
-            or (
-                model
-                and all(
-                    Path(model).expanduser() != model_path(folder, key) for key in MODEL_DOWNLOADS
-                )
-            )
+        executable = config.get("executable")
+        manual = bool(executable and not managed_server_file(folder, executable))
+        server_config = downloaded_server or (
+            config if executable and not manual else
+            self.controller.managed_model_server_config(settings) or {}
         )
         self._auto_configure_manual = manual
         busy = self.controller.model_setup_busy()
         can_download = False
-        server_available = bool(executable and backend and Path(executable).expanduser().is_file())
+        managed = server_config.get("executable")
+        server_available = managed and Path(managed).expanduser().is_file()
         downloading_server = server_percent is not None or (
             "server" not in self._model_download
             and self._model_server_activity == DOWNLOADING_MODEL
@@ -3041,17 +3034,8 @@ class ChatWindow(Adw.ApplicationWindow):
             server = "llama.cpp", "", True
         elif external:
             server = "Manually configured by user", "", False
-        elif manual:
-            can_download = not busy
-            server = "Manually configured by user, click here to auto-configure", "", can_download
         elif server_available:
-            version = re.sub(
-                r", commit [^)]+(?=\))|^(b\d+)-[a-f0-9]+$",
-                r"\1",
-                server_config.get("version") or "",
-            )
-            subtitle = " | ".join(filter(None, [version, backend]))
-            server = "llama.cpp", subtitle, True
+            server = "llama.cpp", self._model_server_subtitle(server_config), not manual
         else:
             can_download = not busy
             server = "Click here to automatically download and set-up", "", can_download
@@ -3062,7 +3046,6 @@ class ChatWindow(Adw.ApplicationWindow):
         self._configured_server.set_title(title)
         self._configured_server.set_subtitle(subtitle)
         self._configured_server.set_sensitive(sensitive)
-        self._reset_local_server.set_sensitive(not external and not busy)
         self._update_setup_highlights()
         self._update_download_indicator(
             self._server_download_indicator,
@@ -3071,7 +3054,18 @@ class ChatWindow(Adw.ApplicationWindow):
             server_percent,
         )
         self._refresh_model_rows(config, downloaded_server, external)
+        self._refresh_custom_file_rows(settings, config, external)
         self._refresh_model_parameter_defaults()
+
+    @staticmethod
+    def _model_server_subtitle(info):
+        version = re.sub(
+            r", commit [^)]+(?=\))|^(b\d+)-[a-f0-9]+$",
+            r"\1",
+            info.get("version") or "",
+        )
+        backend = info.get("backend") or ""
+        return " | ".join(filter(None, (version, BACKEND_LABELS.get(backend, backend.upper()))))
 
     def _model_parameter_config(self, config):
         profile = self.controller.model_recommendation()
@@ -3216,17 +3210,16 @@ class ChatWindow(Adw.ApplicationWindow):
         self._refresh_embedding_row(folder)
 
     def _refresh_embedding_row(self, folder):
-        filename = self._model_path_rows["embedding_path"][0].get_text()
         active = self.controller.embedding_download_active
         _, percent = self._model_download.get("embedding", (None, None))
-        self._embedding_parameters.set_visible(bool(filename.strip()))
         config = self.controller.store.load_app_settings().get("embedding_model", {})
+        self._embedding_parameters.set_visible(bool(config.get("path")))
         selected = Path(config.get("path") or ".")
         with suppress(RuntimeError):
             selected = selected.expanduser()
         row, action, switch, indicator, handler = self._embedding_row
         installed = embedding_path(folder).is_file()
-        available = selected.is_file()
+        available = selected == embedding_path(folder) and selected.is_file()
         if installed or available:
             row.remove_css_class("dim-label")
         else:
@@ -3294,18 +3287,15 @@ class ChatWindow(Adw.ApplicationWindow):
             row.set_visible(row_visible)
             visible |= row_visible
             compatible = family == selected and not external and model_available
-            custom = bool(compatible and projector and not managed_vision_file(folder, projector))
-            switch.set_visible(
-                bool(installed) or bool(custom and Path(projector).expanduser().is_file())
-            )
-            switch.set_sensitive(compatible and not busy and bool(installed or custom))
+            switch.set_visible(bool(installed))
+            switch.set_sensitive(compatible and not busy and bool(installed))
             if compatible:
                 row.remove_css_class("dim-label")
             else:
                 row.add_css_class("dim-label")
             enabled = bool(
                 compatible
-                and projector
+                and vision_file_precision(folder, family, projector)
                 and family not in config.get("vision_disabled", ())
                 and Path(projector).expanduser().is_file()
             )
@@ -3319,25 +3309,20 @@ class ChatWindow(Adw.ApplicationWindow):
             else:
                 action.show_action("remove" if installed else "download", enabled=not busy)
             precision = job[1] if in_progress else default_precision
-            if custom:
-                precision = "Custom file"
-            elif not in_progress:
+            if not in_progress:
                 chosen = vision_file_precision(folder, family, projector) if compatible else None
                 precision = chosen or (
                     installed[0] if installed and precision not in installed else precision
                 )
             subtitle = precision
-            if custom:
-                with suppress(OSError):
-                    subtitle += model_file_size(Path(projector).expanduser().stat().st_size)
-            elif asset := VISION_DOWNLOADS[family].get(precision):
+            if asset := VISION_DOWNLOADS[family].get(precision):
                 subtitle += model_file_size(asset.size)
             row.set_subtitle(subtitle)
             self._update_download_indicator(
                 indicator, "Cancelling" if cancelling else "Downloading", in_progress,
                 percent if job == downloading and not cancelling else None,
             )
-        self._vision_group.set_visible(visible)
+        self._vision_group.set_visible(visible or "mmproj" in self._custom_file_groups)
 
     def _vision_choices(self):
         self._vision_group = Adw.PreferencesGroup(title="Vision")
@@ -3361,6 +3346,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 "vision",
             )
             self._vision_group.add(row)
+        self._add_custom_file_button(self._vision_group, "mmproj", "vision file")
         return self._vision_group
 
     def _model_row_controls(self, row, label, on_download, on_select, on_remove, kind):
@@ -3411,8 +3397,132 @@ class ChatWindow(Adw.ApplicationWindow):
                 lambda key=key: self._confirm_model_delete(key),
                 "model",
             )
-            group.add(row)
+        self._add_custom_file_button(group, "model", "model")
         return group
+
+    @staticmethod
+    def _add_list_button(group, tooltip):
+        button = Gtk.Button(icon_name="list-add-symbolic", tooltip_text=tooltip)
+        button.add_css_class("knowledge-packs-button")
+        footer = Gtk.Box(halign=Gtk.Align.END, css_classes=["list-add-controls"])
+        footer.append(button)
+        group.add(footer)
+        return button
+
+    def _add_custom_file_button(self, group, kind, label):
+        button = self._add_list_button(group, f"Add custom {label}")
+        self._custom_file_groups[kind] = group
+
+        def choose(*_):
+            button.set_sensitive(False)
+            chooser = Gtk.FileDialog(title=f"Add custom {label}")
+            if kind != "executable":
+                file_filter = Gtk.FileFilter(name="GGUF files")
+                file_filter.add_suffix("gguf")
+                filters = Gio.ListStore.new(Gtk.FileFilter)
+                filters.append(file_filter)
+                chooser.set_filters(filters)
+
+            def finished():
+                button.set_sensitive(True)
+                self.refresh_model_configuration()
+
+            def selected(dialog, result):
+                try:
+                    file = dialog.open_finish(result)
+                    filename = file.get_path() if file else None
+                    if not filename:
+                        raise ValueError("Choose a local file.")
+                except GLib.Error as exc:
+                    if not exc.matches(Gtk.dialog_error_quark(), Gtk.DialogError.DISMISSED):
+                        self._show_alert("Could not select file", exc.message)
+                except ValueError as exc:
+                    self._show_alert("Could not select file", str(exc))
+                else:
+                    self.controller.add_custom_model_file(kind, filename, finished)
+                    return
+                finished()
+
+            chooser.open(self, None, selected)
+
+        button.connect("clicked", choose)
+
+    @staticmethod
+    def _list_remove_button(tooltip):
+        button = Gtk.Button(tooltip_text=tooltip, valign=Gtk.Align.CENTER)
+        button.set_child(Gtk.Image(icon_name="window-close-symbolic", css_classes=["delete-icon"]))
+        button.add_css_class("flat")
+        button.add_css_class("list-remove-button")
+        return button
+
+    def _custom_file_row(self, kind, path, info):
+        if kind == "executable":
+            subtitle = self._model_server_subtitle(info)
+        else:
+            metadata = " | ".join(filter(None, (info.get("publisher"), info.get("quantization"))))
+            size = model_file_size(info["size"]) if info.get("size") else ""
+            subtitle = (metadata + size).removeprefix(" · ")
+        row = Adw.ActionRow(
+            title=info["name"], subtitle=subtitle or Path(path).name, use_markup=False,
+        )
+        row.add_css_class("knowledge-packs-row")
+        row.set_tooltip_text(path)
+        toggle = Gtk.Switch(valign=Gtk.Align.CENTER)
+        toggle.add_css_class("knowledge-packs-switch")
+        remove = self._list_remove_button("Remove custom entry")
+
+        def toggled(button, _):
+            self.controller.select_custom_model_file(kind, path, button.get_active())
+            self.refresh_model_configuration()
+
+        toggle_handler = toggle.connect("notify::active", toggled)
+        remove.connect("clicked", lambda *_: self.controller.select_custom_model_file(
+            kind, path, False, remove=True
+        ))
+        row.add_suffix(toggle)
+        row.add_suffix(remove)
+        return row, toggle, toggle_handler, remove
+
+    def _refresh_custom_file_rows(self, settings, config, external):
+        files = settings.get("custom_model_files", {})
+        busy = self.controller.model_setup_busy() or self.controller.switching_model
+        profile = self.controller.model_recommendation()
+        rule = MODEL_RECOMMENDATIONS[profile]
+        recommended = {rule.balanced, rule.faster, rule.better}
+        for kind, group in self._custom_file_groups.items():
+            entries = files.get(kind, {})
+            rows = self._custom_file_rows[kind]
+            order = tuple(entries)
+            if kind == "model":
+                extras = (key for key in self._extra_model_rows if key not in recommended)
+                order = self.controller.custom_models_in_order((*extras, *order), entries)
+            if order != self._custom_file_order.get(kind):
+                for key in self._custom_file_order.get(kind, ()):
+                    row = rows[key][0] if key in rows else self._extra_model_rows[key][0]
+                    group.remove(row)
+                rows.clear()
+                for key in order:
+                    if key in entries:
+                        rows[key] = self._custom_file_row(kind, key, entries[key])
+                    row = rows[key][0] if key in rows else self._extra_model_rows[key][0]
+                    group.add(row)
+                self._custom_file_order[kind] = order
+            for path, (row, toggle, handler, remove) in rows.items():
+                selected = config.get(kind) == path
+                if kind == "model" and self.controller.model_switch_target is not None:
+                    selected = self.controller.model_switch_target == path
+                available = Path(path).expanduser().is_file()
+                if available:
+                    row.remove_css_class("dim-label")
+                else:
+                    row.add_css_class("dim-label")
+                with toggle.handler_block(handler):
+                    toggle.set_active(bool(selected))
+                toggle.set_sensitive(
+                    available and not busy and not external
+                    and (kind != "mmproj" or bool(config.get("model")))
+                )
+                remove.set_sensitive(not busy and (not external or not selected))
 
     def _confirm_model_delete(self, key):
         asset = MODEL_DOWNLOADS[key]
@@ -3443,19 +3553,23 @@ class ChatWindow(Adw.ApplicationWindow):
         alert.choose(self, None, chosen)
 
     @staticmethod
-    def _model_edit_button(title, set_editing):
-        editing = False
+    def _settings_edit_button(title, set_editing, *, editing=False, done_label=None):
+        edit_label = f"Edit {title}"
+        done_label = done_label or f"Done editing {title}"
         edit = Gtk.Button(
-            icon_name=EDIT_ICON, tooltip_text=f"Edit {title}", valign=Gtk.Align.CENTER
+            icon_name=DONE_EDITING_ICON if editing else EDIT_ICON,
+            tooltip_text=done_label if editing else edit_label,
+            valign=Gtk.Align.CENTER,
         )
         edit.add_css_class("flat")
 
         def toggle(*_):
             nonlocal editing
+            if set_editing(not editing) is False:
+                return
             editing = not editing
-            set_editing(editing)
             edit.set_icon_name(DONE_EDITING_ICON if editing else EDIT_ICON)
-            edit.set_tooltip_text(f"Done editing {title}" if editing else f"Edit {title}")
+            edit.set_tooltip_text(done_label if editing else edit_label)
             if not editing:
                 edit.grab_focus()
 
@@ -3463,24 +3577,32 @@ class ChatWindow(Adw.ApplicationWindow):
         edit.connect("clicked", pulse_edit_button)
         return edit
 
-    def _model_entry_row(self, title, value, reset):
+    @staticmethod
+    def _settings_entry_row(title, value):
         row = Adw.EntryRow(title=title, text=value, editable=False, activatable=False)
+        row.add_css_class("settings-edit-entry")
+        return row
+
+    @staticmethod
+    def _set_settings_entry_editing(row, editing):
+        field = row.get_delegate()
+        row.set_editable(editing)
+        field.set_focusable(editing)
+        field.set_can_target(editing)
+        if editing:
+            row.grab_focus_without_selecting()
+        else:
+            position = row.get_position()
+            row.select_region(position, position)
+
+    def _model_entry_row(self, title, value, reset):
+        row = self._settings_entry_row(title, value)
         row.add_css_class("model-settings-row")
         row.add_suffix(reset)
-        field = row.get_delegate()
-
-        def set_editing(editing):
-            row.set_editable(editing)
-            field.set_focusable(editing)
-            field.set_can_target(editing)
-            if editing:
-                row.grab_focus_without_selecting()
-            else:
-                position = row.get_position()
-                row.select_region(position, position)
-
-        set_editing(False)
-        edit = self._model_edit_button(title, set_editing)
+        self._set_settings_entry_editing(row, False)
+        edit = self._settings_edit_button(
+            title, lambda editing: self._set_settings_entry_editing(row, editing)
+        )
         row.connect(
             "entry-activated", lambda *_: edit.emit("clicked") if row.get_editable() else None
         )
@@ -3496,39 +3618,13 @@ class ChatWindow(Adw.ApplicationWindow):
         drafts = settings.get("advanced_model_settings", {})
         config = settings.get("model_server", {}) | drafts.get("model_server", {})
         embedding = settings.get("embedding_model", {}) | drafts.get("embedding_model", {})
+        self._custom_file_groups = {}
+        self._custom_file_rows = {kind: {} for kind in ("executable", "model", "mmproj")}
+        self._custom_file_order = {}
 
         def save(key, value):
             try:
-                if key == "embedding_path":
-                    self.controller.save_advanced_model_settings("embedding_model", {"path": value})
-                    self.refresh_model_configuration()
-                    return
-                settings = self.controller.store.load_app_settings()
-                current = settings.get("model_server", {}) | settings.get(
-                    "advanced_model_settings", {}
-                ).get("model_server", {})
-                changes = {key: value}
-                folder = self.controller.store.root.parent
-                if key == "executable" and value != current.get(key):
-                    for field in (
-                        "backend", "devices", "version", "recommendation", "vision_precision",
-                    ):
-                        changes[field] = None
-                clear_vision = (
-                    key == "model"
-                    and managed_vision_file(folder, current.get("mmproj"))
-                    and model_vision_family(folder, value)
-                    != model_vision_family(folder, current.get("model"))
-                )
-                if clear_vision:
-                    changes["mmproj"] = ""
-                if key == "mmproj" or clear_vision:
-                    changes["mmproj_manual"] = key == "mmproj" and bool(value)
-                self.controller.save_advanced_model_settings("model_server", changes)
-                if clear_vision:
-                    self.update_model_paths({"mmproj": ""})
-                elif key in ("executable", "model", "mmproj"):
-                    self.refresh_model_configuration()
+                self.controller.save_advanced_model_settings("model_server", {key: value})
             except OSError as exc:
                 self._show_alert("Could not save settings", str(exc))
 
@@ -3549,6 +3645,7 @@ class ChatWindow(Adw.ApplicationWindow):
             "activated",
             lambda *_: self.confirm_model_download(reconfigure=self._auto_configure_manual),
         )
+        self._add_custom_file_button(section, "executable", "llama-server")
         page.add(self._model_choices())
         page.add(self._vision_choices())
         page.add(self._embedding_choice())
@@ -3567,59 +3664,6 @@ class ChatWindow(Adw.ApplicationWindow):
             child=advanced_content, activatable=False, selectable=False, focusable=False
         ))
 
-        paths = Adw.PreferencesGroup(
-            title="Local Model Server", description="Leave blank to use a server on port 9931. "
-        )
-        self._reset_local_server = self._add_model_reset_button(
-            paths, lambda: self.confirm_model_download(reconfigure=True)
-        )
-        paths.add_css_class("model-settings-paths")
-        advanced_content.append(paths)
-        self._model_path_rows = {}
-        for key, title in (
-            ("executable", "llama-server executable"),
-            ("model", "Model file"),
-            ("mmproj", "Vision file"),
-            ("embedding_path", "Embedding model file"),
-        ):
-            value = embedding.get("path", "") if key == "embedding_path" else config.get(key, "")
-            reset = self._model_reset_button(
-                title, lambda key=key: self._model_path_rows[key][0].set_text("")
-            )
-            row = self._model_entry_row(title, value or "", reset)
-            reset.set_visible(bool(row.get_text()))
-            row.connect("notify::text", lambda entry, _, b=reset: b.set_visible(
-                bool(entry.get_text().strip())
-            ))
-            handler = row.connect(
-                "notify::text", lambda entry, _pspec, key=key: save(key, entry.get_text())
-            )
-            self._model_path_rows[key] = row, handler
-            browse = Gtk.Button(
-                icon_name="folder-open-symbolic", valign=Gtk.Align.CENTER, sensitive=False
-            )
-            row.bind_property("editable", browse, "sensitive", GObject.BindingFlags.SYNC_CREATE)
-            browse.add_css_class("model-settings-browse")
-            browse.add_css_class("flat")
-            browse.set_tooltip_text("Choose " + title)
-
-            def choose(_button, row=row, title=title):
-                chooser = Gtk.FileDialog(title="Choose " + title)
-
-                def selected(dialog, result):
-                    try:
-                        file = dialog.open_finish(result)
-                        if file and file.get_path():
-                            row.set_text(file.get_path())
-                    except GLib.Error as exc:
-                        if not exc.matches(Gtk.dialog_error_quark(), Gtk.DialogError.DISMISSED):
-                            self._show_alert("Could not select file", exc.message)
-
-                chooser.open(self, None, selected)
-
-            browse.connect("clicked", choose)
-            row.add_suffix(browse)
-            paths.add(row)
         reasoning = Adw.PreferencesGroup()
         reasoning.add_css_class("model-settings-reasoning")
         advanced_content.append(reasoning)
@@ -3801,85 +3845,98 @@ class ChatWindow(Adw.ApplicationWindow):
             "Edit facts, select Core for always-present memories, or delete them. "
             "Click the pencil to edit, then the checkmark to save."
         )
-        for memory_id, text, core in self.controller.list_memories():
-            row = Adw.ActionRow(title=text, title_lines=0, activatable=False)
-            row.add_css_class("memories-row")
-            entry = Gtk.Entry(text=text, hexpand=True, visible=False)
-            entry.add_css_class("memories-entry")
-            row.add_prefix(entry)
-            controls = Gtk.Box()
-            controls.add_css_class("memories-controls")
-            core_button = Gtk.CheckButton(label="Core", active=bool(core))
-            core_button.add_css_class("memories-core-button")
-            controls.append(core_button)
-            edit = Gtk.Button(icon_name=EDIT_ICON, tooltip_text="Edit memory")
-            edit.add_css_class("memories-edit")
-            edit.connect("clicked", pulse_edit_button)
-            hint_edit_button(row, edit, entry.get_visible)
-            edit.add_css_class("flat")
-            edit.set_valign(Gtk.Align.CENTER)
-            delete = Gtk.Button(tooltip_text="Delete memory")
-            delete.add_css_class("memories-delete")
-            delete.set_child(
-                Gtk.Image(icon_name="window-close-symbolic", css_classes=["delete-icon"])
+        add = self._add_list_button(group, "Add memory")
+
+        def add_row(memory_id=None, text="", core=False):
+            draft = memory_id is None
+            summary = Adw.ActionRow(
+                title=text, title_lines=0, use_markup=False, activatable=False, visible=not draft,
             )
-            delete.add_css_class("flat")
-            delete.set_valign(Gtk.Align.CENTER)
+            summary.add_css_class("memories-row")
+            entry = self._settings_entry_row("Memory", text)
+            entry.set_visible(draft)
+            controls = Gtk.Box(css_classes=["memories-controls"])
+            core_button = Gtk.CheckButton(
+                label="Core", active=bool(core), css_classes=["memories-core-button"]
+            )
+            remove = self._list_remove_button("Discard new memory" if draft else "Delete memory")
 
-            def change(
-                _button,
-                *,
-                memory_id=memory_id,
-                entry=entry,
-                core_button=core_button,
-                row=row,
-                edit=edit,
-                delete=False,
-            ):
-                if not delete and not entry.get_visible():
-                    row.set_title("")
-                    entry.set_visible(True)
-                    edit.set_icon_name(DONE_EDITING_ICON)
-                    edit.set_tooltip_text("Save memory")
-                    entry.grab_focus()
+            def set_editing(editing):
+                nonlocal memory_id
+                current, target = (summary, entry) if editing else (entry, summary)
+                if not editing:
+                    text = " ".join(entry.get_text().split())
+                    try:
+                        saved = self.controller.change_memory(
+                            memory_id, text, core_button.get_active()
+                        )
+                    except Exception as exc:
+                        self._show_alert("Could not change memory", str(exc))
+                        return False
+                    if not saved or saved[1] != text:
+                        self._show_alert(
+                            "Memory was not saved", "Check for duplicate or empty text."
+                        )
+                        return False
+                    if memory_id is None:
+                        memory_id = saved[0]
+                        add.set_sensitive(True)
+                        remove.set_tooltip_text("Delete memory")
+                    with core_button.handler_block(core_handler):
+                        core_button.set_active(bool(saved[2]))
+                    summary.set_title(text)
+                current.remove(controls)
+                target.add_suffix(controls)
+                current.set_visible(False)
+                target.set_visible(True)
+                self._set_settings_entry_editing(entry, editing)
+                return True
+
+            def core_changed(button):
+                if memory_id is None:
                     return
-                text = entry.get_text().strip()
-                try:
-                    saved = self.controller.change_memory(
-                        memory_id, text, core_button.get_active(), delete=delete
-                    )
-                    if delete:
-                        group.remove(row)
-                    else:
-                        if saved and saved[1] == text:
-                            with core_button.handler_block(core_button.memory_handler):
-                                core_button.set_active(bool(saved[2]))
-                            entry.set_visible(False)
-                            row.set_title(text)
-                            edit.set_icon_name(EDIT_ICON)
-                            edit.set_tooltip_text("Edit memory")
-                        else:
-                            self._show_alert(
-                                "Memory was not saved", "Check for duplicate or empty text."
-                            )
-                except Exception as exc:
-                    self._show_alert("Could not change memory", str(exc))
-
-            def core_changed(button, memory_id=memory_id):
                 try:
                     self.controller.set_memory_core(memory_id, button.get_active())
                 except Exception as exc:
-                    with button.handler_block(button.memory_handler):
+                    with button.handler_block(core_handler):
                         button.set_active(not button.get_active())
                     self._show_alert("Could not change core memory", str(exc))
 
-            core_button.memory_handler = core_button.connect("toggled", core_changed)
-            edit.connect("clicked", change)
-            delete.connect("clicked", lambda button, change=change: change(button, delete=True))
-            controls.append(delete)
-            row.add_suffix(edit)
-            row.add_suffix(controls)
-            group.add(row)
+            def remove_memory(_button):
+                if memory_id is None:
+                    add.set_sensitive(True)
+                else:
+                    try:
+                        self.controller.change_memory(memory_id, "", False, delete=True)
+                    except Exception as exc:
+                        self._show_alert("Could not remove memory", str(exc))
+                        return
+                group.remove(summary)
+                group.remove(entry)
+
+            core_handler = core_button.connect("toggled", core_changed)
+            edit = self._settings_edit_button(
+                "memory", set_editing, editing=draft, done_label="Save memory"
+            )
+            hint_edit_button(summary, edit, entry.get_visible)
+            entry.connect("entry-activated", lambda *_: edit.emit("clicked"))
+            remove.connect("clicked", remove_memory)
+            controls.append(edit)
+            controls.append(core_button)
+            controls.append(remove)
+            (entry if draft else summary).add_suffix(controls)
+            group.add(summary)
+            group.add(entry)
+            self._set_settings_entry_editing(entry, draft)
+
+        for record in self.controller.list_memories():
+            add_row(*record)
+
+        def start_draft(button):
+            button.set_sensitive(False)
+            add_row()
+
+        add.connect("clicked", start_draft)
         settings_dialog.push_subpage(Adw.NavigationPage.new(toolbar, "Global Memories"))
 
     def _confirm_delete_chat(self, chat_id):
