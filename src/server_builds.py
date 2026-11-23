@@ -557,13 +557,31 @@ def install_embedding(folder, stopped, on_progress):
     return _install_model_asset(folder, EMBEDDING_DOWNLOAD, stopped, on_progress, "embedding", None)
 
 
-def embedding_launch_parameters():
-    # Respect CPU affinity and leave capacity for the chat server and the UI.
+def _embedding_threads():
+    """Size the worker pool from Linux's usable physical cores and SMT siblings."""
     try:
-        available = len(os.sched_getaffinity(0))
+        available = os.sched_getaffinity(0)
     except AttributeError, OSError:
-        available = os.cpu_count() or 1
-    threads = max(1, min(10, available - 2))
+        return max(1, min(24, (os.cpu_count() or 1) - 1))
+    try:
+        topology = Path("/sys/devices/system/cpu")
+        siblings = [
+            (topology / f"cpu{cpu}/topology/thread_siblings_list").read_text().strip()
+            for cpu in available
+        ]
+    except OSError:
+        siblings = []
+    # Linux reports the same sibling list for every logical CPU on a physical core.
+    # Only count siblings that the process can actually run on.
+    if siblings and all(siblings):
+        if len(set(siblings)) < len(available):
+            return max(2, min(24, len(available) - 2))
+        return max(1, len(available) - 1)
+    return max(1, min(24, len(available) - 1))
+
+
+def embedding_launch_parameters():
+    threads = _embedding_threads()
     return (
         "--embedding --pooling last --device none --n-gpu-layers 0 "
         f"--ctx-size 4096 --parallel 1 --threads {threads} --threads-batch {threads}"

@@ -75,13 +75,6 @@ from server_builds import (
 )
 from settings import (
     CHAT_SETTING_DEFAULTS,
-    EMBEDDING_DOCUMENT_CANDIDATES,
-    EMBEDDING_DOCUMENT_MARGIN,
-    EMBEDDING_DOCUMENT_MINIMUM,
-    EMBEDDING_HISTORY_MINIMUM,
-    EMBEDDING_HISTORY_WITH_KEYWORD_MINIMUM,
-    EMBEDDING_MEMORY_MINIMUM,
-    EMBEDDING_MEMORY_WITH_KEYWORD_MINIMUM,
     MODEL_DOWNLOADS,
     MODEL_RECOMMENDATIONS,
     VISION_DOWNLOADS,
@@ -144,6 +137,7 @@ class ChatController:
         self.settings, self.store, self.client = settings, ChatStore(), LlamaClient(settings)
         self.memories = MemoryStore(self.store.root.parent / "memories.sqlite", settings)
         self.recall_embeddings = RecallEmbeddings()
+        self._indexed_embedding_session = None
         self.knowledge = KnowledgeStore()
         self._model_lock = threading.Lock()
         self._chat_warm_stop = threading.Event()
@@ -156,6 +150,7 @@ class ChatController:
             lambda message: self.view.dispatch(
                 self.view._show_alert, "Document library required", message
             ),
+            on_indexed=self.recall_embeddings.schedule,
         )
         self.history_index = HistoryIndex(
             self.store,
@@ -163,6 +158,7 @@ class ChatController:
             LlamaClient(settings),
             self._model_lock,
             lambda active: self.view.dispatch(self.view.set_document_processing, active),
+            on_indexed=self.recall_embeddings.schedule,
         )
         self.chat_sort = settings.chat_sort
         self.view = self.chat = None
@@ -205,6 +201,7 @@ class ChatController:
         app_settings = self.store.load_app_settings()
         self.first_launch = app_settings.get("first_launch") is True
         self.chat_sort = app_settings["chat_sort"]
+        self._refresh_embedding_indexes()
         threading.Thread(target=self._monitor_connection, daemon=True).start()
         chats = self.store.list()
         for chat in chats:
@@ -217,8 +214,6 @@ class ChatController:
                 else self.store.create()["id"]
             )
         self.open_chat(active_chat)
-        if self.get_chat_settings(active_chat)["global_memories"] is True:
-            self._prepare_memory_embeddings()
         config = app_settings.get("model_server", {})
         folder = self.store.root.parent
         configured_model = Path(config.get("model") or ".").expanduser()
@@ -521,83 +516,41 @@ class ChatController:
         settings = self.store.load_app_settings()
         settings.setdefault("embedding_model", {})[key] = value
         self.store.save_app_settings(settings)
-        self.recall_embeddings.prepare(None, None, None, ())
 
     def _embedding_configuration(self):
         settings = self.store.load_app_settings()
         embedding = settings.get("embedding_model", {})
         executable = settings.get("model_server", {}).get("executable")
         filename = embedding.get("path")
-        if (
-            embedding.get("enabled") is False
-            or not executable
-            or not filename
-            or legacy_embedding_file(filename)
-        ):
-            self.recall_embeddings.prepare(None, None, None, ())
+        if embedding.get("enabled") is False or not executable or not filename:
             return None
-        return executable, filename, embedding.get("parameters")
-
-    def _prepare_memory_embeddings(self):
-        config = self._embedding_configuration()
-        if not config:
-            return None, ()
-        try:
-            rows = self.memories.records()
-        except OSError, sqlite3.Error:
-            logging.debug("Could not prepare memory embeddings", exc_info=True)
-            return None, ()
-        recall = self.recall_embeddings.prepare(
-            *config, [text for _, text, core in rows if not core]
-        )
-        return recall, rows
-
-    def _semantic_memory_recall(self, query, seen):
-        recall, rows = self._prepare_memory_embeddings()
-        if recall and not self.stop_requested:
-            # Require a stronger match when keyword recall already supplied some context.
-            minimum = EMBEDDING_MEMORY_WITH_KEYWORD_MINIMUM if seen else EMBEDDING_MEMORY_MINIMUM
-            row = recall(
-                query,
-                [(row, row[1]) for row in rows if not row[2] and row[0] not in seen],
-                minimum=minimum,
-            )
-            if row:
-                return [row]
-        return []
-
-    def _semantic_history_recall(self, config, query, choices, *, local, keyword_matches):
-        if self.stop_requested or config != self._embedding_configuration():
-            return None
-        group = "archive" if local else "chat history"
-        match = self.recall_embeddings.prepare(*config, [text for _, text in choices], group=group)
-        if match and choices:
-            minimum = (
-                EMBEDDING_HISTORY_WITH_KEYWORD_MINIMUM
-                if keyword_matches
-                else EMBEDDING_HISTORY_MINIMUM
-            )
-            return match(query, choices, minimum=minimum)
+        with suppress(OSError, RuntimeError):
+            if (
+                Path(executable).expanduser().is_file()
+                and Path(filename).expanduser().is_file()
+                and not legacy_embedding_file(filename)
+            ):
+                return executable, filename, embedding.get("parameters")
         return None
 
-    def _rerank_documents(self, config, query, passages, *, defer=None):
-        if self.stop_requested or config != self._embedding_configuration():
-            return None
-        choices = [
-            (index, f"{reference.split(', lines ', 1)[0]}\n{body[:1000]}")
-            for index, (reference, body) in enumerate(passages[:EMBEDDING_DOCUMENT_CANDIDATES])
-        ]
-        match = self.recall_embeddings.prepare(
-            *config, [text for _, text in choices], group="documents", defer=defer
-        )
-        if match:
-            return match(
-                query,
-                choices,
-                minimum=EMBEDDING_DOCUMENT_MINIMUM,
-                rerank_margin=EMBEDDING_DOCUMENT_MARGIN,
-            )
-        return None
+    def _refresh_embedding_indexes(self):
+        session = self.recall_embeddings.configure(self._embedding_configuration())
+        if session is self._indexed_embedding_session:
+            return
+        self._indexed_embedding_session = session
+        if not session:
+            return
+        if self.get_chat_settings()["global_memories"] is True:
+            self._schedule_memory_vectors()
+        if self.history_index.enabled() and self.history_index.path.is_file():
+            self.recall_embeddings.schedule(self.history_index.path)
+        for filename in ("documents.sqlite", "chat-history.sqlite"):
+            for path in self.store.root.glob(f"*/{filename}"):
+                self.recall_embeddings.schedule(path)
+
+    def _schedule_memory_vectors(self):
+        if self.memories.path.is_file():
+            self.recall_embeddings.schedule(self.memories.path, "memories")
 
     def download_embedding(self, *, automatic=False, backend=None):
         stopped = self._model_file_stop.is_set
@@ -674,10 +627,7 @@ class ChatController:
         else:
             if path is not None:
                 self.view.update_model_paths({"embedding_path": str(path)})
-            if active and self.get_chat_settings()["global_memories"] is True:
-                self._prepare_memory_embeddings()
-            elif not active:
-                self.recall_embeddings.prepare(None, None, None, ())
+            self._refresh_embedding_indexes()
         self.view.refresh_model_configuration()
 
     def delete_embedding(self):
@@ -693,7 +643,7 @@ class ChatController:
             if not config.get("path") or selected == path:
                 config.update(path="", enabled=False)
                 self.store.save_app_settings(settings)
-                self.recall_embeddings.prepare(None, None, None, ())
+                self.recall_embeddings.configure(None)
                 self.view.update_model_paths({"embedding_path": ""})
             path.unlink(missing_ok=True)
             path.with_suffix(".gguf.download").unlink(missing_ok=True)
@@ -946,6 +896,7 @@ class ChatController:
     def _monitor_connection(self):
         while True:
             with suppress(OSError):
+                self._refresh_embedding_indexes()
                 for folder in self.store.root.iterdir():
                     self.document_indexer.schedule(folder / "documents")
             if not self.switching_model:
@@ -1337,6 +1288,8 @@ class ChatController:
             settings[key] = value
         if chat_id is None:
             self.store.save_app_settings(settings)
+            if key == "global_memories" and value is True:
+                self._schedule_memory_vectors()
             if key == "history_model_indexing" or (
                 key == "global_chat_histories" and value is True
             ):
@@ -1380,12 +1333,14 @@ class ChatController:
             "manual",
             {memory_id},
         )
+        self._schedule_memory_vectors()
         if not delete:
             return next((record for record in self.list_memories() if record[0] == memory_id), None)
         return None
 
     def set_memory_core(self, memory_id, core):
         self.memories.set_core(memory_id, core)
+        self._schedule_memory_vectors()
 
     def has_draft_attachments(self):
         return bool(self.chat and self._draft_attachments.get(self.chat["id"]))
@@ -1589,7 +1544,11 @@ class ChatController:
         # Never hold the model lock while waiting for an indexer that needs it.
         while not self.stop_requested:
             if self._model_lock.acquire(timeout=0.1):
+                embeddings = None
                 try:
+                    embeddings = self.recall_embeddings.configure(self._embedding_configuration())
+                    if embeddings:
+                        embeddings.pause_background()
                     self._respond(
                         messages,
                         preserve_thinking,
@@ -1599,17 +1558,20 @@ class ChatController:
                         query_expansion,
                         attached=attached,
                         images=images,
+                        embeddings=embeddings,
                     )
                 finally:
+                    if embeddings:
+                        embeddings.resume_background()
                     self._model_lock.release()
                 return
         self.view.dispatch(self.finish_response, "", "", None)
 
-    def _select_auto_thinking(self, query, history, options, embedding_config):
-        eligible = embedding_config is not None and thinking_classifier.eligible_prompt(query)
+    def _select_auto_thinking(self, query, history, options, embeddings):
+        eligible = embeddings is not None and thinking_classifier.eligible_prompt(query)
         if eligible and not self.stop_requested:
             with suppress(Exception):
-                vector = self.recall_embeddings.thinking_vector(embedding_config, query)
+                vector = embeddings.thinking_vector(query)
                 if (
                     vector is not None
                     and not self.stop_requested
@@ -1639,13 +1601,13 @@ class ChatController:
         *,
         attached=(),
         images=(),
+        embeddings=None,
     ):
         pending = self._generation_clarification
         self._generation_clarification = None
         retrieved = []
         history = messages[:-1]
         previous_queries = [item["content"] for item in history if item["role"] == "user"]
-        embedding_config = self._embedding_configuration()
         thinking_parameters_for_reply = self._generation_thinking
         if thinking_parameters_for_reply is None:
             can_classify = not (attached or images) and messages[-1]["content"] == query
@@ -1653,7 +1615,7 @@ class ChatController:
                 query,
                 history,
                 self._generation_thinking_options,
-                embedding_config if can_classify else None,
+                embeddings if can_classify else None,
             )
             print("Auto thinking:", thinking_parameters_for_reply, f"({selector})", flush=True)
         if self.stop_requested:
@@ -1664,6 +1626,7 @@ class ChatController:
         memory_rows = []
         expansion = None
         last_answer = None
+        resume_on_first_text = embeddings is not None and self.model_server.gpu_offloaded
 
         def memories_enabled():
             return (
@@ -1676,6 +1639,8 @@ class ChatController:
             visible = self.visible_answer(text)
             if visible:
                 self._generation_streaming = True
+                if not last_answer and resume_on_first_text:
+                    embeddings.resume_background()
             if visible != last_answer:
                 self.view.dispatch(self.view.update_answer, visible)
                 last_answer = visible
@@ -1698,19 +1663,14 @@ class ChatController:
             return expansion
 
         expand_query = expand if query_expansion else None
-        semantic_history = None
-        rerank_documents = None
-        deferred_embeddings = []
-        if embedding_config:
+        recall_expansion = None if embeddings else expand_query
+        vector_rank = None
+        deferred_knowledge = []
+        if embeddings:
 
-            def semantic_history(choices, *, local, keyword_matches):
-                return self._semantic_history_recall(
-                    embedding_config, query, choices, local=local, keyword_matches=keyword_matches
-                )
-
-            def rerank_documents(search_query, passages):
-                return self._rerank_documents(
-                    embedding_config, search_query, passages, defer=deferred_embeddings.append
+            def vector_rank(db, search_query, rows, **options):
+                return embeddings.rank(
+                    db, search_query, rows, stopped=lambda: self.stop_requested, **options
                 )
 
         try:
@@ -1718,24 +1678,26 @@ class ChatController:
                 query,
                 folder,
                 self.settings,
-                expand=expand_query,
+                expand=recall_expansion,
                 stopped=lambda: self.stop_requested,
                 previous_queries=previous_queries,
                 refresh=False,
-                rerank=rerank_documents,
+                vector_rank=vector_rank,
             )
         except Exception as exc:
             if not self.stop_requested:
                 self.view.dispatch(self.view.notify, f"Document retrieval unavailable: {exc}")
         if memory_enabled and not self.stop_requested:
+            if embeddings:
+                self._schedule_memory_vectors()
             try:
                 memory_rows = recall_memories(
                     self.memories,
                     query,
                     self.settings,
-                    expand=expand_query,
+                    expand=recall_expansion,
                     previous_queries=previous_queries,
-                    semantic=self._semantic_memory_recall,
+                    vector_rank=vector_rank,
                 )
             except Exception as exc:
                 self.view.dispatch(self.view.notify, f"Memory retrieval unavailable: {exc}")
@@ -1746,9 +1708,9 @@ class ChatController:
                 history_context = self.history_index.context(
                     query,
                     self._generation_chat_id,
-                    expand=expand_query,
+                    expand=recall_expansion,
                     previous_queries=previous_queries,
-                    semantic=semantic_history,
+                    vector_rank=vector_rank,
                 )
             except Exception as exc:
                 self.view.dispatch(self.view.notify, f"Chat history retrieval unavailable: {exc}")
@@ -1761,10 +1723,10 @@ class ChatController:
                 archive_context = self.history_index.local_context(
                     query,
                     self._generation_chat_id,
-                    expand=expand_query,
+                    expand=recall_expansion,
                     boundary=self._generation_context_start,
                     previous_queries=previous_queries,
-                    semantic=semantic_history,
+                    vector_rank=vector_rank,
                 )
             except Exception as exc:
                 self.view.dispatch(self.view.notify, f"Chat archive retrieval unavailable: {exc}")
@@ -1801,6 +1763,8 @@ class ChatController:
                 expand=expand_query,
                 previous_queries=previous_queries,
                 memory_rows=memory_rows,
+                denoise=(lambda q, rows: embeddings.denoise_knowledge(q, rows, deferred_knowledge))
+                if embeddings else None,
             )
         except Exception as exc:
             self.view.dispatch(self.view.notify, f"Knowledge retrieval unavailable: {exc}")
@@ -1873,7 +1837,7 @@ class ChatController:
                         enabled=memories_enabled,
                         pending_clarification=pending,
                     )
-                    self._prepare_memory_embeddings()
+                    self._schedule_memory_vectors()
                 except Exception as exc:
                     if not self.stop_requested:
                         self.view.dispatch(self.view.notify, f"Could not save memories: {exc}")
@@ -1920,11 +1884,8 @@ class ChatController:
             # Reactive mid-response rolls also need their new archive before queued input.
             self._post_response_condensing = True
             self._set_context_processing(True)
-        if not error and not self.stop_requested:
-            # Cold document candidates can wait until streaming and follow-up model work finish.
-            for warm in deferred_embeddings:
-                with suppress(RuntimeError):
-                    warm()
+        if not error and not self.stop_requested and deferred_knowledge:
+            embeddings.warm_knowledge(deferred_knowledge)
         clarification = clarification and memories_enabled()
         self.view.dispatch(
             self.finish_response,

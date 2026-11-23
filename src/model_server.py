@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -16,6 +17,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 DOWNLOADING_MODEL = "Downloading model"
+_GPU_LAYERS = re.compile(r"\boffloaded (\d+)/\d+ layers to GPU\b")
 
 # Blank values inherit llama-server defaults, rather than model-specific presets.
 SERVER_FIELDS = (
@@ -95,6 +97,26 @@ def launch_command(config, server_url):
     return args + extra + ["--host", "127.0.0.1", "--port", str(address.port or 80)]
 
 
+def _configured_gpu_offload(config, args):
+    """Use the launch options when llama-server omits offload details from its log."""
+    devices = os.environ.get("LLAMA_ARG_DEVICE", "")
+    layers = os.environ.get("LLAMA_ARG_N_GPU_LAYERS", "")
+    options = iter(args[1:])
+    for argument in options:
+        flag, equals, value = argument.partition("=")
+        if flag in ("--device", "-dev"):
+            devices = value if equals else next(options, "")
+        elif flag in ("--n-gpu-layers", "--gpu-layers", "-ngl"):
+            layers = value if equals else next(options, "")
+    if layers.isdecimal() and int(layers) == 0:
+        return False
+    if devices:
+        return any(device.strip().casefold().startswith(("cuda", "vulkan"))
+                   for device in devices.split(","))
+    backend = config.get("backend") or ""
+    return backend.startswith("cuda") or backend == "vulkan"
+
+
 class ModelServer:
     """One asynchronous connection attempt, with bounded diagnostics and owned cleanup."""
 
@@ -108,6 +130,8 @@ class ModelServer:
         self._lock = threading.Lock()
         self._output = deque(maxlen=60)
         self._config = None
+        self._gpu_offload = None
+        self._configured_gpu = False
         self._expected_exits = set()
 
     def _state(self, text):
@@ -118,6 +142,12 @@ class ModelServer:
     def running_config(self):
         process = self.process
         return self._config if process is not None and process.poll() is None else None
+
+    @property
+    def gpu_offloaded(self):
+        if self.running_config is None:
+            return False
+        return self._configured_gpu if self._gpu_offload is None else self._gpu_offload
 
     def connect(
         self,
@@ -313,6 +343,8 @@ class ModelServer:
                 ),
             )
             self._config = config
+            self._gpu_offload = None
+            self._configured_gpu = _configured_gpu_offload(config, args)
         reader = threading.Thread(target=self._read_output, args=(process,), daemon=True)
         reader.start()
         try:
@@ -369,7 +401,13 @@ class ModelServer:
     def _read_output(self, process):
         with process.stdout:
             for line in iter(process.stdout.readline, b""):
-                self._output.append(line.decode("utf-8", errors="replace").rstrip()[-2000:])
+                text = line.decode("utf-8", errors="replace").rstrip()[-2000:]
+                self._output.append(text)
+                # The first report is for the main model. A GPU-capable build can offload zero.
+                if self._gpu_offload is None and (match := _GPU_LAYERS.search(text)):
+                    with self._lock:
+                        if process is self.process:
+                            self._gpu_offload = int(match[1]) > 0
 
     def _watch_exit(self, process, reader):
         code = process.wait()

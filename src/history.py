@@ -9,8 +9,16 @@ import threading
 from contextlib import closing
 from dataclasses import replace
 
-from rag import _chunks, _connect_index, _create_chunks, _keywords, _rank, _retrieval_query, _terms
-from settings import EMBEDDING_HISTORY_CANDIDATES
+from rag import (
+    _chunks,
+    _connect_index,
+    _create_chunks,
+    _keywords,
+    _rank,
+    _replace_source_chunks,
+    _retrieval_query,
+    _terms,
+)
 
 # Conversation-navigation words describe the lookup, rather than its subject.
 _HISTORY_STOP_WORDS = {
@@ -36,10 +44,11 @@ _HISTORY_STOP_WORDS = {
 
 
 class HistoryIndex:
-    def __init__(self, store, settings, client, model_lock, on_processing):
+    def __init__(self, store, settings, client, model_lock, on_processing, on_indexed=None):
         self.store, self.settings, self.client = store, settings, client
         self.path = store.root.parent / "chats.sqlite"
         self.model_lock, self.on_processing = model_lock, on_processing
+        self.on_indexed = on_indexed
         self.pending = queue.Queue()
         self.queued = set()
         self.lock = threading.Lock()
@@ -114,6 +123,9 @@ class HistoryIndex:
     def update_local(self, chat_id):
         with self.archive_lock:
             self._update_local(chat_id)
+        path = self._archive_path(chat_id)
+        if self.on_indexed and path.is_file():
+            self.on_indexed(path)
 
     def _update_local(self, chat_id):
         folder = self.store.folder(chat_id)
@@ -207,7 +219,7 @@ class HistoryIndex:
                     )
 
     def local_context(
-        self, query, chat_id, expand=None, *, boundary=None, previous_queries=(), semantic=None
+        self, query, chat_id, expand=None, *, boundary=None, previous_queries=(), vector_rank=None
     ):
         return self.context(
             query,
@@ -216,7 +228,7 @@ class HistoryIndex:
             previous_queries=previous_queries,
             local=True,
             boundary=boundary,
-            semantic=semantic,
+            vector_rank=vector_rank,
         )
 
     def _update(self, chat_id, *, local=False, keep_hints=False):
@@ -232,6 +244,8 @@ class HistoryIndex:
         chat = self.store.load(chat_id)
         with closing(self._connect(path)) as db, db:
             self._index_messages(db, chat, local, keep_hints)
+        if not local and self.on_indexed:
+            self.on_indexed(path)
 
     def _index_messages(self, db, chat, local, keep_hints):
         chat_id = chat["id"]
@@ -297,26 +311,25 @@ class HistoryIndex:
             # A chat deleted during a slow model request must never reappear in the index.
             if not self.store.folder(chat_id).exists():
                 return
-            db.execute("DELETE FROM chunk_content WHERE source=?", (source,))
-            for section, first, last, content in _chunks(
+            chunks = _chunks(
                 body if local else f"# {chat['title']}\n\n{body}",
                 source,
                 self.settings.chunk_chars,
                 self.settings.chunk_overlap,
-            ):
-                db.execute(
-                    "INSERT INTO chunk_content "
-                    "(source,section,body,keywords,start_line,end_line) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            label = f"{chat['title']} > {group[0]['role']}" if local else chat["title"]
+            _replace_source_chunks(
+                db,
+                source,
+                (
                     (
-                        source,
-                        f"{chat['title']} > {group[0]['role']}" if local else chat["title"],
-                        content,
+                        label, content,
                         summary_terms if assisted else _keywords(source, section, content),
-                        first,
-                        last,
-                    ),
-                )
+                        first, last,
+                    )
+                    for section, first, last, content in chunks
+                ),
+            )
             db.execute("INSERT OR REPLACE INTO files VALUES (?)", (source,))
             db.execute(
                 "INSERT OR REPLACE INTO records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -340,35 +353,6 @@ class HistoryIndex:
             db.execute("DELETE FROM files WHERE path=?", (source,))
             db.execute("DELETE FROM records WHERE source=?", (source,))
 
-    def _recent_semantic_choices(self, db, chat_id, local, boundary, hits):
-        # Offer one existing excerpt per record. Only the short text sent to the
-        # embedder is truncated; the selected excerpt keeps its original citation.
-        scope = "last<=?" if local else "chat!=?"
-        recent = db.execute(
-            f"""SELECT r.chat, c.source, c.section, c.body, c.start_line, c.end_line
-                FROM (SELECT chat, source FROM records WHERE {scope}
-                      ORDER BY timestamp DESC, first DESC LIMIT ?) r
-                JOIN chunk_content c ON c.rowid=(
-                    SELECT id FROM passages WHERE source=r.source ORDER BY start_line, id LIMIT 1
-                )""",
-            (boundary if local else chat_id, EMBEDDING_HISTORY_CANDIDATES),
-        ).fetchall()
-        seen = {hit[1] for hit in hits}
-        eligible = (
-            {
-                owner
-                for owner, *_ in recent
-                if self.store.folder(owner).is_dir() and not self._excluded_chat(owner)
-            }
-            if not local
-            else set()
-        )
-        return [
-            ((0, source, section, body, first, last), body[:1200])
-            for owner, source, section, body, first, last in recent
-            if source not in seen and body.strip() and (local or owner in eligible)
-        ]
-
     def context(
         self,
         query,
@@ -378,7 +362,7 @@ class HistoryIndex:
         previous_queries=(),
         local=False,
         boundary=None,
-        semantic=None,
+        vector_rank=None,
     ):
         path = self._archive_path(chat_id) if local else self.path
         if (
@@ -408,15 +392,18 @@ class HistoryIndex:
             ).fetchone()
             if not available:
                 return ""
+            search_query = _retrieval_query(query, previous_queries)
             subject = re.sub(
                 r"(?<![\w./])(?:" + "|".join(sorted(_HISTORY_STOP_WORDS)) + r")(?![\w./])",
                 " ",
-                _retrieval_query(query, previous_queries),
+                search_query,
                 flags=re.IGNORECASE,
             )
             if not _terms(subject):
                 return ""
             expansion = expand(query) if expand else ""
+            if vector_rank:
+                db.execute("BEGIN")
             hits = _rank(
                 db,
                 subject,
@@ -424,11 +411,11 @@ class HistoryIndex:
                 replace(self.settings, rag_results=3, max_context_chars=4000),
                 excluded,
             )
-            if semantic and len(hits) < 3:
+            if vector_rank:
                 try:
-                    choices = self._recent_semantic_choices(db, chat_id, local, boundary, hits)
-                    if match := semantic(choices, local=local, keyword_matches=bool(hits)):
-                        hits.append(match)
+                    hits = vector_rank(
+                        db, search_query, hits, scope="history", limit=3, excluded=excluded
+                    )
                 except Exception:
                     logging.debug("Semantic chat history recall unavailable", exc_info=True)
             excerpts = []

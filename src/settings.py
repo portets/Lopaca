@@ -162,15 +162,6 @@ EMBEDDING_CPU_AUTO_DOWNLOAD_MIN_RAM_GIB = 22 # for cpu-only main models
 EMBEDDING_QUERY_INSTRUCTION = (
     "Given a search query, retrieve relevant passages that answer the query"
 )
-# Cosine cutoffs for semantic recall over the local embedding model's 256-dimensional vectors.
-EMBEDDING_MEMORY_MINIMUM = 0.56
-EMBEDDING_MEMORY_WITH_KEYWORD_MINIMUM = 0.62
-EMBEDDING_HISTORY_MINIMUM = 0.54
-EMBEDDING_HISTORY_WITH_KEYWORD_MINIMUM = 0.63
-EMBEDDING_HISTORY_CANDIDATES = 24
-EMBEDDING_DOCUMENT_CANDIDATES = 5
-EMBEDDING_DOCUMENT_MINIMUM = 0.55
-EMBEDDING_DOCUMENT_MARGIN = 0.07
 
 
 @dataclass(frozen=True)

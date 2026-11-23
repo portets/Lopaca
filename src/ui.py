@@ -2580,9 +2580,9 @@ class ChatWindow(Adw.ApplicationWindow):
             )
         add_switch(
             "rag_query_expansion",
-            "Expand Document, Memory and Chat Searches",
-            "Ask the current model for related search terms before retrieval. "
-            "Adds slight prompt latency.",
+            "Expand Retrieval Searches",
+            "Ask the current model for related search terms. With embeddings enabled, "
+            "this only applies to knowledge packs.",
         )
         add_switch(
             "rag_model_indexing",

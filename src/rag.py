@@ -101,7 +101,10 @@ def parse_document_questions(text, passages):
 class DocumentIndexer:
     """Serialize background indexing, with at most one queued check per folder."""
 
-    def __init__(self, settings, generate_questions, model_lock, on_processing, on_missing=None):
+    def __init__(
+        self, settings, generate_questions, model_lock, on_processing, on_missing=None,
+        on_indexed=None,
+    ):
         self.settings = settings
         self.enabled = settings.rag_model_indexing
         self.active_folder = None
@@ -110,6 +113,7 @@ class DocumentIndexer:
         self._model_lock = model_lock
         self._on_processing = on_processing
         self._on_missing = on_missing
+        self._on_indexed = on_indexed
         self._missing_libraries = set()
         self._retry_after = 0
         self._hint_version = (
@@ -172,6 +176,8 @@ class DocumentIndexer:
                         changed = _index(
                             connection, folder, self.settings, lambda: False, self._missing_document
                         )
+                        if self._on_indexed and (changed or folder == self.active_folder):
+                            self._on_indexed(folder.parent / "documents.sqlite")
                         version = self._hint_version if self.enabled else "off"
                         state = connection.execute(
                             "SELECT value FROM index_state WHERE key = 'model_indexing'"
@@ -889,14 +895,19 @@ def _quote(text):
     return '"' + text.replace('"', '""') + '"'
 
 
-def retrieve_memories(store, query, expansion="", previous_queries=(), *, expand=None):
+def retrieve_memories(
+    store, query, expansion="", previous_queries=(), *, expand=None, vector_rank=None
+):
     """Fuse lexical memory searches without document chunking or another model call."""
-    terms = _terms(_retrieval_query(query, previous_queries))
+    search_query = _retrieval_query(query, previous_queries)
+    terms = _terms(search_query)
     scores = defaultdict(float)
     with closing(store.connect()) as connection:
         if expand and connection.execute("SELECT 1 FROM memories WHERE core=0 LIMIT 1").fetchone():
             with suppress(Exception):
                 expansion = expand(query)
+        if vector_rank:
+            connection.execute("BEGIN")
         extra = [term for term in _terms(expansion) if term not in terms]
         for weight, words in ((1.0, terms), (0.5, extra)):
             if not words:
@@ -911,18 +922,22 @@ def retrieve_memories(store, query, expansion="", previous_queries=(), *, expand
             for rank, (memory_id,) in enumerate(rows, 1):
                 scores[memory_id] += weight / (60 + rank)
         selected = sorted(scores, key=scores.get, reverse=True)[:6]
-        if not selected:
-            return []
-        records = {
-            row[0]: row
-            for row in connection.execute(
-                "SELECT id,text,core FROM memories WHERE id IN ("
-                + ",".join("?" for _ in selected)
-                + ")",
-                selected,
-            )
-        }
-    return [records[key] for key in selected if key in records]
+        records = {}
+        if selected:
+            records = {
+                row[0]: row
+                for row in connection.execute(
+                    "SELECT id,text,core FROM memories WHERE id IN ("
+                    + ",".join("?" for _ in selected)
+                    + ")",
+                    selected,
+                )
+            }
+        rows = [records[key] for key in selected if key in records]
+        if terms and vector_rank:
+            with suppress(Exception):
+                return vector_rank(connection, search_query, rows, scope="memories", limit=6)
+        return rows
 
 
 def _sections(text, filename):
@@ -1135,6 +1150,40 @@ def _create_chunks(connection):
         connection.execute("PRAGMA user_version = 2")
 
 
+def _replace_source_chunks(connection, source, chunks):
+    """Rebuild the lexical source and transfer vectors by exact passage content."""
+    vectors = {}
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rag_vectors'"
+    ).fetchone():
+        vectors = dict(connection.execute(
+            "SELECT p.body, v.vector FROM passages p JOIN rag_vectors v ON v.id=p.id "
+            "WHERE p.source=? AND v.vector IS NOT NULL",
+            (source,),
+        ))
+    connection.execute("DELETE FROM chunk_content WHERE source=?", (source,))
+    connection.executemany(
+        "INSERT INTO chunk_content (source,section,body,keywords,start_line,end_line) "
+        "VALUES (?,?,?,?,?,?)",
+        ((source, *chunk) for chunk in chunks),
+    )
+    if vectors:
+        passages = connection.execute("SELECT id,body FROM passages WHERE source=?", (source,))
+        connection.executemany(
+            "UPDATE rag_vectors SET vector=? WHERE id=?",
+            ((vectors[body], row_id) for row_id, body in passages if body in vectors),
+        )
+
+
+def _document_chunks(text, source, settings, stopped):
+    for section, first, last, body in _chunks(
+        text, source, settings.chunk_chars, settings.chunk_overlap
+    ):
+        if stopped():
+            raise InterruptedError("Document indexing stopped")
+        yield section, body, _keywords(source, section, body), first, last
+
+
 def _index(connection, folder, settings, stopped, on_missing=None):
     connection.executescript("""
         CREATE TABLE IF NOT EXISTS files (
@@ -1188,19 +1237,8 @@ def _index(connection, folder, settings, stopped, on_missing=None):
         with connection:
             changed = True
             connection.execute("DELETE FROM index_state WHERE key = 'model_indexing'")
-            connection.execute("DELETE FROM chunk_content WHERE source = ?", (name,))
-            if text:
-                for section, first, last, body in _chunks(
-                    text, name, settings.chunk_chars, settings.chunk_overlap
-                ):
-                    if stopped():
-                        raise InterruptedError("Document indexing stopped")
-                    connection.execute(
-                        "INSERT INTO chunk_content "
-                        "(source, section, body, keywords, start_line, end_line) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
-                        (name, section, body, _keywords(name, section, body), first, last),
-                    )
+            chunks = _document_chunks(text, name, settings, stopped) if text else ()
+            _replace_source_chunks(connection, name, chunks)
             connection.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?)", (name, *stamp))
     with connection:
         for name in cached.keys() - seen:
@@ -1703,7 +1741,7 @@ def retrieve(
     previous_queries=(),
     refresh=True,
     *,
-    rerank=None,
+    vector_rank=None,
 ):
     """Retrieve passages; background-indexed callers can skip the folder scan."""
     query = _retrieval_query(query, previous_queries)
@@ -1736,30 +1774,19 @@ def retrieve(
         # Keep term counts, candidate rows, and excerpts in the same read snapshot.
         # Begin after expansion so its model request cannot hold up indexing commits.
         connection.execute("BEGIN")
+        rows = _rank(connection, search_query, expansion, settings)
+        if vector_rank:
+            with suppress(Exception):
+                rows = vector_rank(
+                    connection, search_query, rows, scope="documents", limit=settings.rag_results
+                )
         retrieved = []
-        for _, source, section, body, first, last in _rank(
-            connection, search_query, expansion, settings
-        ):
+        for _, source, section, body, first, last in rows:
             reference = f"documents/{source}, lines {first}-{last}"
             if section:
                 reference += f", section: {section}"
             retrieved.append((reference, body))
-    # Filenames, quoted phrases and code-like tokens already have precise lexical matching.
-    if (
-        rerank
-        and len(retrieved) > 1
-        and not stopped()
-        and not re.search(r'[`"]', search_query)
-        and not any(
-            re.search(r"[_./:+#\d]|[a-z][A-Z]", term) for term in _TERM.findall(search_query)
-        )
-    ):
-        with suppress(Exception):
-            if (winner := rerank(search_query, retrieved)) is not None and 0 < winner < len(
-                retrieved
-            ):
-                retrieved.insert(0, retrieved.pop(winner))
-    return retrieved
+        return retrieved
 
 
 def format_context(retrieved, max_chars):

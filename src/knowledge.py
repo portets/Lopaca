@@ -14,7 +14,7 @@ import uuid
 import zlib
 from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext, suppress
 from functools import wraps
 from pathlib import Path
 
@@ -1223,7 +1223,9 @@ class KnowledgeLibrary:
                         with KnowledgeStore(path)._access(exclusive=True):
                             path.unlink()
 
-    def context(self, query, settings, expand=None, previous_queries=(), memory_rows=()):
+    def context(
+        self, query, settings, expand=None, previous_queries=(), memory_rows=(), *, denoise=None
+    ):
         with self.lock:
             stores = self._active()
             if not stores:
@@ -1243,7 +1245,7 @@ class KnowledgeLibrary:
 
             with ThreadPoolExecutor(max_workers=min(4, len(stores))) as pool:
                 results = list(pool.map(retrieve, stores))
-            scores, rows = {}, {}
+            scores, rows, titles = {}, {}, {}
             memory_clues = [text for _, text, core in memory_rows if not core]
             clues = "\n".join([query, *memory_clues])
             query_key = " " + " ".join(re.findall(r"\w+", clues.casefold())) + " "
@@ -1264,9 +1266,10 @@ class KnowledgeLibrary:
             strongest = max(strengths, default=0)
             for ranked, anchor in zip(results, strengths, strict=True):
                 weight = max(0.15, anchor / strongest) if strongest else 1.0
-                for rank, (key, _, reference, body) in enumerate(ranked, 1):
+                for rank, (key, names, reference, body) in enumerate(ranked, 1):
                     scores[key] = scores.get(key, 0) + weight / (60 + rank)
                     rows.setdefault(key, (reference, body))
+                    titles.setdefault(key, names)
             # Only narrow a direct name lookup. Search stop words include clues such
             # as "how many", which distinguish descriptive questions from name lookups.
             subject = re.sub(
@@ -1295,8 +1298,13 @@ class KnowledgeLibrary:
             if not strongest:
                 eligible = _coherent_results(query, eligible, lambda key: "\n".join(rows[key]))
             chosen = sorted(eligible, key=scores.get, reverse=True)[: settings.rag_results]
+            passages = [(key, titles[key], *rows[key]) for key in chosen]
+            if denoise:
+                with suppress(Exception):
+                    passages = denoise(clues, passages)
             return _format_knowledge_context(
-                [rows[key] for key in chosen], settings.max_context_chars
+                [(reference, body) for _, _, reference, body in passages],
+                settings.max_context_chars,
             )
 
     def read_file(self, path, start_line=1, line_count=100):
