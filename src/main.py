@@ -376,8 +376,8 @@ class ChatController:
             self.download_optional_features()
             return
         settings = self._settings_for_model_change()
-        if settings is not None and self._connect_default_model(settings.get("model_server", {})):
-            self._finish_first_launch()
+        if settings is not None:
+            self._connect_default_model(settings.get("model_server", {}))
 
     def optional_features_installed(self):
         return optional_features_ready(self.store.root.parent)

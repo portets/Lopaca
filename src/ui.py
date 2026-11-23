@@ -261,7 +261,7 @@ window.lopaca-main, .transcript-scroll, .transcript {
 .first-launch-highlight,
 .first-launch-model-tab viewswitcher > button:nth-child(2) {
     box-shadow: inset 0 0 0 2px @accent_color;
-    animation: first-launch-pulse 1s ease-in-out infinite alternate;
+    animation: first-launch-pulse 400ms ease-in-out infinite alternate;
 }
 .chat-list-row {
     /* Theme defaults; add overrides here when needed. */
@@ -542,7 +542,7 @@ window.lopaca-main, .transcript-scroll, .transcript {
 .settings-row {
     /* Theme defaults; add overrides here when needed. */
 }
-.optional-features-row {
+.optional-features-highlight {
     box-shadow: inset 0 0 0 2px @accent_color;
 }
 .settings-button {
@@ -888,6 +888,7 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def refresh_optional_features(self):
         self.emit("optional-features-changed")
+        self._update_setup_highlights()
         self.set_status(self._activity_status)
 
     def __init__(self, app, controller):
@@ -919,8 +920,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._model_server_activity = ""
         self._model_download = {}
         self._model_switch_timer = None
-        self._welcome_shown = False
-        self._welcome_dialog = None
+        self._welcome_pending = False
         self._app_settings_dialog = None
         self._processing_documents = False
         self._notification_timer = None
@@ -940,6 +940,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._apply_css()
         self._build_ui()
         controller.attach(self)
+        self._welcome_pending = controller.first_launch
         self.connect("map", self._start_date_timer)
         self.connect("map", lambda *_: self.update_first_launch())
         self.connect("unmap", lambda *_: GLib.source_remove(self._date_timer))
@@ -2425,29 +2426,35 @@ class ChatWindow(Adw.ApplicationWindow):
         self._closeable_alert(heading, body).present(self)
 
     def update_first_launch(self):
-        self._update_first_launch_highlight()
-        if not self.controller.first_launch:
-            if self._welcome_dialog is not None:
-                self._welcome_dialog.close()
+        self._update_setup_highlights()
+        self.emit("optional-features-changed")
+        if not self._welcome_pending or not self.get_mapped():
             return
-        if self._welcome_shown or self.controller.connected is not False or not self.get_mapped():
-            return
-        self._welcome_shown = True
-        self._welcome_dialog = self._closeable_alert(
+        self._welcome_pending = False
+        self._closeable_alert(
             "Welcome to Lopaca!",
             "Go to settings to configure a model, after you get acquainted check out the "
             "Knowledge Packs and other settings.",
-        )
-        self._welcome_dialog.connect("closed", self._welcome_closed)
-        self._welcome_dialog.present(self)
+        ).present(self)
 
-    def _welcome_closed(self, _dialog):
-        self._welcome_dialog = None
-
-    def _update_first_launch_highlight(self):
-        active = self.controller.first_launch
+    def _update_setup_highlights(self):
+        active = self.controller.first_launch and self.controller.connected is False
+        if active:
+            folder = self.controller.store.root.parent
+            config = self.controller.model_configuration() or {}
+            executable = config.get("executable")
+            active = not (
+                (executable and Path(executable).expanduser().is_file())
+                or cached_server_config(folder)
+            )
         dialog = self._app_settings_dialog
-        targets = [(self._settings_button, "first-launch-highlight", active and dialog is None)]
+        targets = [
+            (self._settings_button, "first-launch-highlight", active and dialog is None),
+            (
+                self._settings_button, "optional-features-highlight",
+                self._offer_optional_features(),
+            ),
+        ]
         model_visible = False
         if dialog is not None:
             page = dialog.get_visible_page()
@@ -2467,7 +2474,7 @@ class ChatWindow(Adw.ApplicationWindow):
     def _app_settings_closed(self, dialog):
         dialog.remove_css_class("first-launch-model-tab")
         self._app_settings_dialog = None
-        self._update_first_launch_highlight()
+        self._update_setup_highlights()
 
     def _rename_chat(self, chat_id):
         chat = self.controller.store.load_settings(chat_id)
@@ -2728,9 +2735,9 @@ class ChatWindow(Adw.ApplicationWindow):
             dialog.add(self._knowledge_settings_page(dialog))
             dialog.add(self._about_settings_page())
             self._app_settings_dialog = dialog
-            dialog.connect("notify::visible-page", lambda *_: self._update_first_launch_highlight())
+            dialog.connect("notify::visible-page", lambda *_: self._update_setup_highlights())
             dialog.connect("closed", self._app_settings_closed)
-            self._update_first_launch_highlight()
+            self._update_setup_highlights()
         dialog.present(self)
 
     def _about_settings_page(self):
@@ -2821,7 +2828,7 @@ class ChatWindow(Adw.ApplicationWindow):
         group.add_css_class("settings-group")
         row = Adw.ActionRow(title="Download Optional Features (Recommended)", activatable=True)
         row.add_css_class("model-settings-summary-row")
-        row.add_css_class("optional-features-row")
+        row.add_css_class("optional-features-highlight")
         row.set_tooltip_text(OPTIONAL_FEATURES_TOOLTIP)
         arrow = Gtk.Image(icon_name="go-next-symbolic", valign=Gtk.Align.CENTER)
         row.add_suffix(arrow)
@@ -2831,7 +2838,7 @@ class ChatWindow(Adw.ApplicationWindow):
 
         def refresh(*_):
             stage = self.controller.optional_features_stage
-            group.set_visible(not self.controller.optional_features_installed())
+            group.set_visible(self._offer_optional_features())
             row.set_activatable(stage is None)
             arrow.set_visible(stage is None)
             self._update_download_indicator(indicator, stage or "", bool(stage), None)
@@ -2840,6 +2847,11 @@ class ChatWindow(Adw.ApplicationWindow):
         dialog.connect("closed", lambda *_: self.disconnect(handler))
         refresh()
         return group
+
+    def _offer_optional_features(self):
+        return (
+            not self.controller.first_launch and not self.controller.optional_features_installed()
+        )
 
     def confirm_model_download(self, *, reconfigure=False):
         rule = MODEL_RECOMMENDATIONS[self.controller.model_recommendation()]
@@ -2887,7 +2899,7 @@ class ChatWindow(Adw.ApplicationWindow):
         alert.add_response("yes", "Yes")
         alert.set_default_response("cancel")
         alert.set_close_response("cancel")
-        extras = Gtk.CheckButton(label="Download optional features?", active=True)
+        extras = Gtk.CheckButton(label="Download optional features? (Recommended)", active=True)
         extras.set_tooltip_text(OPTIONAL_FEATURES_TOOLTIP)
         extras.set_sensitive(
             not self.controller.optional_features_installed()
@@ -2974,7 +2986,8 @@ class ChatWindow(Adw.ApplicationWindow):
         self._configured_server.set_title(title)
         self._configured_server.set_subtitle(subtitle)
         self._configured_server.set_sensitive(sensitive)
-        self._update_first_launch_highlight()
+        self._reset_local_server.set_sensitive(not external and not busy)
+        self._update_setup_highlights()
         self._update_download_indicator(
             self._server_download_indicator,
             "Downloading server",
@@ -3000,10 +3013,37 @@ class ChatWindow(Adw.ApplicationWindow):
         if identity == self._model_parameter_identity:
             return
         self._model_parameter_identity = identity
-        values = server_parameters(config)
-        for key, (row, handler) in self._model_parameter_rows.items():
+        self._show_model_parameter_values(server_parameters(config), self._model_parameter_rows)
+
+    def _show_model_parameter_values(self, values, keys):
+        for key in keys:
+            row, handler = self._model_parameter_rows[key]
             with row.handler_block(handler):
                 row.set_text(str(values[key]))
+
+    def _reset_model_parameters(self, keys):
+        overrides = dict.fromkeys(keys, "")
+        try:
+            self.controller.save_advanced_model_settings("model_server", overrides)
+        except OSError as exc:
+            self._show_alert("Could not save settings", str(exc))
+            return
+        settings = self.controller.store.load_app_settings()
+        draft = settings.get("advanced_model_settings", {}).get("model_server", {})
+        config = self._model_parameter_config(settings.get("model_server", {}) | draft)
+        self._show_model_parameter_values(server_parameters(config), keys)
+
+    @staticmethod
+    def _add_model_reset_button(group, reset):
+        label = f"Reset {group.get_title()}"
+        button = Gtk.Button(
+            icon_name="view-refresh-symbolic", tooltip_text=label, valign=Gtk.Align.CENTER
+        )
+        button.add_css_class("flat")
+        button.update_property([Gtk.AccessibleProperty.LABEL], [label])
+        button.connect("clicked", lambda *_: reset())
+        group.set_header_suffix(button)
+        return button
 
     @staticmethod
     def _update_download_indicator(indicator, text, active, percent):
@@ -3234,7 +3274,7 @@ class ChatWindow(Adw.ApplicationWindow):
         return row, action, switch, indicator, handler
 
     def _model_choices(self):
-        group = Adw.PreferencesGroup(title="Configured Model")
+        group = Adw.PreferencesGroup(title="Configured Local Model")
         group.add_css_class("model-settings-summary")
         self._model_rows = {}
 
@@ -3369,6 +3409,9 @@ class ChatWindow(Adw.ApplicationWindow):
         paths = Adw.PreferencesGroup(
             title="Local Model Server", description="Leave blank to use a server on port 9931. "
         )
+        self._reset_local_server = self._add_model_reset_button(
+            paths, lambda: self.confirm_model_download(reconfigure=True)
+        )
         paths.add_css_class("model-settings-paths")
         advanced_content.append(paths)
         self._model_path_rows = {}
@@ -3439,6 +3482,10 @@ class ChatWindow(Adw.ApplicationWindow):
             options = Adw.PreferencesGroup(
                 title=heading,
                 description="Clear a field to use its default. Press Connect to apply changes.",
+            )
+            keys = tuple(key for key, _, _ in fields)
+            self._add_model_reset_button(
+                options, lambda keys=keys: self._reset_model_parameters(keys)
             )
             options.add_css_class("model-settings-options")
             advanced_content.append(options)
