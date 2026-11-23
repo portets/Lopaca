@@ -22,6 +22,7 @@ from urllib.parse import quote, unquote, urljoin, urlsplit
 from urllib.request import Request, urlopen
 
 from images import IMAGE_SIZE_LIMIT, supported_image_mimes
+from settings import APP_DIR
 
 KNOWLEDGE_PACK_URL_PREFIX = "https://huggingface.co/datasets/"
 KNOWLEDGE_CATALOG_URL = (
@@ -204,10 +205,15 @@ def _huggingface_file(url):
 
 
 def _download_xet(url, path, size, sha256, stopped, on_progress):
-    if not (file := _huggingface_file(url)) or not all(
-        find_spec(name) for name in ("hf_xet", "huggingface_hub")
-    ):
+    if not (file := _huggingface_file(url)):
         return False
+    # The optional installer can finish in this session before the app itself is restarted.
+    from optional_features import optional_python
+
+    if not (python := optional_python(APP_DIR)):
+        if not all(find_spec(name) for name in ("hf_xet", "huggingface_hub")):
+            return False
+        python = sys.executable
     # Preserve the existing startup signal for restarting interrupted model downloads.
     path.touch()
     # Isolate the native transfer so Stop can terminate it. local_dir keeps the file on
@@ -219,7 +225,7 @@ def _download_xet(url, path, size, sha256, stopped, on_progress):
             progress_path.open("w") as output,
             progress_path.open() as updates,
             subprocess.Popen(
-                [sys.executable, "-c", _XET_WORKER, url, *file, str(local_dir), str(size)],
+                [str(python), "-c", _XET_WORKER, url, *file, str(local_dir), str(size)],
                 stdout=output,
                 stderr=subprocess.DEVNULL,
             ) as process,

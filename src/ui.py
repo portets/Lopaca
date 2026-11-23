@@ -3637,6 +3637,20 @@ class ChatWindow(Adw.ApplicationWindow):
             self._knowledge_jobs = []
         self._knowledge_refresh = None
         is_open = True
+        scroller = group.get_ancestor(Gtk.ScrolledWindow)
+        adjustment = scroller.get_vadjustment() if scroller is not None else None
+        scroll_position = None
+
+        def restore_scroll():
+            nonlocal scroll_position
+            if is_open:
+                adjustment.set_value(scroll_position)
+            scroll_position = None
+            return GLib.SOURCE_REMOVE
+
+        def restore_after_layout(*_):
+            GLib.idle_add(restore_scroll, priority=GLib.PRIORITY_LOW)
+            return GLib.SOURCE_REMOVE
 
         def closed(*_):
             nonlocal is_open
@@ -3647,6 +3661,7 @@ class ChatWindow(Adw.ApplicationWindow):
         dialog.connect("closed", closed)
 
         def refresh(job=None):
+            nonlocal scroll_position
             if not is_open:
                 return
             if job is not None:
@@ -3654,6 +3669,11 @@ class ChatWindow(Adw.ApplicationWindow):
                 if label := indicators.get(id(job)):
                     label.set_text(job["status"])
                 return
+            if adjustment is not None and rows and scroll_position is None and group.get_mapped():
+                scroll_position = adjustment.get_value()
+                # GTK can reset the adjustment while removing the focused row. Restore it
+                # after the replacement rows have been allocated.
+                group.add_tick_callback(restore_after_layout)
             indicators.clear()
             for row in rows:
                 group.remove(row)

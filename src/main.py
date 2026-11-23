@@ -193,6 +193,7 @@ class ChatController:
         self.switching_model = False
         self.model_file_download = None
         self.optional_features_stage = None
+        self._pending_default_setup = None
         self.download_cancels = {
             kind: threading.Event() for kind in ("model", "vision", "embedding")
         }
@@ -324,13 +325,16 @@ class ChatController:
             or self.busy
             or self.model_server.busy
             or self.model_file_download
+            or self._pending_default_setup is not None
         ):
             return
         if reconfigure and self._model_selection_busy():
             return
+        if optional_features and not self.optional_features_installed():
+            self._pending_default_setup = reconfigure
+            self.download_optional_features()
+            return
         if self._connect_default_model(self.store.load_app_settings().get("model_server", {})):
-            if optional_features:
-                self.download_optional_features()
             self._finish_first_launch()
 
     def optional_features_installed(self):
@@ -346,11 +350,15 @@ class ChatController:
             self.view.refresh_optional_features()
 
         def finish(error):
+            pending = self._pending_default_setup
+            self._pending_default_setup = None
             set_stage(None)
             if error:
                 self.view._show_alert("Could not install optional features", error)
             elif self.optional_features_installed():
                 self.view.notify("Optional features installed. Restart Lopaca to use them.")
+            if pending is not None:
+                self.download_default_model(reconfigure=pending)
 
         def run():
             error = None
@@ -1545,7 +1553,11 @@ class ChatController:
         if self.model_server.busy and not self.busy and self.model_switch_target is None:
             return False
         if not self.connected and self.model_switch_target is None:
-            if not self.model_file_download and not self.busy:
+            if (
+                not self.model_file_download
+                and not self.busy
+                and self._pending_default_setup is None
+            ):
                 self.view.confirm_model_download()
             return False
         chat_id = self.chat["id"]
