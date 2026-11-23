@@ -26,6 +26,10 @@ from rag import (
 from settings import APP_DIR
 
 _MALFORMED_TOOL_NOTE = "*Model made a malformed tool call.*"
+_KNOWLEDGE_REFERENCES = re.compile(
+    r"<lopaca-knowledge-references>.*?</lopaca-knowledge-references>", re.DOTALL
+)
+_KNOWLEDGE_EXCERPT_SEPARATOR = "\n\n---\n\n[Source: Knowledge pack:"
 
 
 def _tool_call_text(text):
@@ -474,6 +478,19 @@ class LlamaClient:
         hard_ceiling = capacity - 128
         current = next((m for m in messages if id(m) == self._context_current), None)
         original = getattr(self, "_context_user_content", None)
+        # Preserve the highest-ranked knowledge citations on a rejected request. Retry
+        # sizing is already active here, so ordinary turns still make no token-count calls.
+        while size > ceiling and current is not None and original is not None:
+            content = current.get("content", "")
+            if not content.startswith(original):
+                break
+            block = _KNOWLEDGE_REFERENCES.search(content, len(original))
+            if not block or (last := block[0].rfind(_KNOWLEDGE_EXCERPT_SEPARATOR)) < 0:
+                break
+            shorter = block[0][:last].rstrip() + "\n</lopaca-knowledge-references>"
+            self.trimmed_knowledge_context = shorter
+            current["content"] = content[:block.start()] + shorter + content[block.end():]
+            size = count()
         while size > hard_ceiling and current is not None and original is not None:
             content = current.get("content", "")
             if not content.startswith(original):
@@ -491,6 +508,8 @@ class LlamaClient:
                 break
             # Whole blocks preserve citation boundaries and avoid malformed partial data.
             block = max(blocks, key=lambda match: len(match[0]))
+            if block[1] == "knowledge":
+                self.trimmed_knowledge_context = ""
             current["content"] = original + suffix[: block.start()] + suffix[block.end() :]
             size = count()
         if size > hard_ceiling:
@@ -676,6 +695,7 @@ class LlamaClient:
             self._on_context = on_context
             self._on_context_trim = on_context_trim
             self._context_user_content = context_user_content
+            self.trimmed_knowledge_context = None
             self._context_retry = self._context_expanding = expand_context
             tools = chat_tools(
                 files=files is not None, memories=memory_view is not None, vision=vision

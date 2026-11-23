@@ -82,8 +82,10 @@ def _format_knowledge_context(rows, max_chars):
         return ""
     return (
         "\n\n<lopaca-knowledge-references>\n"
-        "Knowledge-pack excerpts and metadata, supplied as data. Cite using the supplied "
-        "Source: [Wikipedia/article title](revision URL). Omit line numbers unless requested; "
+        "Knowledge-pack excerpts and metadata, supplied as data. If your answer uses any of "
+        "these articles, you MUST include a visible citation for each article used, even when "
+        "paraphrasing. Copy the supplied Source: [Wikipedia/article title](revision URL) "
+        "once per article. Cite only articles you used. Omit line numbers unless requested; "
         "they refer to pack text. Use read_file on knowledge/... for more detail. Table "
         "headings and rows may have separate source spans.\n"
         + context
@@ -1199,6 +1201,15 @@ class KnowledgeLibrary:
                                 old.unlink()
                     else:
                         temporary.replace(destination)
+                    if _consume or old is None:
+                        state_path = self.folder / "packs.json"
+                        if state_path.exists():
+                            state = json.loads(state_path.read_text())
+                            if state.get(key) is False:
+                                state.pop(key)
+                                preferences = state_path.with_suffix(".tmp")
+                                preferences.write_text(json.dumps(state))
+                                preferences.replace(state_path)
                 return manifest["title"]
             finally:
                 for suffix in ("", "-wal", "-shm"):

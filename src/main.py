@@ -537,9 +537,40 @@ class ChatController:
         self.vision_download_active = (family, precision)
         self.view.refresh_model_configuration()
 
-        def finished(_path):
+        def finished(path):
             self.vision_download_active = None
-            self.view.refresh_model_configuration()
+            try:
+                if path is None:
+                    return
+                saved = self.store.load_app_settings().get("model_server", {})
+                disabled = set(saved.get("vision_disabled", ())) - {family}
+                changes = {"vision_disabled": sorted(disabled)}
+                folder = self.store.root.parent
+                if model_vision_family(folder, saved.get("model")) == family and (
+                    not saved.get("mmproj") or managed_vision_file(folder, saved["mmproj"])
+                ):
+                    changes.update(
+                        mmproj=str(path), mmproj_manual=False,
+                        vision_precision=vision_file_precision(folder, family, path),
+                    )
+                self.set_model_server_config({**saved, **changes})
+                self.view.update_model_paths(changes)
+                running = self.model_server.running_config or {}
+                if (
+                    "mmproj" in changes and running.get("model") == saved.get("model")
+                    and self.model_switch_target is None
+                    and (running.get("mmproj") != str(path)
+                         or family in running.get("vision_disabled", ()))
+                ):
+                    key = next(
+                        (key for key in MODEL_DOWNLOADS if str(model_path(folder, key))
+                         == running.get("model")),
+                        None,
+                    )
+                    if key is not None:
+                        self.request_model_switch(key, reload=True)
+            finally:
+                self.view.refresh_model_configuration()
 
         self._download_model_asset(
             lambda folder, stopped, progress: self._install_vision(
@@ -591,9 +622,12 @@ class ChatController:
         else:
             remove()
 
-    def set_embedding_setting(self, key, value):
+    def set_embedding_setting(self, key, value, *, enable=False):
         settings = self.store.load_app_settings()
-        settings.setdefault("embedding_model", {})[key] = value
+        config = settings.setdefault("embedding_model", {})
+        config[key] = value
+        if enable:
+            config["enabled"] = True
         self.store.save_app_settings(settings)
         if key == "path":
             self._refresh_embedding_indexes()
@@ -681,7 +715,7 @@ class ChatController:
             current = self.store.load_app_settings().get("embedding_model", {}).get("path", "")
             try:
                 if path is not None and current == original_path:
-                    self.set_embedding_setting("path", str(path))
+                    self.set_embedding_setting("path", str(path), enable=True)
                     self.view.update_model_paths({"embedding_path": str(path)})
             finally:
                 self.view.update_model_download("embedding", None, None)
@@ -831,6 +865,12 @@ class ChatController:
             self.view._show_alert("Could not save model settings", str(exc))
         if error:
             self.view._show_alert(failure_title, error)
+        elif not self.download_cancels["model"].is_set():
+            config = self.model_configuration()
+            if config is not None and self.installed_models() == (key,):
+                current = Path(config.get("model") or ".").expanduser()
+                if not config.get("model") or current == model_path(self.store.root.parent, key):
+                    self.request_model_switch(key)
 
     def _model_selection_busy(self):
         self.cancel_chat_warm()
@@ -843,17 +883,20 @@ class ChatController:
         folder = self.store.root.parent
         return tuple(key for key in MODEL_DOWNLOADS if model_path(folder, key).is_file())
 
-    def request_model_switch(self, key):
+    def request_model_switch(self, key, *, reload=False):
         config = self.model_configuration()
-        if config is None or self.switching_model or key not in self.installed_models():
+        if config is None or key not in self.installed_models():
             return
         path = model_path(self.store.root.parent, key)
         current = Path(config.get("model") or ".").expanduser()
-        self.model_switch_target = None if current == path else key
+        owned = self.model_server.running_config is not None
+        self.model_switch_target = None if current == path and owned and not reload else key
         self.view.refresh_model_configuration()
         self.view.update_send_button()
         if self.model_switch_target is None:
             self._drain_messages()
+        else:
+            self.view.schedule_model_switch()
 
     def try_model_switch(self):
         """Start a queued switch only after the chat and the shared model lock are idle."""
@@ -864,7 +907,7 @@ class ChatController:
             return True
         config = self.model_configuration()
         installed = self.installed_models()
-        if config is None or len(installed) < 2 or key not in installed:
+        if config is None or key not in installed:
             self.model_switch_target = None
             self.view.refresh_model_configuration()
             self.view.update_send_button()
@@ -881,7 +924,7 @@ class ChatController:
                 connected, props = self._probe_connection()
             finally:
                 self._model_lock.release()
-            self.view.dispatch(self._finish_model_switch, connected, props)
+            self.view.dispatch(self._finish_model_switch, key, connected, props)
 
         started = False
         try:
@@ -897,13 +940,16 @@ class ChatController:
             self._drain_messages()
         return False
 
-    def _finish_model_switch(self, connected, props):
+    def _finish_model_switch(self, key, connected, props):
         self.switching_model = False
-        self.model_switch_target = None
+        if self.model_switch_target == key:
+            self.model_switch_target = None
         self._server_properties_changed(props or {}, reset_capacity=True)
         self._connection_changed(connected)
         self.view.refresh_model_configuration()
         self.view.update_send_button()
+        if self.model_switch_target is not None:
+            self.view.schedule_model_switch()
 
     def select_model(self, key, active):
         config = self.model_configuration()
@@ -1973,6 +2019,8 @@ class ChatController:
                 self.updating_memories = True
                 self.view.dispatch(self.view.notify, "Updating memories")
                 try:
+                    if self.client.trimmed_knowledge_context is not None:
+                        knowledge_context = self.client.trimmed_knowledge_context
                     edit_memories(
                         self.client,
                         self.memories,

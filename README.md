@@ -34,6 +34,8 @@ DOCX, PPTX, and XLSX documents require optional Python libraries `python-docx`, 
 
 Optional features also include high-performance Xet downloads for large Hugging Face files and OCRmyPDF for scanned PDFs. Lopaca uses its adaptive HTTP downloader when Xet is unavailable or when resuming an HTTP partial. Install Tesseract (`tesseract-ocr` on Debian and Ubuntu) to make scanned pages searchable. OCR runs during background indexing and preserves the original PDF.
 
+NumPy speeds up vector searches across knowledge packs, documents, memories, and chat histories when an embedding model is in use. Lopaca uses the same saved vectors and can search them with standard Python when NumPy is unavailable.
+
 **Expand Document Searches** in App Settings optionally asks the same llama-server model for related search terms. It's off by default because it adds response latency.
 
 **Model-Assisted Document Indexing** in App settings optionally allows the LLM to help process documents for better info retrieval. Very slow and depends on your model speed. Modest quality improvement. Recommended for t/s greater than 80.

@@ -30,9 +30,10 @@ _OPTIONAL_REQUIREMENTS = (
         "huggingface_hub": "huggingface_hub>=1.0",
         "ocrmypdf": "ocrmypdf>=17",
         "pypdfium2": "pypdfium2",
+        "numpy": "numpy",
     }
 )
-_READY_VERSION = "2"
+_READY_VERSION = "3"
 _PROBE = r"""
 import json
 import re

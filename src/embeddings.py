@@ -17,11 +17,12 @@ import time
 import zlib
 from contextlib import closing, suppress
 from http.client import HTTPConnection, HTTPException
+from itertools import batched
 from pathlib import Path
 
 import thinking_classifier
 from model_server import ModelServer
-from packs import VECTOR_DIMENSIONS
+from packs import VECTOR_DIMENSIONS, optional_numpy
 from rag import _literal_score, _literal_terms, _query_literals
 from server_builds import embedding_launch_parameters
 from settings import EMBEDDING_QUERY_INSTRUCTION
@@ -277,6 +278,7 @@ class _EmbeddingSession:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+        optional_numpy()  # Load while the embedding server starts, off the retrieval path.
         for _ in range(80):
             if self._stopped.wait(0.125):
                 raise InterruptedError
@@ -634,10 +636,33 @@ def _exact_patterns(query):
     ]
 
 
+def _stored_vector_scores(cursor, vector, excluded, stopped):
+    unpack = struct.Struct(f"<{len(vector)}f")
+    np = optional_numpy()
+    query_array = None
+    for batch in batched(cursor, 256, strict=False):
+        if stopped():
+            return
+        valid = [
+            (row_id, blob, source[0] if source else None)
+            for row_id, blob, *source in batch
+            if len(blob) == unpack.size and (not source or source[0] not in excluded)
+        ]
+        if np is None or len(valid) < 32:
+            for row_id, blob, source in valid:
+                yield row_id, math.sumprod(vector, unpack.unpack(blob)), source
+        else:
+            if query_array is None:
+                query_array = np.asarray(vector, dtype=np.float64)
+            row_ids, blobs, sources = zip(*valid, strict=True)
+            matrix = np.frombuffer(b"".join(blobs), dtype="<f4").reshape(len(valid), len(vector))
+            scores = np.einsum("ij,j->i", matrix, query_array).tolist()
+            yield from zip(row_ids, scores, sources, strict=True)
+
+
 def _rank_vectors(db, query, vector, rows, scope, limit, excluded, stopped):
     memory = scope == "memories"
     filter_at, add_at, add_with_keywords_at = _RECALL_CUTOFFS[scope]
-    unpack = struct.Struct(f"<{len(vector)}f")
     exact = _exact_patterns(query)
     ranked = {row[0]: row for row in rows}
     protected = {
@@ -650,22 +675,20 @@ def _rank_vectors(db, query, vector, rows, scope, limit, excluded, stopped):
     matched_sources = {row[1] for row in rows} if scope == "history" else set()
     join = "" if memory else "JOIN passages p ON p.id=v.id"
     columns = "v.id, v.vector" if memory else "v.id, v.vector, p.source"
-    for index, (row_id, blob, *source) in enumerate(
-        db.execute(f"SELECT {columns} FROM rag_vectors v {join} WHERE v.vector IS NOT NULL")
+    cursor = db.execute(f"SELECT {columns} FROM rag_vectors v {join} WHERE v.vector IS NOT NULL")
+    for index, (row_id, score, source) in enumerate(
+        _stored_vector_scores(cursor, vector, excluded, stopped)
     ):
-        if index % 256 == 0 and stopped():
-            return rows
-        if len(blob) != unpack.size or (source and source[0] in excluded):
-            continue
-        score = math.sumprod(vector, unpack.unpack(blob))
         if row_id in ranked:
             scores[row_id] = score
-        elif score >= add_at and (not source or source[0] not in matched_sources):
+        elif score >= add_at and source not in matched_sources:
             candidate = (score, -index, row_id)
             if len(shortlist) < 8:
                 heapq.heappush(shortlist, candidate)
             elif candidate > shortlist[0]:
                 heapq.heapreplace(shortlist, candidate)
+    if stopped():
+        return rows
     kept = [row for row in rows if row[0] in protected or scores.get(row[0], 1.0) >= filter_at]
     if scope == "documents" and len(kept) > 1 and not protected:
         winner = max(kept, key=lambda row: scores.get(row[0], -1.0))

@@ -2,6 +2,7 @@
 
 import heapq
 import json
+import logging
 import math
 import re
 import sqlite3
@@ -35,6 +36,18 @@ VECTOR_FORMAT = {
 COMPACT_VECTOR_FORMAT = dict(VECTOR_FORMAT, encoding="ivf-residual-pq64-v1")
 
 
+@lru_cache(maxsize=1)
+def optional_numpy():
+    try:
+        import numpy
+    except ImportError:
+        return None
+    except Exception as exc:
+        logging.warning("Could not load NumPy for retrieval: %s", exc)
+        return None
+    return numpy
+
+
 def read_search_vector_state(db):
     row = db.execute(
         "SELECT value FROM index_state WHERE key=?", (COMPACT_VECTOR_STATE_KEY,)
@@ -54,7 +67,7 @@ def read_search_vector_state(db):
 
 
 @lru_cache(maxsize=24)
-def _search_vector_model(path, stamp, clusters):
+def _search_vector_model(path, stamp, clusters, np):
     with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
         row = db.execute("SELECT centers, codebook FROM compact_vector_model").fetchone()
     if row is None:
@@ -67,6 +80,13 @@ def _search_vector_model(path, stamp, clusters):
         or len(codebook) != COMPACT_VECTOR_BYTES * 256 * word.size
     ):
         raise ValueError("Invalid compact vector model size.")
+    if np is not None:
+        return (
+            np.frombuffer(centers, dtype="<f4").reshape(clusters, VECTOR_DIMENSIONS),
+            np.frombuffer(codebook, dtype="<f4").reshape(
+                COMPACT_VECTOR_BYTES, 256, COMPACT_VECTOR_WIDTH
+            ),
+        )
     words = tuple(word.iter_unpack(codebook))
     floats = array("f")
     floats.frombytes(centers)
@@ -81,20 +101,28 @@ def search_pack_vectors(db, path, state, query, *, limit=24, budget=16000):
     """Score passages in nearby clusters with their published vector encoding."""
     if len(query) != VECTOR_DIMENSIONS:
         return []
+    np = optional_numpy()
     info = path.stat()
     centers, codebook = _search_vector_model(
-        path.resolve(), (info.st_ino, info.st_mtime_ns, info.st_size), state["clusters"]
+        path.resolve(), (info.st_ino, info.st_mtime_ns, info.st_size), state["clusters"], np
     )
-    scores = [
-        math.sumprod(query, centers[start:start + VECTOR_DIMENSIONS])
-        for start in range(0, len(centers), VECTOR_DIMENSIONS)
-    ]
+    if np is None:
+        scores = [
+            math.sumprod(query, centers[start:start + VECTOR_DIMENSIONS])
+            for start in range(0, len(centers), VECTOR_DIMENSIONS)
+        ]
+        tables = []
+        for i, words in enumerate(codebook):
+            offset = i * COMPACT_VECTOR_WIDTH
+            segment = query[offset:offset + COMPACT_VECTOR_WIDTH]
+            tables.append(tuple(math.sumprod(segment, word) for word in words))
+    else:
+        # Keep the scoring in float64 and avoid a BLAS thread pool per pack search.
+        vector = np.asarray(query, dtype=np.float64)
+        scores = np.einsum("ij,j->i", centers, vector).tolist()
+        tables = np.einsum("ikj,ij->ik", codebook, vector.reshape(-1, COMPACT_VECTOR_WIDTH))
+        code_positions = np.arange(COMPACT_VECTOR_BYTES)
     neighbors = heapq.nlargest(24, range(len(scores)), key=scores.__getitem__)
-    tables = []
-    for i, words in enumerate(codebook):
-        offset = i * COMPACT_VECTOR_WIDTH
-        segment = query[offset:offset + COMPACT_VECTOR_WIDTH]
-        tables.append(tuple(math.sumprod(segment, word) for word in words))
 
     def candidates():
         remaining = budget
@@ -113,12 +141,18 @@ def search_pack_vectors(db, path, state, query, *, limit=24, budget=16000):
                 break
             bias = scores[cluster]
             step = max(1, (count + remaining - 1) // remaining)
-            row_ids = islice(struct.iter_unpack("<I", ids), 0, None, step)
-            for position, (row_id,) in enumerate(row_ids):
-                start = position * step * COMPACT_VECTOR_BYTES
-                code = codes[start:start + COMPACT_VECTOR_BYTES]
-                score = sum(table[value] for table, value in zip(tables, code, strict=True))
-                yield bias + score, row_id
+            if np is None:
+                row_ids = islice(struct.iter_unpack("<I", ids), 0, None, step)
+                for position, (row_id,) in enumerate(row_ids):
+                    start = position * step * COMPACT_VECTOR_BYTES
+                    code = codes[start:start + COMPACT_VECTOR_BYTES]
+                    score = sum(table[value] for table, value in zip(tables, code, strict=True))
+                    yield bias + score, row_id
+            else:
+                row_ids = np.frombuffer(ids, dtype="<u4")[::step]
+                bucket = np.frombuffer(codes, dtype=np.uint8).reshape(-1, COMPACT_VECTOR_BYTES)
+                similarities = tables[code_positions, bucket[::step]].sum(axis=1) + bias
+                yield from zip(similarities.tolist(), row_ids.tolist(), strict=True)
             remaining -= (count + step - 1) // step
             if remaining <= 0:
                 break

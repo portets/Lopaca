@@ -1278,6 +1278,8 @@ class ChatWindow(Adw.ApplicationWindow):
         if index >= len(self._model_keys):
             return
         self.controller.request_model_switch(self._model_keys[index])
+
+    def schedule_model_switch(self):
         if self._model_switch_timer is None and self.controller.try_model_switch():
             self._model_switch_timer = GLib.timeout_add(100, self._retry_model_switch)
 
