@@ -511,6 +511,9 @@ window.lopaca-main, .transcript-scroll, .transcript {
 }
 
 /* Settings pages and shared settings controls */
+.about-page .about-link-button {
+    color: @window_fg_color;
+}
 preferencespage button,
 preferencespage row.activatable:not(.settings-edit-entry):not(.memories-row),
 popover.menu modelbutton {
@@ -859,7 +862,8 @@ def hint_edit_button(row, button, editing):
 class DownloadAction(Gtk.Button):
     def __init__(self, label, **actions):
         super().__init__(
-            valign=Gtk.Align.CENTER, sensitive=False, css_classes=["knowledge-packs-button"]
+            valign=Gtk.Align.CENTER, sensitive=False, focus_on_click=False,
+            css_classes=["knowledge-packs-button"],
         )
         self._label, self._actions = label, actions
         self._action = None
@@ -2505,7 +2509,10 @@ class ChatWindow(Adw.ApplicationWindow):
         ).present(self)
 
     def _update_setup_highlights(self):
-        active = self.controller.first_launch and self.controller.connected is False
+        active = (
+            self.controller.first_launch and self.controller.connected is False
+            and not self.controller.external_model_server
+        )
         if active:
             folder = self.controller.store.root.parent
             config = self.controller.model_configuration() or {}
@@ -2824,6 +2831,7 @@ class ChatWindow(Adw.ApplicationWindow):
         def link_row(title, subtitle, url):
             row = Adw.ActionRow(title=title, subtitle=subtitle)
             link = Gtk.LinkButton(uri=url, label="")
+            link.add_css_class("about-link-button")
             link.set_child(Gtk.Image(icon_name="external-link-symbolic"))
             link.set_valign(Gtk.Align.CENTER)
             link.set_tooltip_text(url)
@@ -3013,6 +3021,8 @@ class ChatWindow(Adw.ApplicationWindow):
         external = config is None
         config = config or {}
         settings = self.controller.store.load_app_settings()
+        if hasattr(self, "_custom_server_add"):
+            self._custom_server_add.set_sensitive(not external)
         downloaded_server, server_percent = self._model_download.get("server", (None, None))
         folder = self.controller.store.root.parent
         executable = config.get("executable")
@@ -3032,12 +3042,14 @@ class ChatWindow(Adw.ApplicationWindow):
         )
         if downloading_server:
             server = "llama.cpp", "", True
-        elif external:
+        elif external and not self.controller.external_model_server:
             server = "Manually configured by user", "", False
         elif server_available:
-            server = "llama.cpp", self._model_server_subtitle(server_config), not manual
+            server = (
+                "llama.cpp", self._model_server_subtitle(server_config), not (manual or external)
+            )
         else:
-            can_download = not busy
+            can_download = not (busy or external)
             server = "Click here to automatically download and set-up", "", can_download
 
         self._configured_server.set_activatable(can_download)
@@ -3098,6 +3110,12 @@ class ChatWindow(Adw.ApplicationWindow):
                 else:
                     row.set_text(value)
             reset.set_visible(self._has_model_override(key, value))
+            if key == "port":
+                self._update_external_server_title(value)
+
+    def _update_external_server_title(self, value):
+        port = str(value).strip() or "9931"
+        self._external_server_row.set_title(f"Use external model server at {port}")
 
     def _has_model_override(self, key, value):
         default = self._model_parameter_defaults[key]
@@ -3131,7 +3149,8 @@ class ChatWindow(Adw.ApplicationWindow):
     def _model_reset_button(title, reset):
         label = f"Reset {title}"
         button = Gtk.Button(
-            icon_name="view-refresh-symbolic", tooltip_text=label, valign=Gtk.Align.CENTER
+            icon_name="view-refresh-symbolic", tooltip_text=label, valign=Gtk.Align.CENTER,
+            focus_on_click=False,
         )
         button.add_css_class("flat")
         button.update_property([Gtk.AccessibleProperty.LABEL], [label])
@@ -3446,6 +3465,7 @@ class ChatWindow(Adw.ApplicationWindow):
             chooser.open(self, None, selected)
 
         button.connect("clicked", choose)
+        return button
 
     @staticmethod
     def _list_remove_button(tooltip):
@@ -3645,7 +3665,9 @@ class ChatWindow(Adw.ApplicationWindow):
             "activated",
             lambda *_: self.confirm_model_download(reconfigure=self._auto_configure_manual),
         )
-        self._add_custom_file_button(section, "executable", "llama-server")
+        self._custom_server_add = self._add_custom_file_button(
+            section, "executable", "llama-server"
+        )
         page.add(self._model_choices())
         page.add(self._vision_choices())
         page.add(self._embedding_choice())
@@ -3667,6 +3689,15 @@ class ChatWindow(Adw.ApplicationWindow):
         reasoning = Adw.PreferencesGroup()
         reasoning.add_css_class("model-settings-reasoning")
         advanced_content.append(reasoning)
+        self._external_server_row = Adw.SwitchRow(
+            active=bool(config.get("external")),
+            subtitle="Press Connect to apply changes.",
+        )
+        self._update_external_server_title(server_parameters(config)["port"])
+        self._external_server_row.connect(
+            "notify::active", lambda row, _: save("external", row.get_active())
+        )
+        reasoning.add(self._external_server_row)
         preserve_row = Adw.ActionRow(
             title="Preserve Reasoning",
             subtitle="Include earlier thinking in future replies when the model supports it.",
@@ -3747,6 +3778,8 @@ class ChatWindow(Adw.ApplicationWindow):
                         value = entry.get_text()
                         save(key, value)
                         reset.set_visible(self._has_model_override(key, value))
+                        if key == "port":
+                            self._update_external_server_title(value)
 
                     handler = row.connect("notify::text", changed)
                 row.set_tooltip_text(f"--{key}: {hint}")
@@ -3995,20 +4028,6 @@ class ChatWindow(Adw.ApplicationWindow):
         self._knowledge_refresh = None
         is_open = True
         merge_confirming = False
-        scroller = group.get_ancestor(Gtk.ScrolledWindow)
-        adjustment = scroller.get_vadjustment() if scroller is not None else None
-        scroll_position = None
-
-        def restore_scroll():
-            nonlocal scroll_position
-            if is_open:
-                adjustment.set_value(scroll_position)
-            scroll_position = None
-            return GLib.SOURCE_REMOVE
-
-        def restore_after_layout(*_):
-            GLib.idle_add(restore_scroll, priority=GLib.PRIORITY_LOW)
-            return GLib.SOURCE_REMOVE
 
         def closed(*_):
             nonlocal is_open
@@ -4019,7 +4038,6 @@ class ChatWindow(Adw.ApplicationWindow):
         dialog.connect("closed", closed)
 
         def refresh(job=None):
-            nonlocal scroll_position
             if not is_open:
                 return
             if job is not None:
@@ -4027,11 +4045,6 @@ class ChatWindow(Adw.ApplicationWindow):
                 if label := indicators.get(id(job)):
                     label.set_text(job["status"])
                 return
-            if adjustment is not None and rows and scroll_position is None and group.get_mapped():
-                scroll_position = adjustment.get_value()
-                # GTK can reset the adjustment while removing the focused row. Restore it
-                # after the replacement rows have been allocated.
-                group.add_tick_callback(restore_after_layout)
             indicators.clear()
             for row in rows:
                 group.remove(row)
@@ -4077,7 +4090,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 pending = next((job for job in jobs if job.get("key") == key), None)
                 switch = Gtk.Switch(
                     active=pending.get("enabled", enabled) if pending else enabled,
-                    valign=Gtk.Align.CENTER,
+                    valign=Gtk.Align.CENTER, focus_on_click=False,
                 )
                 switch.add_css_class("knowledge-packs-switch")
                 if error:

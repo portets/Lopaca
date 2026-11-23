@@ -27,6 +27,7 @@ DOWNLOADING_MODEL = "Downloading model"
 _GPU_LAYERS = re.compile(r"\boffloaded (\d+)/\d+ layers to GPU\b")
 
 SERVER_FIELDS = (
+    ("port", "Server port", "Local port from 1 to 65535; default 9931"),
     ("ctx-size", "Context size", "Tokens; 0 uses the model default"),
     ("n-gpu-layers", "GPU layers", "Number of layers, auto or all"),
     ("threads", "CPU threads", "Generation threads; -1 uses automatic detection"),
@@ -80,6 +81,7 @@ def server_parameters(config):
         {},
     )
     parameters = dict(SERVER_LAUNCH_DEFAULTS)
+    parameters["port"] = 9931
     sampling = SERVER_SAMPLING_DEFAULTS | sampling
     parameters.update(
         (_SAMPLING_FLAGS[name], value) for name, value in sampling.items()
@@ -138,7 +140,8 @@ def launch_command(config, server_url):
             raise ValueError(f"The vision file does not exist or is not a file.\nPath: {projector}")
         args.extend(("--mmproj", str(projector.resolve())))
     for key, value in server_parameters(config).items():
-        args.extend(("--" + key, str(value).strip()))
+        if key != "port":
+            args.extend(("--" + key, str(value).strip()))
     devices = config.get("devices")
     if (
         devices
@@ -237,8 +240,6 @@ class ModelServer:
                     self._expected_exits.add(process)
                     self._stop_process(process)
                 self.process = self._config = None
-                if not self._closed.is_set():
-                    finished()
                 self._state("Model unloaded")
             except OSError as exc:
                 if not self._closed.is_set():
@@ -246,6 +247,8 @@ class ModelServer:
             finally:
                 self.busy = False
                 self.on_state(self.status, False)
+            if self.process is None and not self._closed.is_set():
+                finished()
 
         threading.Thread(target=unload, daemon=True).start()
 

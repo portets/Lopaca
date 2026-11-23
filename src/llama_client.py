@@ -219,9 +219,7 @@ class LlamaClient:
     """Small OpenAI-compatible streaming client for llama-server."""
 
     def __init__(self, settings):
-        self.settings = settings
-        self.chat_url = settings.server_url.rstrip("/") + "/chat/completions"
-        self.base_url = settings.server_url.rstrip("/").removesuffix("/v1")
+        self.set_endpoint(settings)
         self.active_response = None
         self.context_capacity = None
         self.vision_enabled = False
@@ -232,6 +230,11 @@ class LlamaClient:
         self._context_expanding = False
         self._context_rejected = self._context_retry = False
         self._on_context = self._on_context_trim = None
+
+    def set_endpoint(self, settings):
+        self.settings = settings
+        self.chat_url = settings.server_url.rstrip("/") + "/chat/completions"
+        self.base_url = settings.server_url.rstrip("/").removesuffix("/v1")
 
     def cancel(self):
         response = self.active_response

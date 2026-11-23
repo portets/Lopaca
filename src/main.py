@@ -12,8 +12,10 @@ import uuid
 from collections import deque
 from concurrent.futures import Future, wait
 from contextlib import suppress
+from dataclasses import replace
 from http.client import HTTPException
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import thinking_classifier
 from agentic import (
@@ -153,6 +155,8 @@ class ChatController:
         self._model_lock = threading.Lock()
         self._chat_warm_stop = threading.Event()
         indexing_client = LlamaClient(settings)
+        self._indexing_client = indexing_client
+        self.external_model_server = False
         self.document_indexer = DocumentIndexer(
             settings,
             indexing_client.document_questions,
@@ -224,6 +228,11 @@ class ChatController:
             self.view._show_alert("Could not save model settings", str(exc))
         self.first_launch = app_settings.get("first_launch") is True
         self.chat_sort = app_settings["chat_sort"]
+        config = app_settings.get("model_server", {})
+        try:
+            self._set_model_endpoint(config)
+        except ValueError as exc:
+            self.view._show_alert("Invalid model server port", str(exc))
         threading.Thread(target=self._monitor_connection, daemon=True).start()
         chats = self.store.list()
         for chat in chats:
@@ -236,7 +245,6 @@ class ChatController:
                 else self.store.create()["id"]
             )
         self.open_chat(active_chat)
-        config = app_settings.get("model_server", {})
         folder = self.store.root.parent
         configured_model = Path(config.get("model") or ".").expanduser()
         pending = app_settings.get("pending_model_download")
@@ -258,7 +266,8 @@ class ChatController:
             and (not config.get("model") or configured_model == model_path(folder, key))
         ]
         if (
-            partials
+            not self.external_model_server
+            and partials
             and not pending
             and config.get("model") != ""
             and not configured_model.is_file()
@@ -267,7 +276,7 @@ class ChatController:
             self._connect_default_model(config, partials[0] if len(partials) == 1 else None)
         else:
             self._connect_configured_model(config, startup=True)
-            if pending:
+            if pending and not self.external_model_server:
                 self.download_model(pending)
 
     def _set_model_recommendation(self, profile, vision_precision):
@@ -481,6 +490,8 @@ class ChatController:
 
     def model_configuration(self):
         """Use the active configuration while connected, otherwise show saved paths."""
+        if self.external_model_server:
+            return None
         if self.connected:
             config = self.model_server.running_config
             if config is None:
@@ -501,10 +512,52 @@ class ChatController:
         settings = self._settings_for_model_change()
         if settings is None:
             return
-        self._connect_configured_model(settings.get("model_server", {}))
-        self.view.refresh_model_configuration()
+        config = settings.get("model_server", {})
+        try:
+            port = self._model_server_port(config)
+        except ValueError as exc:
+            self.view._show_alert("Invalid model server port", str(exc))
+            return
+
+        def connect():
+            self._set_model_endpoint(config)
+            self._server_properties_changed({}, reset_capacity=True)
+            self._connection_changed(False)
+            self._connect_configured_model(config)
+            self.view.refresh_model_configuration()
+
+        if self.model_server.running_config is not None and (
+            config.get("external") or port != urlsplit(self.settings.server_url).port
+        ):
+            self.model_server.disconnect(lambda: self.view.dispatch(connect))
+        else:
+            connect()
+
+    @staticmethod
+    def _model_server_port(config):
+        try:
+            port = int(str(config.get("port") or "9931").strip() or "9931")
+        except ValueError:
+            port = 0
+        if not 1 <= port <= 65535:
+            raise ValueError("Enter a port between 1 and 65535.")
+        return port
+
+    def _set_model_endpoint(self, config):
+        port = self._model_server_port(config)
+        self.external_model_server = bool(config.get("external"))
+        address = urlsplit(self.settings.server_url)
+        url = address._replace(netloc=f"{address.hostname}:{port}").geturl()
+        if url != self.settings.server_url:
+            self.settings = replace(self.settings, server_url=url)
+            for client in (self.client, self._indexing_client, self.history_index.client):
+                client.set_endpoint(self.settings)
+            self.model_server.url = self.client.base_url
 
     def _connect_configured_model(self, config, *, startup=False):
+        if self.external_model_server:
+            self._connection_wakeup.set()
+            return
         def configured(paths):
             self.view.dispatch(self._save_vision_settings, config, paths)
             if startup:
@@ -530,6 +583,8 @@ class ChatController:
         )
 
     def download_default_model(self, *, reconfigure=False, optional_features=False):
+        if self.external_model_server:
+            return
         owned = self.model_server.running_config is not None
         if (
             (self.connected and not (reconfigure and owned))
@@ -1385,8 +1440,11 @@ class ChatController:
                     self.document_indexer.schedule(folder / "documents")
             if not self.switching_model:
                 process = self.model_server.process
+                endpoint = self.client.base_url
                 connected, props = self._probe_connection()
-                self.view.dispatch(self._apply_connection_probe, process, connected, props)
+                self.view.dispatch(
+                    self._apply_connection_probe, process, connected, props, endpoint
+                )
             sizes, total = self.store.disk_usage()
             self.view.dispatch(self._update_disk_usage, sizes, total)
             self._connection_wakeup.wait(self.settings.connection_check_interval)
@@ -1403,8 +1461,11 @@ class ChatController:
                 props = self.client.server_properties()
         return connected, props
 
-    def _apply_connection_probe(self, process, connected, props):
-        if self.switching_model or process is not self.model_server.process:
+    def _apply_connection_probe(self, process, connected, props, endpoint):
+        if (
+            self.switching_model or process is not self.model_server.process
+            or endpoint != self.client.base_url
+        ):
             return
         if props is not None:
             self._server_properties_changed(props)
@@ -1858,7 +1919,10 @@ class ChatController:
                 and not self.busy
                 and self._pending_default_setup is None
             ):
-                self.view.confirm_model_download()
+                if self.external_model_server:
+                    self.view.notify("Start your external model server to continue.")
+                else:
+                    self.view.confirm_model_download()
             return False
         chat_id = self.chat["id"]
         attachments = self._draft_attachments.pop(chat_id, ())
