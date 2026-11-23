@@ -36,8 +36,8 @@ class ModelDownload:
         return f"https://huggingface.co/{self.repository}/resolve/{self.revision}/{self.filename}"
 
 
-_UNSLOTH_9B = "unsloth/Qwen3.5-9B-GGUF"
-_UNSLOTH_9B_REVISION = "3885219b6810b007914f3a7950a8d1b469d598a5"
+_UNSLOTH_9B = "unsloth/Qwen3.5-9B-MTP-GGUF"
+_UNSLOTH_9B_REVISION = "9716a636ee4bddc3fed678220b7a33dd2a4160ae"
 _UNSLOTH_27B = "unsloth/Qwen3.8-27B-GGUF"
 _UNSLOTH_27B_REVISION = "4af51b3542f775b0a8e4b310bfb3f17e01c306c9"
 
@@ -63,8 +63,8 @@ MODEL_DOWNLOADS = {
         _UNSLOTH_9B,
         _UNSLOTH_9B_REVISION,
         "Qwen3.5-9B-UD-Q5_K_XL.gguf",
-        6_743_680_224,
-        "96cf42ddb97f9572410a72b9ed6f2299b1e887ee08da4c2a6c01e897cfa9f673",
+        6_874_345_824,
+        "bb0aa4bf2acf4b6d97eca051a7af91200729e9e97449ce98785af9e70f6d703c",
         vision_family="3.5",
     ),
     "9b-q4": ModelDownload(
@@ -74,8 +74,8 @@ MODEL_DOWNLOADS = {
         _UNSLOTH_9B,
         _UNSLOTH_9B_REVISION,
         "Qwen3.5-9B-UD-Q4_K_XL.gguf",
-        5_966_095_584,
-        "6f5d30666c2d8ae16a306e616d95341dcf3cc46810df84d7e6f5a7d1e4c1b293",
+        6_135_034_208,
+        "362f85a2d7dbc0259e926d5ac33ca0d0f17fd3753496d65bfd2106384c929d3f",
         vision_family="3.5",
     ),
     "9b-q3": ModelDownload(
@@ -85,8 +85,8 @@ MODEL_DOWNLOADS = {
         _UNSLOTH_9B,
         _UNSLOTH_9B_REVISION,
         "Qwen3.5-9B-UD-Q3_K_XL.gguf",
-        5_053_834_464,
-        "aae0879e1be99ce93f0d56217f8185a399e25ad68a8ebbc095f362706283062f",
+        5_241_319_776,
+        "437bb5639136b1b48807a5427f320321133383319e134e1687f339b38fe1a050",
         vision_family="3.5",
     ),
     "27b-q8": ModelDownload(
@@ -157,7 +157,6 @@ EMBEDDING_DOWNLOAD = ModelDownload(
     1_197_629_632,
     "421a27e58d165478cc7acb984a688c2aa41404968b0203e7cd743ece44c54340",
 )
-EMBEDDING_LEGACY_Q8 = ("Qwen3-Embedding-0.6B-Q8_0.gguf", 639_150_016)
 EMBEDDING_QUERY_INSTRUCTION = (
     "Given a search query, retrieve relevant passages that answer the query"
 )
@@ -181,14 +180,14 @@ VISION_DOWNLOADS = {
         "FP16": VisionDownload(
             _UNSLOTH_9B,
             _UNSLOTH_9B_REVISION,
-            918_166_080,
-            "f70dc3509053962b0d0d3ee8a7eacebf5d60aa560cad78254ae8698516ae029f",
+            918_165_984,
+            "5a40d1f771686432172a4981018a0d30d03a5aaf5793a5badd5416573362a232",
         ),
         "BF16": VisionDownload(
             _UNSLOTH_9B,
             _UNSLOTH_9B_REVISION,
-            921_705_024,
-            "853698ce7aa6c7ba732478bad280240969ddf7b0fcbf93900046f63903a83383",
+            921_704_928,
+            "73c90471c349fec797f3969b59249259318ee3fa855a684da7ef35a46f063a9e",
         ),
     },
     "3.8": {
@@ -312,7 +311,7 @@ MODEL_RECOMMENDATIONS = {
     "small": ModelRecommendation(
         balanced="9b-q4",
         faster="9b-q3",
-        better="27b-q4s",
+        better="27b-q2",
         vision=True,
         embedding=True,
         ram_gib=32,

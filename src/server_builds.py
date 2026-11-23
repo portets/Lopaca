@@ -18,7 +18,6 @@ from threading import Event, Lock
 
 from settings import (
     EMBEDDING_DOWNLOAD,
-    EMBEDDING_LEGACY_Q8,
     MODEL_DOWNLOADS,
     MODEL_FREE_VRAM_DISCOUNT_GIB,
     MODEL_RECOMMENDATIONS,
@@ -537,13 +536,6 @@ def vision_file_precision(folder, family, filename):
 
 def embedding_path(folder):
     return folder / "models" / EMBEDDING_DOWNLOAD.filename
-
-
-def legacy_embedding_file(filename):
-    with suppress(OSError, RuntimeError):
-        path = Path(filename or ".").expanduser()
-        return path.name == EMBEDDING_LEGACY_Q8[0] and path.stat().st_size == EMBEDDING_LEGACY_Q8[1]
-    return False
 
 
 def managed_vision_file(folder, filename):

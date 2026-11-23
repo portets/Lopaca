@@ -26,7 +26,6 @@ from server_builds import (
     cached_server_config,
     embedding_launch_parameters,
     embedding_path,
-    legacy_embedding_file,
     managed_vision_file,
     model_path,
     model_vision_family,
@@ -2868,7 +2867,7 @@ class ChatWindow(Adw.ApplicationWindow):
             selected = Path(embedding.get("path") or ".")
             with suppress(RuntimeError):
                 selected = selected.expanduser()
-            if not selected.is_file() or legacy_embedding_file(selected):
+            if not selected.is_file():
                 downloads.append(
                     f"{EMBEDDING_DOWNLOAD.name} · {EMBEDDING_DOWNLOAD.size / 10**9:.2f} GB"
                 )
@@ -2904,10 +2903,14 @@ class ChatWindow(Adw.ApplicationWindow):
         alert.present(self)
 
     def update_model_paths(self, paths):
+        drafts = self.controller.store.load_app_settings().get("advanced_model_settings", {})
         for key, (row, handler) in getattr(self, "_model_path_rows", {}).items():
             if key in paths:
+                section = "embedding_model" if key == "embedding_path" else "model_server"
+                draft = drafts.get(section, {})
+                field = "path" if key == "embedding_path" else key
                 with row.handler_block(handler):
-                    row.set_text(paths[key])
+                    row.set_text(draft.get(field, paths[key]) or "")
         self.refresh_model_configuration()
 
     def refresh_model_configuration(self):
@@ -2990,9 +2993,9 @@ class ChatWindow(Adw.ApplicationWindow):
     def _refresh_model_parameter_defaults(self):
         if not getattr(self, "_model_parameter_rows", None):
             return
-        config = self._model_parameter_config(
-            self.controller.store.load_app_settings().get("model_server", {})
-        )
+        settings = self.controller.store.load_app_settings()
+        draft = settings.get("advanced_model_settings", {}).get("model_server", {})
+        config = self._model_parameter_config(settings.get("model_server", {}) | draft)
         identity = config["recommendation"], config["model"]
         if identity == self._model_parameter_identity:
             return
@@ -3020,16 +3023,27 @@ class ChatWindow(Adw.ApplicationWindow):
         downloading, percent = self._model_download.get("model", (None, None))
         file_job = self.controller.model_file_download
         setup_busy = self.controller.model_server.busy
-        for role, widgets in self._model_rows.items():
+        recommended = {role: getattr(rule, role) for role in self._model_rows}
+        recommended_keys = set(recommended.values())
+        rows = [
+            (key, self._model_rows[role], False) for role, key in recommended.items()
+        ]
+        rows.extend((key, widgets, True) for key, widgets in self._extra_model_rows.items())
+        for key, widgets, extra in rows:
             row, action, switch, indicator, handler = widgets
-            key = getattr(rule, role)
             asset = MODEL_DOWNLOADS[key]
             path = model_path(folder, key)
             installed = path.is_file()
             active = installed and path == selected
             in_progress = percent is not None if key == downloading else key == file_job
+            if extra:
+                visible = key not in recommended_keys and (installed or in_progress)
+                row.set_visible(visible)
+                if not visible:
+                    continue
             row.set_subtitle(
-                f"{asset.name} · {asset.publisher} | {asset.quantization}"
+                ("" if extra else f"{asset.name} · ")
+                + f"{asset.publisher} | {asset.quantization}"
                 + model_file_size(asset.size)
             )
             if installed:
@@ -3062,13 +3076,13 @@ class ChatWindow(Adw.ApplicationWindow):
         active = self.controller.embedding_download_active
         _, percent = self._model_download.get("embedding", (None, None))
         self._embedding_parameters.set_visible(bool(filename.strip()))
-        selected = Path(filename)
+        config = self.controller.store.load_app_settings().get("embedding_model", {})
+        selected = Path(config.get("path") or ".")
         with suppress(RuntimeError):
             selected = selected.expanduser()
-        config = self.controller.store.load_app_settings().get("embedding_model", {})
         row, action, switch, indicator, handler = self._embedding_row
         installed = embedding_path(folder).is_file()
-        available = selected.is_file() and not legacy_embedding_file(selected)
+        available = selected.is_file()
         if installed or available:
             row.remove_css_class("dim-label")
         else:
@@ -3242,6 +3256,18 @@ class ChatWindow(Adw.ApplicationWindow):
                 "model",
             )
             group.add(row)
+        self._extra_model_rows = {}
+        for key, asset in MODEL_DOWNLOADS.items():
+            row = Adw.ActionRow(title=asset.name, use_markup=False, visible=False)
+            self._extra_model_rows[key] = self._model_row_controls(
+                row,
+                "Model",
+                lambda key=key: self.controller.download_model(key),
+                lambda active, key=key: self.controller.select_model(key, active),
+                lambda key=key: self._confirm_model_delete(key),
+                "model",
+            )
+            group.add(row)
         return group
 
     def _confirm_model_delete(self, key):
@@ -3268,23 +3294,27 @@ class ChatWindow(Adw.ApplicationWindow):
         page.add_css_class("model-settings-page")
         page.connect("map", self._sync_native_scroll)
         settings = self.controller.store.load_app_settings()
-        config = dict(settings.get("model_server", {}))
-        embedding = settings.get("embedding_model", {})
+        drafts = settings.get("advanced_model_settings", {})
+        config = settings.get("model_server", {}) | drafts.get("model_server", {})
+        embedding = settings.get("embedding_model", {}) | drafts.get("embedding_model", {})
 
         def save(key, value):
             try:
                 if key == "embedding_path":
-                    self.controller.set_embedding_setting("path", value)
+                    self.controller.save_advanced_model_settings("embedding_model", {"path": value})
                     self.refresh_model_configuration()
                     return
-                current = self.controller.store.load_app_settings().get("model_server", {})
+                settings = self.controller.store.load_app_settings()
+                current = settings.get("model_server", {}) | settings.get(
+                    "advanced_model_settings", {}
+                ).get("model_server", {})
+                changes = {key: value}
                 folder = self.controller.store.root.parent
                 if key == "executable" and value != current.get(key):
-                    current.pop("backend", None)
-                    current.pop("devices", None)
-                    current.pop("version", None)
-                    current.pop("recommendation", None)
-                    current.pop("vision_precision", None)
+                    for field in (
+                        "backend", "devices", "version", "recommendation", "vision_precision",
+                    ):
+                        changes[field] = None
                 clear_vision = (
                     key == "model"
                     and managed_vision_file(folder, current.get("mmproj"))
@@ -3292,10 +3322,10 @@ class ChatWindow(Adw.ApplicationWindow):
                     != model_vision_family(folder, current.get("model"))
                 )
                 if clear_vision:
-                    current["mmproj"] = ""
+                    changes["mmproj"] = ""
                 if key == "mmproj" or clear_vision:
-                    current["mmproj_manual"] = key == "mmproj" and bool(value)
-                self.controller.set_model_server_config({**current, key: value})
+                    changes["mmproj_manual"] = key == "mmproj" and bool(value)
+                self.controller.save_advanced_model_settings("model_server", changes)
                 if clear_vision:
                     self.update_model_paths({"mmproj": ""})
                 elif key in ("executable", "model", "mmproj"):
@@ -3303,7 +3333,7 @@ class ChatWindow(Adw.ApplicationWindow):
             except OSError as exc:
                 self._show_alert("Could not save settings", str(exc))
 
-        section = Adw.PreferencesGroup(title="Configured Server")
+        section = Adw.PreferencesGroup(title="Configured Local Server")
         section.add_css_class("model-settings-summary")
         self._configured_server = Adw.ActionRow(use_markup=False)
         self._configured_server.add_css_class("model-settings-summary-row")
@@ -3454,7 +3484,9 @@ class ChatWindow(Adw.ApplicationWindow):
 
         def save_embedding_parameters(value):
             try:
-                self.controller.set_embedding_setting("parameters", value)
+                self.controller.save_advanced_model_settings(
+                    "embedding_model", {"parameters": value}
+                )
             except OSError as exc:
                 self._show_alert("Could not save settings", str(exc))
 
