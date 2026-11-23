@@ -20,7 +20,13 @@ from markdown_ui import (
     append_markdown,
     load_picture,
 )
-from model_server import DOWNLOADING_MODEL, SAMPLING_FIELDS, SERVER_FIELDS, server_parameters
+from model_server import (
+    DOWNLOADING_MODEL,
+    SAMPLING_FIELDS,
+    SERVER_FIELD_CHOICES,
+    SERVER_FIELDS,
+    server_parameters,
+)
 from server_builds import (
     BACKEND_LABELS,
     cached_server_config,
@@ -505,6 +511,27 @@ window.lopaca-main, .transcript-scroll, .transcript {
 }
 
 /* Settings pages and shared settings controls */
+preferencespage button,
+preferencespage row.activatable:not(.model-settings-row):not(.memories-row),
+popover.menu modelbutton {
+    transition: box-shadow 120ms ease-out, background-color 120ms ease-out;
+}
+preferencespage button:active,
+preferencespage row.activatable:not(.model-settings-row):not(.memories-row):active,
+popover.menu modelbutton:active {
+    box-shadow: inset 0 0 0 1px alpha(@window_fg_color, 0.18);
+    transition-duration: 45ms;
+}
+button.edit-button-pressed {
+    background-color: alpha(@window_fg_color, 0.16);
+    box-shadow: inset 0 0 0 1px alpha(@window_fg_color, 0.23);
+    transition-duration: 45ms;
+}
+.model-settings-advanced.model-advanced:active,
+.model-settings-advanced.model-advanced:hover {
+    background-color: transparent;
+    box-shadow: none;
+}
 .delete-icon {
     -gtk-icon-size: 24px;
 }
@@ -613,6 +640,14 @@ window.lopaca-main, .transcript-scroll, .transcript {
 }
 .model-settings-row {
     /* Theme defaults; add overrides here when needed. */
+}
+.model-settings-row .edit-icon {
+    opacity: 0;
+    -gtk-icon-size: 1px;
+    min-width: 0;
+    min-height: 0;
+    padding: 0;
+    margin: 0;
 }
 .model-settings-browse {
     /* Theme defaults; add overrides here when needed. */
@@ -797,6 +832,39 @@ def model_file_size(size):
     return f" · {size / 10**9:.1f} GB"
 
 
+EDIT_ICON = "document-edit-symbolic"
+DONE_EDITING_ICON = "object-select-symbolic"
+
+
+def pulse_edit_button(button):
+    button.add_css_class("edit-button-pressed")
+
+    def clear():
+        button.remove_css_class("edit-button-pressed")
+        return GLib.SOURCE_REMOVE
+
+    GLib.timeout_add(200, clear)
+
+
+def hint_edit_button(row, button, editing):
+    gesture = Gtk.GestureClick(button=Gdk.BUTTON_PRIMARY)
+    gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+
+    def pressed(_gesture, _count, x, y):
+        if editing():
+            return
+        target = row.pick(x, y, Gtk.PickFlags.DEFAULT)
+        while target is not None and target is not row:
+            if isinstance(target, (Gtk.Button, Gtk.CheckButton, Gtk.Switch)):
+                return
+            target = target.get_parent()
+        if target is row:
+            pulse_edit_button(button)
+
+    gesture.connect("pressed", pressed)
+    row.add_controller(gesture)
+
+
 class DownloadAction(Gtk.Button):
     def __init__(self, label, **actions):
         super().__init__(
@@ -889,6 +957,7 @@ class ChatWindow(Adw.ApplicationWindow):
     def refresh_optional_features(self):
         self.emit("optional-features-changed")
         self._update_setup_highlights()
+        self.refresh_model_configuration()
         self.set_status(self._activity_status)
 
     def __init__(self, app, controller):
@@ -920,6 +989,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._model_server_activity = ""
         self._model_download = {}
         self._model_switch_timer = None
+        self._model_setup_dialog = self._model_remove_dialog = None
         self._welcome_pending = False
         self._app_settings_dialog = None
         self._processing_documents = False
@@ -2854,6 +2924,8 @@ class ChatWindow(Adw.ApplicationWindow):
         )
 
     def confirm_model_download(self, *, reconfigure=False):
+        if self._model_setup_dialog is not None or self.controller.model_setup_busy():
+            return
         rule = MODEL_RECOMMENDATIONS[self.controller.model_recommendation()]
         model = MODEL_DOWNLOADS[rule.balanced]
         folder = self.controller.store.root.parent
@@ -2906,13 +2978,17 @@ class ChatWindow(Adw.ApplicationWindow):
             and self.controller.optional_features_stage is None
         )
         alert.set_extra_child(extras)
-        alert.connect(
-            "response::yes",
-            lambda *_: self.controller.download_default_model(
-                reconfigure=reconfigure, optional_features=extras.get_active()
-            ),
-        )
-        alert.present(self)
+
+        def chosen(alert, result):
+            self._model_setup_dialog = None
+            if alert.choose_finish(result) == "yes":
+                self.controller.download_default_model(
+                    reconfigure=reconfigure, optional_features=extras.get_active()
+                )
+            self.refresh_model_configuration()
+
+        self._model_setup_dialog = alert
+        alert.choose(self, None, chosen)
 
     def update_model_paths(self, paths):
         drafts = self.controller.store.load_app_settings().get("advanced_model_settings", {})
@@ -2954,7 +3030,7 @@ class ChatWindow(Adw.ApplicationWindow):
             )
         )
         self._auto_configure_manual = manual
-        busy = self.controller.model_server.busy or self.controller.model_file_download
+        busy = self.controller.model_setup_busy()
         can_download = False
         server_available = bool(executable and backend and Path(executable).expanduser().is_file())
         downloading_server = server_percent is not None or (
@@ -3013,13 +3089,37 @@ class ChatWindow(Adw.ApplicationWindow):
         if identity == self._model_parameter_identity:
             return
         self._model_parameter_identity = identity
+        self._model_parameter_defaults = server_parameters(
+            {"recommendation": config["recommendation"], "model": config["model"]}
+        )
         self._show_model_parameter_values(server_parameters(config), self._model_parameter_rows)
 
     def _show_model_parameter_values(self, values, keys):
         for key in keys:
-            row, handler = self._model_parameter_rows[key]
+            row, handler, reset = self._model_parameter_rows[key]
             with row.handler_block(handler):
-                row.set_text(str(values[key]))
+                value = str(values[key])
+                if choices := SERVER_FIELD_CHOICES.get(key):
+                    self._set_model_parameter_choice(row, choices, value)
+                else:
+                    row.set_text(value)
+            reset.set_visible(self._has_model_override(key, value))
+
+    def _has_model_override(self, key, value):
+        default = self._model_parameter_defaults[key]
+        value = value.strip()
+        if value and isinstance(default, (float, int)):
+            with suppress(ValueError):
+                return float(value) != default
+        return bool(value and value != str(default))
+
+    @staticmethod
+    def _set_model_parameter_choice(row, choices, value):
+        # Keep a manually configured value visible until the user replaces it.
+        if value not in choices:
+            choices = (*choices, value)
+        row.set_model(Gtk.StringList.new(choices))
+        row.set_selected(choices.index(value))
 
     def _reset_model_parameters(self, keys):
         overrides = dict.fromkeys(keys, "")
@@ -3034,14 +3134,18 @@ class ChatWindow(Adw.ApplicationWindow):
         self._show_model_parameter_values(server_parameters(config), keys)
 
     @staticmethod
-    def _add_model_reset_button(group, reset):
-        label = f"Reset {group.get_title()}"
+    def _model_reset_button(title, reset):
+        label = f"Reset {title}"
         button = Gtk.Button(
             icon_name="view-refresh-symbolic", tooltip_text=label, valign=Gtk.Align.CENTER
         )
         button.add_css_class("flat")
         button.update_property([Gtk.AccessibleProperty.LABEL], [label])
         button.connect("clicked", lambda *_: reset())
+        return button
+
+    def _add_model_reset_button(self, group, reset):
+        button = self._model_reset_button(group.get_title(), reset)
         group.set_header_suffix(button)
         return button
 
@@ -3062,7 +3166,7 @@ class ChatWindow(Adw.ApplicationWindow):
         selected = Path(config.get("model") or ".").expanduser()
         downloading, percent = self._model_download.get("model", (None, None))
         file_job = self.controller.model_file_download
-        setup_busy = self.controller.model_server.busy
+        setup_busy = self.controller.model_setup_busy()
         recommended = {role: getattr(rule, role) for role in self._model_rows}
         recommended_keys = set(recommended.values())
         rows = [
@@ -3317,6 +3421,8 @@ class ChatWindow(Adw.ApplicationWindow):
         )
 
     def _confirm_model_removal(self, name, remove):
+        if self._model_remove_dialog is not None:
+            return
         alert = Adw.AlertDialog(
             heading="Remove model?",
             body=f"Remove {name} from this computer?",
@@ -3326,8 +3432,61 @@ class ChatWindow(Adw.ApplicationWindow):
         alert.set_default_response("cancel")
         alert.set_close_response("cancel")
         alert.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
-        alert.connect("response::delete", lambda *_: remove())
-        alert.present(self)
+
+        def chosen(alert, result):
+            self._model_remove_dialog = None
+            if alert.choose_finish(result) == "delete":
+                remove()
+                self.refresh_model_configuration()
+
+        self._model_remove_dialog = alert
+        alert.choose(self, None, chosen)
+
+    @staticmethod
+    def _model_edit_button(title, set_editing):
+        editing = False
+        edit = Gtk.Button(
+            icon_name=EDIT_ICON, tooltip_text=f"Edit {title}", valign=Gtk.Align.CENTER
+        )
+        edit.add_css_class("flat")
+
+        def toggle(*_):
+            nonlocal editing
+            editing = not editing
+            set_editing(editing)
+            edit.set_icon_name(DONE_EDITING_ICON if editing else EDIT_ICON)
+            edit.set_tooltip_text(f"Done editing {title}" if editing else f"Edit {title}")
+            if not editing:
+                edit.grab_focus()
+
+        edit.connect("clicked", toggle)
+        edit.connect("clicked", pulse_edit_button)
+        return edit
+
+    def _model_entry_row(self, title, value, reset):
+        row = Adw.EntryRow(title=title, text=value, editable=False, activatable=False)
+        row.add_css_class("model-settings-row")
+        row.add_suffix(reset)
+        field = row.get_delegate()
+
+        def set_editing(editing):
+            row.set_editable(editing)
+            field.set_focusable(editing)
+            field.set_can_target(editing)
+            if editing:
+                row.grab_focus_without_selecting()
+            else:
+                position = row.get_position()
+                row.select_region(position, position)
+
+        set_editing(False)
+        edit = self._model_edit_button(title, set_editing)
+        row.connect(
+            "entry-activated", lambda *_: edit.emit("clicked") if row.get_editable() else None
+        )
+        row.add_suffix(edit)
+        hint_edit_button(row, edit, row.get_editable)
+        return row
 
     def _model_settings_page(self):
         page = Adw.PreferencesPage(name="model", title="Model", icon_name="network-server-symbolic")
@@ -3404,7 +3563,9 @@ class ChatWindow(Adw.ApplicationWindow):
         page.add(advanced_group)
         advanced_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         advanced_content.add_css_class("model-settings-advanced-content")
-        advanced.add_row(advanced_content)
+        advanced.add_row(Gtk.ListBoxRow(
+            child=advanced_content, activatable=False, selectable=False, focusable=False
+        ))
 
         paths = Adw.PreferencesGroup(
             title="Local Model Server", description="Leave blank to use a server on port 9931. "
@@ -3422,13 +3583,22 @@ class ChatWindow(Adw.ApplicationWindow):
             ("embedding_path", "Embedding model file"),
         ):
             value = embedding.get("path", "") if key == "embedding_path" else config.get(key, "")
-            row = Adw.EntryRow(title=title, text=value)
-            row.add_css_class("model-settings-row")
+            reset = self._model_reset_button(
+                title, lambda key=key: self._model_path_rows[key][0].set_text("")
+            )
+            row = self._model_entry_row(title, value or "", reset)
+            reset.set_visible(bool(row.get_text()))
+            row.connect("notify::text", lambda entry, _, b=reset: b.set_visible(
+                bool(entry.get_text().strip())
+            ))
             handler = row.connect(
                 "notify::text", lambda entry, _pspec, key=key: save(key, entry.get_text())
             )
             self._model_path_rows[key] = row, handler
-            browse = Gtk.Button(icon_name="folder-open-symbolic", valign=Gtk.Align.CENTER)
+            browse = Gtk.Button(
+                icon_name="folder-open-symbolic", valign=Gtk.Align.CENTER, sensitive=False
+            )
+            row.bind_property("editable", browse, "sensitive", GObject.BindingFlags.SYNC_CREATE)
             browse.add_css_class("model-settings-browse")
             browse.add_css_class("flat")
             browse.set_tooltip_text("Choose " + title)
@@ -3453,12 +3623,25 @@ class ChatWindow(Adw.ApplicationWindow):
         reasoning = Adw.PreferencesGroup()
         reasoning.add_css_class("model-settings-reasoning")
         advanced_content.append(reasoning)
-        preserve = Adw.SwitchRow(
+        preserve_row = Adw.ActionRow(
             title="Preserve Reasoning",
             subtitle="Include earlier thinking in future replies when the model supports it.",
-            active=self.controller.get_chat_settings()["preserve_reasoning"] is True,
         )
-        preserve.add_css_class("model-settings-preserve")
+        preserve = Gtk.Switch(
+            active=self.controller.get_chat_settings()["preserve_reasoning"] is True,
+            sensitive=False, valign=Gtk.Align.CENTER,
+        )
+        preserve_row.add_css_class("model-settings-preserve")
+        preserve_default = self.controller.settings.preserve_thinking
+        preserve_reset = self._model_reset_button(
+            "Preserve Reasoning", lambda: preserve.set_active(preserve_default)
+        )
+        preserve_reset.set_visible(preserve.get_active() != preserve_default)
+        preserve_row.add_suffix(preserve_reset)
+        preserve_row.add_suffix(
+            self._model_edit_button("Preserve Reasoning", preserve.set_sensitive)
+        )
+        preserve_row.add_suffix(preserve)
 
         def save_reasoning(row, _pspec):
             active = row.get_active()
@@ -3468,12 +3651,16 @@ class ChatWindow(Adw.ApplicationWindow):
                 with row.handler_block(reasoning_handler):
                     row.set_active(not active)
                 self._show_alert("Could not save settings", str(exc))
+            preserve_reset.set_visible(row.get_active() != preserve_default)
 
         reasoning_handler = preserve.connect("notify::active", save_reasoning)
-        reasoning.add(preserve)
+        reasoning.add(preserve_row)
         self._model_parameter_rows = {}
         defaults = self._model_parameter_config(config)
         self._model_parameter_identity = defaults["recommendation"], defaults["model"]
+        self._model_parameter_defaults = server_parameters(
+            {"recommendation": defaults["recommendation"], "model": defaults["model"]}
+        )
         values = server_parameters(defaults)
         for heading, fields in (
             ("Launch Parameters", SERVER_FIELDS),
@@ -3481,7 +3668,8 @@ class ChatWindow(Adw.ApplicationWindow):
         ):
             options = Adw.PreferencesGroup(
                 title=heading,
-                description="Clear a field to use its default. Press Connect to apply changes.",
+                description="Clear a text field to restore its default. "
+                "Press Connect to apply changes.",
             )
             keys = tuple(key for key, _, _ in fields)
             self._add_model_reset_button(
@@ -3490,13 +3678,37 @@ class ChatWindow(Adw.ApplicationWindow):
             options.add_css_class("model-settings-options")
             advanced_content.append(options)
             for key, title, hint in fields:
-                row = Adw.EntryRow(title=title, text=str(values[key]))
-                row.add_css_class("model-settings-row")
-                row.set_tooltip_text(f"--{key}: {hint}")
-                handler = row.connect(
-                    "notify::text", lambda entry, _pspec, key=key: save(key, entry.get_text())
+                value = str(values[key])
+                reset = self._model_reset_button(
+                    title, lambda key=key: self._reset_model_parameters((key,))
                 )
-                self._model_parameter_rows[key] = row, handler
+                reset.set_visible(self._has_model_override(key, value))
+                if choices := SERVER_FIELD_CHOICES.get(key):
+                    row = Adw.ActionRow(title=title, use_markup=False)
+                    row.add_css_class("model-settings-row")
+                    widget = Gtk.DropDown(valign=Gtk.Align.CENTER)
+                    row.add_suffix(reset)
+                    row.add_suffix(widget)
+                    self._set_model_parameter_choice(widget, choices, value)
+
+                    def selected(entry, _, key=key, reset=reset):
+                        if item := entry.get_selected_item():
+                            value = item.get_string()
+                            save(key, value)
+                            reset.set_visible(self._has_model_override(key, value))
+
+                    handler = widget.connect("notify::selected-item", selected)
+                else:
+                    widget = row = self._model_entry_row(title, value, reset)
+
+                    def changed(entry, _, key=key, reset=reset):
+                        value = entry.get_text()
+                        save(key, value)
+                        reset.set_visible(self._has_model_override(key, value))
+
+                    handler = row.connect("notify::text", changed)
+                row.set_tooltip_text(f"--{key}: {hint}")
+                self._model_parameter_rows[key] = widget, handler, reset
                 options.add(row)
 
         extra = Adw.PreferencesGroup(
@@ -3506,8 +3718,8 @@ class ChatWindow(Adw.ApplicationWindow):
         )
         extra.add_css_class("model-settings-extra")
         advanced_content.append(extra)
-        extra.add(
-            self._launch_parameters_box(config.get("extra", ""), lambda value: save("extra", value))
+        self._launch_parameters_box(
+            extra, config.get("extra", ""), "", lambda value: save("extra", value)
         )
         actions = Adw.PreferencesGroup()
         actions.add_css_class("model-settings-actions")
@@ -3537,25 +3749,50 @@ class ChatWindow(Adw.ApplicationWindow):
             except OSError as exc:
                 self._show_alert("Could not save settings", str(exc))
 
-        self._embedding_parameters.add(
-            self._launch_parameters_box(
-                embedding.get("parameters", embedding_launch_parameters()),
-                save_embedding_parameters,
-            )
+        embedding_defaults = embedding_launch_parameters()
+        self._launch_parameters_box(
+            self._embedding_parameters, embedding.get("parameters") or embedding_defaults,
+            embedding_defaults, save_embedding_parameters,
         )
         advanced_content.append(self._embedding_parameters)
         advanced_content.append(actions)
         self.refresh_model_configuration()
         return page
 
-    @staticmethod
-    def _launch_parameters_box(value, save):
-        text = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
+    def _launch_parameters_box(self, group, value, default, save):
+        text = Gtk.TextView(
+            wrap_mode=Gtk.WrapMode.WORD_CHAR, editable=False, cursor_visible=False,
+            focusable=False, can_target=False,
+        )
         text.add_css_class("model-settings-text")
         text.add_css_class("prompt-view")
         buffer = text.get_buffer()
         buffer.set_text(value)
-        buffer.connect("changed", lambda buffer: save(buffer.get_text(*buffer.get_bounds(), False)))
+        title = group.get_title()
+        reset = self._model_reset_button(title, lambda: buffer.set_text(default))
+        reset.set_visible(bool(value.strip() and value.strip() != default.strip()))
+
+        def changed(buffer):
+            value = buffer.get_text(*buffer.get_bounds(), False)
+            overridden = bool(value.strip() and value.strip() != default.strip())
+            save(value if overridden else "")
+            reset.set_visible(overridden)
+
+        def set_editing(editing):
+            text.set_editable(editing)
+            text.set_cursor_visible(editing)
+            text.set_focusable(editing)
+            text.set_can_target(editing)
+            if editing:
+                text.grab_focus()
+            else:
+                buffer.place_cursor(buffer.get_iter_at_mark(buffer.get_insert()))
+
+        buffer.connect("changed", changed)
+        controls = Gtk.Box()
+        controls.append(reset)
+        controls.append(self._model_edit_button(title, set_editing))
+        group.set_header_suffix(controls)
         scroll = Gtk.ScrolledWindow(
             min_content_height=95, max_content_height=200, propagate_natural_height=True, child=text
         )
@@ -3563,7 +3800,7 @@ class ChatWindow(Adw.ApplicationWindow):
         frame = Gtk.Frame(child=scroll)
         frame.add_css_class("model-settings-frame")
         frame.add_css_class("composer-frame")
-        return frame
+        group.add(frame)
 
     def _show_memories(self, settings_dialog):
         toolbar = Adw.ToolbarView()
@@ -3583,7 +3820,7 @@ class ChatWindow(Adw.ApplicationWindow):
             "Click the pencil to edit, then the checkmark to save."
         )
         for memory_id, text, core in self.controller.list_memories():
-            row = Adw.ActionRow(title=text, title_lines=0)
+            row = Adw.ActionRow(title=text, title_lines=0, activatable=False)
             row.add_css_class("memories-row")
             entry = Gtk.Entry(text=text, hexpand=True, visible=False)
             entry.add_css_class("memories-entry")
@@ -3593,8 +3830,10 @@ class ChatWindow(Adw.ApplicationWindow):
             core_button = Gtk.CheckButton(label="Core", active=bool(core))
             core_button.add_css_class("memories-core-button")
             controls.append(core_button)
-            edit = Gtk.Button(icon_name="document-edit-symbolic", tooltip_text="Edit memory")
+            edit = Gtk.Button(icon_name=EDIT_ICON, tooltip_text="Edit memory")
             edit.add_css_class("memories-edit")
+            edit.connect("clicked", pulse_edit_button)
+            hint_edit_button(row, edit, entry.get_visible)
             edit.add_css_class("flat")
             edit.set_valign(Gtk.Align.CENTER)
             delete = Gtk.Button(tooltip_text="Delete memory")
@@ -3618,7 +3857,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 if not delete and not entry.get_visible():
                     row.set_title("")
                     entry.set_visible(True)
-                    edit.set_icon_name("object-select-symbolic")
+                    edit.set_icon_name(DONE_EDITING_ICON)
                     edit.set_tooltip_text("Save memory")
                     entry.grab_focus()
                     return
@@ -3635,7 +3874,7 @@ class ChatWindow(Adw.ApplicationWindow):
                                 core_button.set_active(bool(saved[2]))
                             entry.set_visible(False)
                             row.set_title(text)
-                            edit.set_icon_name("document-edit-symbolic")
+                            edit.set_icon_name(EDIT_ICON)
                             edit.set_tooltip_text("Edit memory")
                         else:
                             self._show_alert(
@@ -3716,6 +3955,7 @@ class ChatWindow(Adw.ApplicationWindow):
             self._knowledge_jobs = []
         self._knowledge_refresh = None
         is_open = True
+        merge_confirming = False
         scroller = group.get_ancestor(Gtk.ScrolledWindow)
         adjustment = scroller.get_vadjustment() if scroller is not None else None
         scroll_position = None
@@ -3760,7 +4000,8 @@ class ChatWindow(Adw.ApplicationWindow):
             jobs = self._knowledge_jobs
             installed = self.controller.knowledge.list_packs()
             merge.set_sensitive(
-                len(installed) >= 2 and not any(job["kind"] == "merge" for job in jobs)
+                len(installed) >= 2 and not merge_confirming
+                and not any(job["kind"] == "merge" for job in jobs)
             )
             covered = {
                 key: manifest["title"]
@@ -3795,7 +4036,10 @@ class ChatWindow(Adw.ApplicationWindow):
                     )
                     row.add_suffix(info)
                 pending = next((job for job in jobs if job.get("key") == key), None)
-                switch = Gtk.Switch(active=enabled, valign=Gtk.Align.CENTER)
+                switch = Gtk.Switch(
+                    active=pending.get("enabled", enabled) if pending else enabled,
+                    valign=Gtk.Align.CENTER,
+                )
                 switch.add_css_class("knowledge-packs-switch")
                 if error:
                     switch.set_sensitive(False)
@@ -3806,28 +4050,15 @@ class ChatWindow(Adw.ApplicationWindow):
                         f"This pack is unused while {manifest['unused_by']} is enabled."
                     )
                 if pending:
-                    add_status(row, pending)
+                    if pending["kind"] != "toggle":
+                        add_status(row, pending)
                     switch.set_sensitive(False)
 
-                def toggled(button, _, k=key):
-                    enabled = button.get_active()
-                    button.set_sensitive(False)
-
-                    def run():
-                        error = None
-                        try:
-                            self.controller.knowledge.change(k, enabled)
-                        except Exception as exc:
-                            error = str(exc)
-
-                        def finish():
-                            notify()
-                            if error:
-                                self._show_alert("Could not change knowledge pack", error)
-
-                        self.dispatch(finish)
-
-                    threading.Thread(target=run, daemon=True).start()
+                def toggled(button, _, k=key, title=manifest["title"]):
+                    enqueue({
+                        "kind": "toggle", "key": k, "title": title,
+                        "enabled": button.get_active(),
+                    })
 
                 switch.connect("notify::active", toggled)
                 if compatible and (error or newer) and not pending:
@@ -3892,6 +4123,8 @@ class ChatWindow(Adw.ApplicationWindow):
                 )
 
             def cancel_download():
+                if pending["cancel"].is_set():
+                    return
                 pending["cancel"].set()
                 if pending.get("active"):
                     pending["status"] = "Cancelling…"
@@ -3925,6 +4158,9 @@ class ChatWindow(Adw.ApplicationWindow):
                 self._knowledge_refresh(job)
 
         def enqueue(job):
+            key = job.get("key")
+            if any(existing.get("key") == key for existing in self._knowledge_jobs):
+                return
             if job["kind"] in ("download", "dependencies"):
                 job["cancel"] = threading.Event()
             job["status"] = "Waiting…"
@@ -3951,6 +4187,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 "dependencies": "Downloading shared Wikipedia data…",
                 "delete": "Deleting…",
                 "merge": "Merging…",
+                "toggle": None,
             }[job["kind"]]
             notify()
 
@@ -3999,7 +4236,7 @@ class ChatWindow(Adw.ApplicationWindow):
                     elif job["kind"] == "merge":
                         self.controller.knowledge.merge_all(progress, list(catalog.values()))
                     else:
-                        self.controller.knowledge.change(job["key"])
+                        self.controller.knowledge.change(job["key"], job.get("enabled"))
                 except InterruptedError as exc:
                     if not stopped():
                         error = str(exc)
@@ -4010,6 +4247,11 @@ class ChatWindow(Adw.ApplicationWindow):
             threading.Thread(target=run, daemon=True).start()
 
         def confirm_merge(*_):
+            nonlocal merge_confirming
+            if merge_confirming:
+                return
+            merge_confirming = True
+            merge.set_sensitive(False)
             alert = Adw.AlertDialog(
                 heading="Merge Installed Packs?",
                 body=(
@@ -4024,8 +4266,12 @@ class ChatWindow(Adw.ApplicationWindow):
             alert.set_close_response("cancel")
 
             def chosen(alert, result):
+                nonlocal merge_confirming
+                merge_confirming = False
                 if alert.choose_finish(result) == "proceed":
                     enqueue({"kind": "merge", "title": "Merging Installed Packs"})
+                else:
+                    notify()
 
             alert.choose(self, None, chosen)
 

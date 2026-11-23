@@ -359,22 +359,28 @@ class ChatController:
             on_config=configured,
         )
 
+    def model_setup_busy(self):
+        return (
+            self.model_server.busy
+            or bool(self.model_file_download)
+            or self._pending_default_setup is not None
+        )
+
     def download_default_model(self, *, reconfigure=False, optional_features=False):
         owned = self.model_server.running_config is not None
         if (
             (self.connected and not (reconfigure and owned))
             or self.busy
-            or self.model_server.busy
-            or self.model_file_download
-            or self._pending_default_setup is not None
+            or self.model_setup_busy()
         ):
             return
         if reconfigure and self._model_selection_busy():
             return
         if optional_features and not self.optional_features_installed():
             self._pending_default_setup = reconfigure
-            self.download_optional_features()
-            return
+            if self.download_optional_features():
+                return
+            self._pending_default_setup = None
         settings = self._settings_for_model_change()
         if settings is not None:
             self._connect_default_model(settings.get("model_server", {}))
@@ -384,8 +390,10 @@ class ChatController:
 
     def download_optional_features(self):
         stopped = self._model_file_stop.is_set
-        if self.optional_features_stage or stopped() or self.optional_features_installed():
-            return
+        if self.optional_features_stage:
+            return True
+        if stopped() or self.optional_features_installed():
+            return False
 
         def set_stage(stage):
             self.optional_features_stage = stage
@@ -393,14 +401,15 @@ class ChatController:
 
         def finish(error):
             pending = self._pending_default_setup
-            self._pending_default_setup = None
             set_stage(None)
             if error:
                 self.view._show_alert("Could not install optional features", error)
             elif self.optional_features_installed():
                 self.view.notify("Optional features installed. Restart Lopaca to use them.")
             if pending is not None:
+                self._pending_default_setup = None
                 self.download_default_model(reconfigure=pending)
+                self.view.refresh_model_configuration()
 
         def run():
             error = None
@@ -418,6 +427,7 @@ class ChatController:
 
         set_stage("Installing")
         threading.Thread(target=run, daemon=True).start()
+        return True
 
     def _finish_first_launch(self):
         if not self.first_launch:

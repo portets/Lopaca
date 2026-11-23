@@ -45,6 +45,18 @@ SERVER_FIELDS = (
     ("spec-type", "Speculative decoding", "none, draft-mtp or another supported mode"),
     ("spec-draft-n-max", "Maximum drafted tokens", "Tokens predicted per speculative step"),
 )
+# Choices from the bundled llama-server release. The server still accepts custom
+# template levels and comma-separated speculative modes from existing settings.
+SERVER_FIELD_CHOICES = {
+    "flash-attn": ("auto", "on", "off"),
+    "fit": ("on", "off"),
+    "reasoning": ("auto", "on", "off"),
+    "reasoning-effort": ("default", "minimal", "low", "medium", "high", "xhigh", "max"),
+    "spec-type": (
+        "none", "draft-mtp", "draft-simple", "draft-eagle3", "draft-dflash", "draft-dspark",
+        "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache",
+    ),
+}
 SAMPLING_FIELDS = (
     ("temp", "Temperature", "Sampling temperature"),
     ("top-p", "Top P", "Nucleus sampling threshold"),
