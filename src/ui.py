@@ -3629,8 +3629,9 @@ class ChatWindow(Adw.ApplicationWindow):
         )
         preserve = Gtk.Switch(
             active=self.controller.get_chat_settings()["preserve_reasoning"] is True,
-            sensitive=False, valign=Gtk.Align.CENTER,
+            valign=Gtk.Align.CENTER,
         )
+        preserve_row.set_activatable_widget(preserve)
         preserve_row.add_css_class("model-settings-preserve")
         preserve_default = self.controller.settings.preserve_thinking
         preserve_reset = self._model_reset_button(
@@ -3638,9 +3639,6 @@ class ChatWindow(Adw.ApplicationWindow):
         )
         preserve_reset.set_visible(preserve.get_active() != preserve_default)
         preserve_row.add_suffix(preserve_reset)
-        preserve_row.add_suffix(
-            self._model_edit_button("Preserve Reasoning", preserve.set_sensitive)
-        )
         preserve_row.add_suffix(preserve)
 
         def save_reasoning(row, _pspec):
@@ -3760,10 +3758,7 @@ class ChatWindow(Adw.ApplicationWindow):
         return page
 
     def _launch_parameters_box(self, group, value, default, save):
-        text = Gtk.TextView(
-            wrap_mode=Gtk.WrapMode.WORD_CHAR, editable=False, cursor_visible=False,
-            focusable=False, can_target=False,
-        )
+        text = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
         text.add_css_class("model-settings-text")
         text.add_css_class("prompt-view")
         buffer = text.get_buffer()
@@ -3778,21 +3773,8 @@ class ChatWindow(Adw.ApplicationWindow):
             save(value if overridden else "")
             reset.set_visible(overridden)
 
-        def set_editing(editing):
-            text.set_editable(editing)
-            text.set_cursor_visible(editing)
-            text.set_focusable(editing)
-            text.set_can_target(editing)
-            if editing:
-                text.grab_focus()
-            else:
-                buffer.place_cursor(buffer.get_iter_at_mark(buffer.get_insert()))
-
         buffer.connect("changed", changed)
-        controls = Gtk.Box()
-        controls.append(reset)
-        controls.append(self._model_edit_button(title, set_editing))
-        group.set_header_suffix(controls)
+        group.set_header_suffix(reset)
         scroll = Gtk.ScrolledWindow(
             min_content_height=95, max_content_height=200, propagate_natural_height=True, child=text
         )
