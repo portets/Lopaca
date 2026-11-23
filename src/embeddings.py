@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import heapq
 import json
 import logging
 import math
@@ -20,6 +21,8 @@ from pathlib import Path
 
 import thinking_classifier
 from model_server import ModelServer
+from packs import VECTOR_DIMENSIONS
+from rag import _literal_score, _literal_terms, _query_literals
 from server_builds import embedding_launch_parameters
 from settings import EMBEDDING_QUERY_INSTRUCTION
 
@@ -32,6 +35,16 @@ _BACKGROUND_BATCH_CHARS = 480
 _PASSAGE_CACHE_SIZE = 512
 _QUERY_CACHE_SIZE = 16
 _THREAD_FLAGS = {"--threads", "--threads-batch", "-t", "-tb"}
+
+
+def normalize_embedding(encoded):
+    raw = base64.b64decode(encoded, validate=True)
+    size = min(len(raw) // 4, VECTOR_DIMENSIONS)
+    vector = struct.unpack_from(f"<{size}f", raw)
+    norm = math.sqrt(math.sumprod(vector, vector))
+    if not norm or not math.isfinite(norm):
+        raise ValueError("Invalid embedding vector.")
+    return tuple(value / norm for value in vector)
 
 
 def _vector_options(args):
@@ -51,10 +64,11 @@ def _vector_options(args):
 class RecallEmbeddings:
     """Keep one local embedding session and discard it when its configuration changes."""
 
-    def __init__(self):
+    def __init__(self, on_state_changed=None):
         self._lock = threading.Lock()
         self._session = None
         self._closed = False
+        self._on_state_changed = on_state_changed
 
     def configure(self, config):
         with self._lock:
@@ -64,7 +78,7 @@ class RecallEmbeddings:
                 self._session.close()
                 self._session = None
             if self._session is None and config:
-                self._session = _EmbeddingSession(config)
+                self._session = _EmbeddingSession(config, self._on_state_changed)
             if self._session and self._session.available:
                 return self._session
         return None
@@ -83,8 +97,9 @@ class RecallEmbeddings:
 
 
 class _EmbeddingSession:
-    def __init__(self, config):
+    def __init__(self, config, on_state_changed=None):
         self.config = config
+        self._on_state_changed = on_state_changed
         self._stopped = threading.Event()
         self._background_allowed = threading.Event()
         self._background_allowed.set()
@@ -121,6 +136,13 @@ class _EmbeddingSession:
     @property
     def available(self):
         return not self._stopped.is_set()
+
+    @property
+    def ready(self):
+        return (
+            self.available and self._vector_model is not None
+            and self._process is not None and self._process.poll() is None
+        )
 
     def pause_background(self):
         with self._lock:
@@ -294,6 +316,8 @@ class _EmbeddingSession:
                 fingerprint([*vector_options, "--threads", str(n), "--threads-batch", str(n)])
                 for n in range(1, 11)
             )
+        if self._on_state_changed:
+            self._on_state_changed(self)
 
     @staticmethod
     def _supports_thinking_classifier(model, args):
@@ -338,15 +362,10 @@ class _EmbeddingSession:
         result = self._request(
             "/v1/embeddings", {"input": texts, "encoding_format": "base64"}, timeout=timeout
         )
-        vectors = []
-        for entry in sorted(result["data"], key=lambda item: item["index"]):
-            raw = base64.b64decode(entry["embedding"], validate=True)
-            size = min(len(raw) // 4, 256)
-            vector = struct.unpack_from(f"<{size}f", raw)
-            norm = math.sqrt(math.sumprod(vector, vector))
-            if not norm or not math.isfinite(norm):
-                raise ValueError("Invalid embedding vector.")
-            vectors.append(tuple(value / norm for value in vector))
+        vectors = [
+            normalize_embedding(entry["embedding"])
+            for entry in sorted(result["data"], key=lambda item: item["index"])
+        ]
         if len(vectors) != len(texts):
             raise ValueError("The embedding server returned the wrong number of vectors.")
         return vectors
@@ -397,6 +416,8 @@ class _EmbeddingSession:
                     "Local embeddings unavailable. Using keyword recall.", exc_info=True
                 )
                 self.close()
+                if self._on_state_changed:
+                    self._on_state_changed(self)
 
     def _embed_knowledge(self, texts):
         try:
@@ -625,7 +646,7 @@ def _rank_vectors(db, query, vector, rows, scope, limit, excluded, stopped):
         if any(pattern.search(row[1] if memory else "\n".join(row[1:4])) for pattern in exact)
     }
     scores = {}
-    best = None
+    shortlist = []
     matched_sources = {row[1] for row in rows} if scope == "history" else set()
     join = "" if memory else "JOIN passages p ON p.id=v.id"
     columns = "v.id, v.vector" if memory else "v.id, v.vector, p.source"
@@ -639,8 +660,12 @@ def _rank_vectors(db, query, vector, rows, scope, limit, excluded, stopped):
         score = math.sumprod(vector, unpack.unpack(blob))
         if row_id in ranked:
             scores[row_id] = score
-        elif (not source or source[0] not in matched_sources) and (best is None or score > best[0]):
-            best = score, row_id
+        elif score >= add_at and (not source or source[0] not in matched_sources):
+            candidate = (score, -index, row_id)
+            if len(shortlist) < 8:
+                heapq.heappush(shortlist, candidate)
+            elif candidate > shortlist[0]:
+                heapq.heapreplace(shortlist, candidate)
     kept = [row for row in rows if row[0] in protected or scores.get(row[0], 1.0) >= filter_at]
     if scope == "documents" and len(kept) > 1 and not protected:
         winner = max(kept, key=lambda row: scores.get(row[0], -1.0))
@@ -649,23 +674,48 @@ def _rank_vectors(db, query, vector, rows, scope, limit, excluded, stopped):
             kept.remove(winner)
             kept.insert(0, winner)
     add_threshold = max(filter_at, add_with_keywords_at if kept else add_at)
-    if best is None or best[0] < add_threshold:
+    if not shortlist:
         return kept
+    replaced_score = -math.inf
     if len(kept) >= limit:
         row_id = kept[-1][0]
-        if scope != "documents" or row_id in protected or scores.get(row_id, 1.0) >= best[0]:
+        if scope != "documents" or row_id in protected:
             return kept
-    row = db.execute(
-        "SELECT id,text,core FROM memories WHERE id=? AND NOT core"
+        replaced_score = scores.get(row_id, 1.0)
+    eligible = {
+        row_id: score for score, _, row_id in shortlist
+        if score >= add_threshold and score > replaced_score
+    }
+    if not eligible or stopped():
+        return kept
+    placeholders = ",".join("?" for _ in eligible)
+    candidates = db.execute(
+        f"SELECT id,text,core FROM memories WHERE id IN ({placeholders}) AND NOT core"
         if memory
         else "SELECT rowid,source,section,body,start_line,end_line "
-        "FROM chunk_content WHERE rowid=?",
-        (best[1],),
-    ).fetchone()
-    if not row:
+        f"FROM chunk_content WHERE rowid IN ({placeholders})",
+        tuple(eligible),
+    )
+    distinct = [
+        row for row in candidates
+        if memory or not any(
+            row[1] == hit[1] and row[4] <= hit[5] and row[5] >= hit[4] for hit in kept
+        )
+    ]
+    if not distinct:
         return kept
-    if not memory and any(
-        row[1] == hit[1] and row[4] <= hit[5] and row[5] >= hit[4] for hit in kept
-    ):
-        return kept
+    terms = _query_literals(query)
+    numbers = {term for term in terms if term.isdecimal()}
+    best_score = max(eligible[row[0]] for row in distinct)
+
+    def supported_score(row):
+        similarity = eligible[row[0]]
+        text = row[1] if memory else row[2] + "\n" + row[3]
+        return similarity + _literal_score(terms, numbers, _literal_terms(text)), similarity
+
+    # Literal evidence breaks ties within the semantic shortlist, above the noise threshold.
+    row = max(
+        (row for row in distinct if eligible[row[0]] >= best_score - 0.04),
+        key=supported_score,
+    )
     return [*kept[: limit - 1], row]

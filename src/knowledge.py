@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sqlite3
+import struct
 import tempfile
 import threading
 import time
@@ -24,13 +25,18 @@ from packs import (
     download_pack,
     load_catalog,
     publishing_metadata,
+    read_search_vector_state,
+    search_pack_vectors,
 )
 from packs import read_manifest as index_manifest
 from rag import (
+    _add_rank_votes,
     _coherent_results,
     _connect_index,
     _create_chunks,
+    _literal_score,
     _literal_terms,
+    _query_literals,
     _rank,
     _retrieval_query,
     _terms,
@@ -639,8 +645,18 @@ class KnowledgeStore:
                 }
 
     @_guarded
+    def compact_vector_state(self):
+        with (
+            suppress(OSError, sqlite3.Error, ValueError),
+            closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)) as db,
+        ):
+            return read_search_vector_state(db)
+        return None
+
+    @_guarded
     def context(
-        self, query, settings, expand=None, previous_queries=(), memory_rows=(), _rows=False
+        self, query, settings, expand=None, previous_queries=(), memory_rows=(), _rows=False,
+        *, semantic_query=None, semantic_scores=None, semantic_budget=16000,
     ):
         if not self.path.exists():
             return [] if _rows else ""
@@ -662,9 +678,8 @@ class KnowledgeStore:
                 )
                 scores, candidates = {}, {}
                 for weight, results in ((1.0, ranked), (1.0, memory_ranked)):
-                    for rank, row in enumerate(results, 1):
-                        scores[row[0]] = scores.get(row[0], 0.0) + weight / (60 + rank)
-                        candidates[row[0]] = row
+                    _add_rank_votes(scores, (row[0] for row in results), weight)
+                    candidates.update((row[0], row) for row in results)
                 ranked = sorted(candidates.values(), key=lambda row: scores[row[0]], reverse=True)[
                     : settings.rag_results
                 ]
@@ -807,9 +822,49 @@ class KnowledgeStore:
                 if (any(c.isalpha() for c in term) and any(c.isdigit() for c in term))
                 or "_" in term
             ]
+            semantic = {}
+            if semantic_query is not None and semantic_scores is not None:
+                with suppress(OSError, sqlite3.Error, ValueError, struct.error):
+                    state = read_search_vector_state(db)
+                    if state:
+                        semantic = {
+                            row_id: score for score, row_id in search_pack_vectors(
+                                db, self.path, state, semantic_query,
+                                limit=48, budget=semantic_budget,
+                            )
+                            if score >= 0.65
+                        }
+            if semantic:
+                # Use the same citations and table context as for keyword passages.
+                existing = {row[0] for row in ranked}
+                candidates = db.execute(
+                    "SELECT rowid,source,section,body,start_line,end_line FROM chunk_content "
+                    f"WHERE rowid IN ({','.join('?' for _ in semantic)})",
+                    tuple(semantic),
+                ).fetchall()
+                semantic_rows = []
+                identifiers = {re.sub(r"\W+", "", term) for term in requested_ids}
+                query_terms = _query_literals(query)
+                numbers = {term for term in query_terms if term.isdecimal()}
+                for row in candidates:
+                    body = row[3]
+                    literals = _literal_terms(row[2] + "\n" + body)
+                    if "Wikipedia does not have an article" in body or (
+                        identifiers and not identifiers & literals
+                    ):
+                        semantic.pop(row[0], None)
+                        continue
+                    semantic[row[0]] += _literal_score(query_terms, numbers, literals)
+                    if row[0] not in existing:
+                        semantic_rows.append(row)
+                lexical_count = len(ranked)
+                semantic_rows.sort(key=lambda row: semantic[row[0]], reverse=True)
+                ranked = [*ranked, *semantic_rows[:8]]
+            else:
+                lexical_count = len(ranked)
             rows = []
             outlined_sources = set()
-            for _, source, section, body, first, last in ranked:
+            for index, (row_id, source, section, body, first, last) in enumerate(ranked):
                 metadata = json.loads(
                     db.execute(
                         "SELECT metadata FROM articles WHERE source=?", (source,)
@@ -823,6 +878,8 @@ class KnowledgeStore:
                 )
                 if section:
                     reference += f", section: {section}"
+                key = (source, first, last, str(metadata["revision"]))
+                semantic_score = semantic.get(row_id)
                 literals = _literal_terms(section + "\n" + body) if requested_ids else set()
                 unmatched = [
                     term for term in requested_ids if re.sub(r"\W+", "", term) not in literals
@@ -879,13 +936,18 @@ class KnowledgeStore:
                         )
                 if _rows:
                     # Keep article identity and real aliases separate from rendered excerpts.
-                    key = (source, first, last, str(metadata["revision"]))
                     names = (
                         metadata["title"],
                         *matched_aliases.get(source, ()),
                         *matched_titles.get(source, ()),
                     )
-                    rows.append((key, names, reference, body))
+                    result = (key, names, reference, body)
+                    if index < lexical_count:
+                        rows.append(result)
+                    if semantic_score is not None and (
+                        key not in semantic_scores or semantic_score > semantic_scores[key][0]
+                    ):
+                        semantic_scores[key] = (semantic_score, result)
                 else:
                     rows.append((reference, body))
             if _rows:
@@ -1143,7 +1205,7 @@ class KnowledgeLibrary:
                     Path(str(temporary) + suffix).unlink(missing_ok=True)
                 _lock_path(temporary).unlink(missing_ok=True)
 
-    def download_pack(self, release, progress=None, *, _dependency=False):
+    def download_pack(self, release, progress=None, *, stopped=lambda: False, _dependency=False):
         with self._operation():
             staged = self.folder.resolve() / (release["sha256"] + ".download")
             with KnowledgeStore(staged)._access(exclusive=True):
@@ -1153,10 +1215,18 @@ class KnowledgeLibrary:
                     for _, m, _ in self._entries()
                 ):
                     return release["title"]
-                download_pack(release, staged, progress)
+                try:
+                    download_pack(release, staged, progress, stopped=stopped)
+                    if stopped():
+                        raise InterruptedError("Download cancelled.")
+                except Exception:
+                    if stopped():
+                        staged.unlink(missing_ok=True)
+                        raise InterruptedError("Download cancelled.") from None
+                    raise
                 title = self.import_pack(staged, progress, _consume=True)
         if not _dependency:
-            self.ensure_dependencies(progress)
+            self.ensure_dependencies(progress, stopped=stopped)
         return title
 
     def missing_dependencies(self):
@@ -1172,9 +1242,11 @@ class KnowledgeLibrary:
             )
         ]
 
-    def ensure_dependencies(self, progress=None):
+    def ensure_dependencies(self, progress=None, *, stopped=lambda: False):
         catalog = self._catalog()
         for key in sorted(self.missing_dependencies()):
+            if stopped():
+                return
             release = catalog.get(key)
             if release is None:
                 raise ValueError(f"Shared knowledge data {key} is missing from the catalog.")
@@ -1186,7 +1258,11 @@ class KnowledgeLibrary:
                     if progress:
                         progress(f"Shared data — {stage}", current, total, None)
 
-                self.download_pack(release, shared_progress, _dependency=True)
+                self.download_pack(release, shared_progress, stopped=stopped, _dependency=True)
+            except InterruptedError:
+                if not stopped():
+                    raise
+                return
             except Exception as exc:
                 raise RuntimeError(
                     "Your requested pack is installed, but shared data could not be installed: "
@@ -1224,27 +1300,40 @@ class KnowledgeLibrary:
                             path.unlink()
 
     def context(
-        self, query, settings, expand=None, previous_queries=(), memory_rows=(), *, denoise=None
+        self, query, settings, expand=None, previous_queries=(), memory_rows=(), *, denoise=None,
+        embed_query=None,
     ):
         with self.lock:
             stores = self._active()
             if not stores:
                 return ""
             query = _retrieval_query(query, previous_queries)
-            # Resolve expansion once before worker threads, preserving the shared request cache.
-            expansion = expand(query) if expand else ""
+            compact = {
+                store for store in stores if embed_query and store.compact_vector_state()
+            }
+            # Apply the saved expansion preference only to packs that need keyword search.
+            expansion = expand(query) if expand and len(compact) < len(stores) else ""
+            semantic_query = embed_query(query) if compact else None
+            # About 10,000 comparisons per pack preserved recall in the five-pack test.
+            semantic_budget = min(24000, max(1500, 48000 // max(1, len(compact))))
 
             def retrieve(store):
-                return store.context(
+                semantic = {} if store in compact else None
+                rows = store.context(
                     query,
                     settings,
-                    expand=lambda _: expansion,
+                    expand=None if semantic is not None else lambda _: expansion,
                     memory_rows=memory_rows,
                     _rows=True,
+                    semantic_query=semantic_query,
+                    semantic_scores=semantic,
+                    semantic_budget=semantic_budget,
                 )
+                return rows, semantic
 
             with ThreadPoolExecutor(max_workers=min(4, len(stores))) as pool:
-                results = list(pool.map(retrieve, stores))
+                fetched = list(pool.map(retrieve, stores))
+            results, semantic_results = zip(*fetched, strict=True)
             scores, rows, titles = {}, {}, {}
             memory_clues = [text for _, text, core in memory_rows if not core]
             clues = "\n".join([query, *memory_clues])
@@ -1266,8 +1355,8 @@ class KnowledgeLibrary:
             strongest = max(strengths, default=0)
             for ranked, anchor in zip(results, strengths, strict=True):
                 weight = max(0.15, anchor / strongest) if strongest else 1.0
-                for rank, (key, names, reference, body) in enumerate(ranked, 1):
-                    scores[key] = scores.get(key, 0) + weight / (60 + rank)
+                _add_rank_votes(scores, (row[0] for row in ranked), weight)
+                for key, names, reference, body in ranked:
                     rows.setdefault(key, (reference, body))
                     titles.setdefault(key, names)
             # Only narrow a direct name lookup. Search stop words include clues such
@@ -1279,15 +1368,20 @@ class KnowledgeLibrary:
             )
             subject = re.sub(r"^(?:a|an|the)\s+", "", subject)
             name_key = re.findall(r"\w+", subject)
+            direct_sources = set()
             if strongest and len(_terms(subject)) >= 2 and not memory_clues:
-                named_sources = {
+                direct_sources = {
                     key[0]
                     for ranked in results
                     for key, names, _, _ in ranked
                     if any(re.findall(r"\w+", name.casefold()) == name_key for name in names)
                 }
-                if named_sources:
-                    rows = {key: row for key, row in rows.items() if key[0] in named_sources}
+                if direct_sources:
+                    rows = {key: row for key, row in rows.items() if key[0] in direct_sources}
+            semantic_candidates = [
+                candidate for semantic in semantic_results if semantic
+                for candidate in semantic.values()
+            ]
             newest = {}
             for source, _, _, revision in rows:
                 if revision.isdecimal():
@@ -1302,10 +1396,97 @@ class KnowledgeLibrary:
             if denoise:
                 with suppress(Exception):
                     passages = denoise(clues, passages)
+            if (
+                semantic_candidates and not direct_sources
+                and (len(compact) == len(stores) or not passages)
+            ):
+                # A compact index can recover paraphrases. Exact names and identifiers
+                # keep their keyword evidence, and memory clues keep their own retrieval.
+                identifiers = {
+                    term for term in _terms(query)
+                    if any(c.isalpha() for c in term) and any(c.isdigit() for c in term)
+                }
+                constrained = bool(
+                    identifiers or memory_clues or re.search(r'`[^\n]+`|"[^\n]+"', query)
+                )
+                named_sources = {
+                    key[0] for key, names, _, _ in passages
+                    if any(f" {' '.join(re.findall(r'\w+', name.casefold()))} " in query_key
+                           for name in names)
+                }
+                if not constrained:
+                    semantic_newest = newest.copy()
+                    for _, row in semantic_candidates:
+                        source, _, _, revision = row[0]
+                        if revision.isdecimal():
+                            semantic_newest[source] = max(
+                                semantic_newest.get(source, 0), int(revision)
+                            )
+                    candidates = [
+                        (score, row) for score, row in semantic_candidates
+                        if not row[0][3].isdecimal() or int(row[0][3]) == semantic_newest[row[0][0]]
+                    ]
+                    focused = self._focus_semantic(
+                        candidates, passages, named_sources, query, settings.rag_results
+                    )
+                    if focused:
+                        passages = focused
             return _format_knowledge_context(
                 [(reference, body) for _, _, reference, body in passages],
                 settings.max_context_chars,
             )
+
+    @staticmethod
+    def _focus_semantic(candidates, lexical, named_sources, query, limit):
+        candidates = sorted(candidates, key=lambda item: item[0], reverse=True)
+        # Limit the context to distinct excerpts near the best match. Never introduce
+        # a different article when the question explicitly matched a source name.
+        grounded = []
+        relevant = [
+            (score, row) for score, row in candidates
+            if not named_sources or row[0][0] in named_sources
+        ]
+        if not relevant and named_sources:
+            relevant = candidates[:1]
+        if not relevant:
+            return []
+        best = relevant[0][0]
+        for score, row in relevant:
+            source, first, last, revision = row[0]
+            if score < best - 0.04 or len(grounded) >= min(2, limit):
+                break
+            if any(
+                key[0] == source and (key[3] != revision or (key[1] <= last and first <= key[2]))
+                for key, *_ in grounded
+            ):
+                continue
+            grounded.append(row)
+        if not grounded:
+            return []
+        # Leave room for independent literal evidence, especially when a term was
+        # not well represented in the semantic index.
+        terms = _query_literals(query)
+        corroboration = sorted(
+            lexical,
+            key=lambda row: (row[0][0] in named_sources, len(terms & _literal_terms(row[3]))),
+            reverse=True,
+        )
+        seen = {row[0] for row in grounded}
+        selected_revisions = {source: revision for source, _, _, revision in seen}
+        anchors = {}
+        fallback = None
+        for row in corroboration:
+            key = row[0]
+            if key in seen or selected_revisions.get(key[0], key[3]) != key[3]:
+                continue
+            if key[0] in named_sources:
+                anchors.setdefault(key[0], row)
+            elif fallback is None:
+                fallback = row
+        if fallback and not anchors:
+            grounded.append(fallback)
+        grounded[:0] = anchors.values()
+        return grounded[:limit]
 
     def read_file(self, path, start_line=1, line_count=100):
         with self.lock:

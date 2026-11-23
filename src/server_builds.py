@@ -548,13 +548,15 @@ def managed_vision_file(folder, filename):
     return any(vision_file_precision(folder, family, filename) for family in VISION_DOWNLOADS)
 
 
-def install_model(folder, key, stopped, on_progress):
+def install_model(folder, key, stopped, on_progress, *, discard=lambda: False):
     asset = MODEL_DOWNLOADS[key]
-    return _install_model_asset(folder, asset, stopped, on_progress, "model", key)
+    return _install_model_asset(folder, asset, stopped, on_progress, "model", key, discard)
 
 
-def install_embedding(folder, stopped, on_progress):
-    return _install_model_asset(folder, EMBEDDING_DOWNLOAD, stopped, on_progress, "embedding", None)
+def install_embedding(folder, stopped, on_progress, *, discard=lambda: False):
+    return _install_model_asset(
+        folder, EMBEDDING_DOWNLOAD, stopped, on_progress, "embedding", None, discard
+    )
 
 
 def _embedding_threads():
@@ -588,18 +590,18 @@ def embedding_launch_parameters():
     )
 
 
-def _install_model_asset(folder, asset, stopped, on_progress, stage, item):
+def _install_model_asset(folder, asset, stopped, on_progress, stage, item, discard):
     model = folder / "models" / asset.filename
     expected = {"size": asset.size, "sha256": asset.sha256, "stopped": stopped}
     if model.exists():
         if not matches_download(model, **expected):
             raise ValueError(f"The file at {model} differs from the default model.")
     else:
-        _download_gguf(model, asset.url, expected, on_progress, stage, item)
+        _download_gguf(model, asset.url, expected, on_progress, stage, item, discard)
     return model
 
 
-def install_vision(folder, family, precision, stopped, on_progress):
+def install_vision(folder, family, precision, stopped, on_progress, *, discard=lambda: False):
     asset = VISION_DOWNLOADS[family][precision]
     path = vision_path(folder, family, precision)
     item = (family, precision)
@@ -610,27 +612,33 @@ def install_vision(folder, family, precision, stopped, on_progress):
         if not path.is_file() or path.stat().st_size != asset.size:
             expected = {"size": asset.size, "sha256": asset.sha256, "stopped": stopped}
             try:
-                _download_gguf(path, asset.url(precision), expected, on_progress, "vision", item)
+                _download_gguf(
+                    path, asset.url(precision), expected, on_progress, "vision", item, discard
+                )
             finally:
                 on_progress("vision", item, None)
     return path
 
 
-def _download_gguf(path, url, expected, on_progress, stage, item):
+def _download_gguf(path, url, expected, on_progress, stage, item, discard):
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_suffix(".gguf.download")
     resuming = partial.is_file()
+    on_progress(stage, item, 0)
+    report = _report_progress(on_progress, stage, item)
     try:
-        download_verified_file(
-            url, partial, on_progress=_report_progress(on_progress, stage, item), **expected
-        )
-    except DownloadChecksumError:
-        if not resuming:
-            raise
-        download_verified_file(
-            url, partial, on_progress=_report_progress(on_progress, stage, item), **expected
-        )
-    partial.replace(path)
+        try:
+            download_verified_file(url, partial, on_progress=report, **expected)
+        except DownloadChecksumError:
+            if not resuming:
+                raise
+            download_verified_file(url, partial, on_progress=report, **expected)
+        if expected["stopped"]():
+            raise InterruptedError("Download cancelled.")
+        partial.replace(path)
+    finally:
+        if discard():
+            partial.unlink(missing_ok=True)
 
 
 def _report_progress(callback, stage, server=None):
@@ -689,7 +697,9 @@ def _verified_servers(folder, arch, candidates, stopped, on_progress):
         )
 
 
-def default_model_configs(folder, stopped, on_progress, *, model_key=None, installed=False):
+def default_model_configs(
+    folder, stopped, on_progress, *, model_key=None, installed=False, discard=lambda: False,
+):
     """Start both downloads together when the hardware identifies a model."""
     arch = _server_arch()
     if arch is None:
@@ -709,9 +719,10 @@ def default_model_configs(folder, stopped, on_progress, *, model_key=None, insta
     cancel_model = Event()
 
     def download(key, cancelled):
-        model = install_model(folder, key, cancelled, on_progress)
-        on_progress("model", key, None)
-        return model
+        try:
+            return install_model(folder, key, cancelled, on_progress, discard=discard)
+        finally:
+            on_progress("model", key, None)
 
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-download") as downloads:
         pending = None

@@ -1,18 +1,143 @@
 """Pack formats, compatibility and catalog metadata."""
 
+import heapq
 import json
+import math
 import re
 import sqlite3
+import struct
+import sys
 import uuid
+from array import array
 from contextlib import closing
+from functools import lru_cache
+from itertools import islice
 from pathlib import Path
 
-from settings import APP_DIR
+from settings import APP_DIR, EMBEDDING_DOWNLOAD
 from web import KNOWLEDGE_PACK_URL_PREFIX, download_verified_file, fetch_knowledge_catalog
 
 APP_VERSION = "0.1.0"
 INDEX_FORMAT = 1
 CATALOG_FORMAT = 1
+VECTOR_STATE_KEY = "knowledge_vectors"
+VECTOR_DIMENSIONS = 256
+COMPACT_VECTOR_STATE_KEY = "knowledge_compact_vectors"
+COMPACT_VECTOR_BYTES = 64
+COMPACT_VECTOR_WIDTH = VECTOR_DIMENSIONS // COMPACT_VECTOR_BYTES
+VECTOR_FORMAT = {
+    "version": 1,
+    "model_sha256": EMBEDDING_DOWNLOAD.sha256,
+    "input": "prepared-passage",
+    "dimensions": VECTOR_DIMENSIONS,
+    "encoding": "normalized-float32-le",
+}
+COMPACT_VECTOR_FORMAT = dict(VECTOR_FORMAT, encoding="ivf-residual-pq64-v1")
+
+
+def read_search_vector_state(db):
+    row = db.execute(
+        "SELECT value FROM index_state WHERE key=?", (COMPACT_VECTOR_STATE_KEY,)
+    ).fetchone()
+    state = json.loads(row[0]) if row else None
+    if (
+        isinstance(state, dict)
+        and state.get("format") == COMPACT_VECTOR_FORMAT
+        and not state.get("invalidated")
+        and type(state.get("count")) is int
+        and state["count"] > 0
+        and type(state.get("clusters")) is int
+        and 0 < state["clusters"] <= 8192
+    ):
+        return state
+    return None
+
+
+@lru_cache(maxsize=24)
+def _search_vector_model(path, stamp, clusters):
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+        row = db.execute("SELECT centers, codebook FROM compact_vector_model").fetchone()
+    if row is None:
+        raise ValueError("Missing compact vector model.")
+    centers, codebook = row
+    center = struct.Struct(f"<{VECTOR_DIMENSIONS}f")
+    word = struct.Struct(f"<{COMPACT_VECTOR_WIDTH}f")
+    if (
+        len(centers) != clusters * center.size
+        or len(codebook) != COMPACT_VECTOR_BYTES * 256 * word.size
+    ):
+        raise ValueError("Invalid compact vector model size.")
+    words = tuple(word.iter_unpack(codebook))
+    floats = array("f")
+    floats.frombytes(centers)
+    if sys.byteorder == "big":
+        floats.byteswap()
+    return memoryview(floats), tuple(
+        words[i:i + 256] for i in range(0, len(words), 256)
+    )
+
+
+def search_pack_vectors(db, path, state, query, *, limit=24, budget=16000):
+    """Score passages in nearby clusters with their published vector encoding."""
+    if len(query) != VECTOR_DIMENSIONS:
+        return []
+    info = path.stat()
+    centers, codebook = _search_vector_model(
+        path.resolve(), (info.st_ino, info.st_mtime_ns, info.st_size), state["clusters"]
+    )
+    scores = [
+        math.sumprod(query, centers[start:start + VECTOR_DIMENSIONS])
+        for start in range(0, len(centers), VECTOR_DIMENSIONS)
+    ]
+    neighbors = heapq.nlargest(24, range(len(scores)), key=scores.__getitem__)
+    tables = []
+    for i, words in enumerate(codebook):
+        offset = i * COMPACT_VECTOR_WIDTH
+        segment = query[offset:offset + COMPACT_VECTOR_WIDTH]
+        tables.append(tuple(math.sumprod(segment, word) for word in words))
+
+    def candidates():
+        remaining = budget
+        for cluster in neighbors:
+            row = db.execute(
+                "SELECT row_ids, codes FROM compact_vector_buckets WHERE cluster=?", (cluster,)
+            ).fetchone()
+            if row is None:
+                continue
+            ids, codes = row
+            count = len(ids) // 4
+            if len(ids) != count * 4 or len(codes) != count * COMPACT_VECTOR_BYTES:
+                raise ValueError("Invalid search vector bucket size.")
+            # Sample across an unusually large nearest bucket to keep the first search bounded.
+            if count > remaining and remaining < budget:
+                break
+            bias = scores[cluster]
+            step = max(1, (count + remaining - 1) // remaining)
+            row_ids = islice(struct.iter_unpack("<I", ids), 0, None, step)
+            for position, (row_id,) in enumerate(row_ids):
+                start = position * step * COMPACT_VECTOR_BYTES
+                code = codes[start:start + COMPACT_VECTOR_BYTES]
+                score = sum(table[value] for table, value in zip(tables, code, strict=True))
+                yield bias + score, row_id
+            remaining -= (count + step - 1) // step
+            if remaining <= 0:
+                break
+
+    return heapq.nlargest(limit, candidates())
+
+
+def read_vector_state(db):
+    row = db.execute("SELECT value FROM index_state WHERE key=?", (VECTOR_STATE_KEY,)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def vectors_ready(state):
+    return bool(
+        isinstance(state, dict)
+        and state.get("format") == VECTOR_FORMAT
+        and state.get("complete") is True
+        and not state.get("invalidated")
+    )
 
 
 def version_tuple(value):
@@ -164,7 +289,7 @@ def load_catalog(*, refresh=False, folder=None):
     return selected
 
 
-def download_pack(release, path, progress=None):
+def download_pack(release, path, progress=None, *, stopped=lambda: False):
     """Stream a resumable download; verify bytes and identity before installation."""
     validate_catalog({"catalog_format_version": CATALOG_FORMAT, "releases": [release]})
     if error := compatibility_error(release):
@@ -174,6 +299,7 @@ def download_pack(release, path, progress=None):
         path,
         size=release["size_bytes"],
         sha256=release["sha256"],
+        stopped=stopped,
         on_progress=(
             lambda received, total: progress("Downloading", received, total, release["title"])
         )

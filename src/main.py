@@ -136,7 +136,9 @@ class ChatController:
     def __init__(self, settings):
         self.settings, self.store, self.client = settings, ChatStore(), LlamaClient(settings)
         self.memories = MemoryStore(self.store.root.parent / "memories.sqlite", settings)
-        self.recall_embeddings = RecallEmbeddings()
+        self.recall_embeddings = RecallEmbeddings(
+            lambda session: self.view.dispatch(self._embedding_changed, session)
+        )
         self._indexed_embedding_session = None
         self.knowledge = KnowledgeStore()
         self._model_lock = threading.Lock()
@@ -160,6 +162,7 @@ class ChatController:
             lambda active: self.view.dispatch(self.view.set_document_processing, active),
             on_indexed=self.recall_embeddings.schedule,
         )
+        self.history_index.model_indexing_allowed = lambda: not self.embedding_ready()
         self.chat_sort = settings.chat_sort
         self.view = self.chat = None
         self.busy = self.stop_requested = self.updating_memories = False
@@ -185,6 +188,10 @@ class ChatController:
         self.model_switch_target = None
         self.switching_model = False
         self.model_file_download = None
+        self.download_cancels = {
+            kind: threading.Event() for kind in ("model", "vision", "embedding")
+        }
+        self._vision_download_lock = threading.Lock()
         self.embedding_download_active = False
         self.vision_download_active = None
         self._model_file_stop = threading.Event()
@@ -332,6 +339,23 @@ class ChatController:
         self.view.update_first_launch()
 
     def _connect_default_model(self, config, model_key=None, *, installed=False, on_finished=None):
+        self.download_cancels["model"].clear()
+
+        def prepare(stopped):
+            cancelled = self.download_cancels["model"].is_set
+            try:
+                yield from default_model_configs(
+                    self.store.root.parent,
+                    lambda: stopped() or cancelled(),
+                    self._model_download_progress,
+                    model_key=model_key,
+                    installed=installed,
+                    discard=cancelled,
+                )
+            except (OSError, RuntimeError, ValueError, HTTPException):
+                if not cancelled():
+                    raise
+
         def save(paths):
             self._save_downloaded_model(
                 {
@@ -355,13 +379,7 @@ class ChatController:
 
         return self.model_server.connect(
             {**config, "mmproj": "", "mmproj_manual": False},
-            prepare=lambda stopped: default_model_configs(
-                self.store.root.parent,
-                stopped,
-                self._model_download_progress,
-                model_key=model_key,
-                installed=installed,
-            ),
+            prepare=prepare,
             prepare_config=self._prepare_model_vision,
             on_finished=on_finished,
             on_config=lambda paths: self.view.dispatch(save, paths),
@@ -369,6 +387,20 @@ class ChatController:
 
     def _model_download_progress(self, stage, item, percent):
         self.view.dispatch(self.view.update_model_download, stage, item, percent)
+
+    def _install_vision(self, folder, family, precision, stopped, progress):
+        with self._vision_download_lock:
+            cancel = self.download_cancels["vision"]
+            cancel.clear()
+            try:
+                return install_vision(
+                    folder, family, precision, lambda: stopped() or cancel.is_set(),
+                    progress, discard=cancel.is_set,
+                )
+            except InterruptedError:
+                if not cancel.is_set():
+                    raise
+                return None
 
     def _prepare_model_vision(self, config, stopped, *, strict=False):
         folder = self.store.root.parent
@@ -391,7 +423,9 @@ class ChatController:
         )
         selected["vision_precision"] = precision
         try:
-            path = install_vision(folder, family, precision, stopped, self._model_download_progress)
+            path = self._install_vision(
+                folder, family, precision, stopped, self._model_download_progress
+            )
         except InterruptedError:
             raise
         except (OSError, ValueError, HTTPException) as exc:
@@ -399,7 +433,7 @@ class ChatController:
                 raise
             self.view.dispatch(self.view._show_alert, "Vision download failed", str(exc))
             return {**selected, "mmproj": ""}
-        return {**selected, "mmproj": str(path) if path.is_file() else ""}
+        return {**selected, "mmproj": str(path) if path and path.is_file() else ""}
 
     def _save_vision_settings(self, original, paths, update_preference=False):
         config = self.store.load_app_settings().get("model_server", {})
@@ -463,7 +497,7 @@ class ChatController:
             self.view.refresh_model_configuration()
 
         self._download_model_asset(
-            lambda folder, stopped, progress: install_vision(
+            lambda folder, stopped, progress: self._install_vision(
                 folder,
                 family,
                 detect_vision_precision(config, fallback=precision),
@@ -516,6 +550,8 @@ class ChatController:
         settings = self.store.load_app_settings()
         settings.setdefault("embedding_model", {})[key] = value
         self.store.save_app_settings(settings)
+        if key == "path":
+            self._refresh_embedding_indexes()
 
     def _embedding_configuration(self):
         settings = self.store.load_app_settings()
@@ -538,15 +574,38 @@ class ChatController:
         if session is self._indexed_embedding_session:
             return
         self._indexed_embedding_session = session
+        self.view.refresh_retrieval_settings()
         if not session:
+            if self.chat:
+                self._apply_chat_settings()
+            for chat in self.store.list():
+                if self.get_chat_settings(chat["id"])["history_model_indexing"] is True:
+                    self.history_index.schedule(chat["id"])
             return
-        if self.get_chat_settings()["global_memories"] is True:
-            self._schedule_memory_vectors()
-        if self.history_index.enabled() and self.history_index.path.is_file():
+        session.start()
+        self._schedule_memory_vectors()
+        if self.history_index.path.is_file():
             self.recall_embeddings.schedule(self.history_index.path)
         for filename in ("documents.sqlite", "chat-history.sqlite"):
             for path in self.store.root.glob(f"*/{filename}"):
                 self.recall_embeddings.schedule(path)
+
+    def embedding_ready(self):
+        session = self._indexed_embedding_session
+        return bool(session and session.ready)
+
+    def embedding_configured(self):
+        return self._embedding_configuration() is not None
+
+    def _embedding_changed(self, session):
+        if session is not self._indexed_embedding_session:
+            return
+        if not session.ready:
+            self._refresh_embedding_indexes()
+        else:
+            if self.chat:
+                self._apply_chat_settings()
+            self.view.refresh_retrieval_settings()
 
     def _schedule_memory_vectors(self):
         if self.memories.path.is_file():
@@ -568,6 +627,8 @@ class ChatController:
                 if path.is_file() and not legacy_embedding_file(path):
                     return
         self.embedding_download_active = True
+        cancel = self.download_cancels["embedding"]
+        cancel.clear()
         self.view.refresh_model_configuration()
 
         def finished(path):
@@ -580,7 +641,18 @@ class ChatController:
             finally:
                 self.view.update_model_download("embedding", None, None)
 
-        self._download_model_asset(install_embedding, finished, "Embedding setup failed")
+        def install(folder, stopped, progress):
+            try:
+                return install_embedding(
+                    folder, lambda: stopped() or cancel.is_set(),
+                    progress, discard=cancel.is_set,
+                )
+            except InterruptedError:
+                if not cancel.is_set():
+                    raise
+                return None
+
+        self._download_model_asset(install, finished, "Embedding setup failed")
 
     def _download_model_asset(self, install, apply, failure_title):
         stopped = self._model_file_stop.is_set
@@ -643,7 +715,7 @@ class ChatController:
             if not config.get("path") or selected == path:
                 config.update(path="", enabled=False)
                 self.store.save_app_settings(settings)
-                self.recall_embeddings.configure(None)
+                self._refresh_embedding_indexes()
                 self.view.update_model_paths({"embedding_path": ""})
             path.unlink(missing_ok=True)
             path.with_suffix(".gguf.download").unlink(missing_ok=True)
@@ -662,6 +734,7 @@ class ChatController:
             self.view._show_alert("Could not start model download", str(exc))
             return
         self.model_file_download = key
+        self.download_cancels["model"].clear()
         self.view.refresh_model_configuration()
         server = settings.get("model_server", {})
 
@@ -669,25 +742,38 @@ class ChatController:
             error = None
             failure_title = "Model download failed"
             folder = self.store.root.parent
-            stopped = self._model_file_stop.is_set
+            cancelled = self.download_cancels["model"].is_set
+
+            def stopped():
+                return cancelled() or self._model_file_stop.is_set()
+
             try:
                 if not model_path(folder, key).is_file():
-                    install_model(folder, key, stopped, self._model_download_progress)
+                    install_model(
+                        folder, key, stopped, self._model_download_progress, discard=cancelled
+                    )
                 self._model_download_progress("model", key, None)
                 family = MODEL_DOWNLOADS[key].vision_family
                 if family and family not in server.get("vision_disabled", ()):
                     failure_title = "Vision download failed"
                     hardware = server or cached_server_config(folder) or {}
                     precision = detect_vision_precision(hardware)
-                    install_vision(
+                    self._install_vision(
                         folder, family, precision, stopped, self._model_download_progress
                     )
+            except InterruptedError as exc:
+                if not cancelled():
+                    error = str(exc)
             except (OSError, ValueError, HTTPException) as exc:
                 error = str(exc)
             if not self._model_file_stop.is_set():
                 self.view.dispatch(self._finish_model_download, key, failure_title, error)
 
         threading.Thread(target=download, daemon=True).start()
+
+    def cancel_model_download(self, kind):
+        self.download_cancels[kind].set()
+        self.view.refresh_model_configuration()
 
     def _finish_model_download(self, key, failure_title, error):
         self.model_file_download = None
@@ -1273,7 +1359,9 @@ class ChatController:
     def _apply_chat_settings(self):
         settings = self.get_chat_settings(self.chat["id"])
         folder = self.store.documents(self.chat["id"])
-        self.document_indexer.configure(settings["rag_model_indexing"] is True, folder)
+        self.document_indexer.configure(
+            settings["rag_model_indexing"] is True and not self.embedding_ready(), folder
+        )
         self.document_indexer.schedule(folder)
         self.history_index.schedule(self.chat["id"])
 
@@ -1547,6 +1635,8 @@ class ChatController:
                 embeddings = None
                 try:
                     embeddings = self.recall_embeddings.configure(self._embedding_configuration())
+                    if embeddings is not self._indexed_embedding_session:
+                        self.view.dispatch(self._refresh_embedding_indexes)
                     if embeddings:
                         embeddings.pause_background()
                     self._respond(
@@ -1652,6 +1742,8 @@ class ChatController:
 
         def expand(search_query):
             nonlocal expansion
+            if embeddings and embeddings.ready:
+                return ""
             if expansion is None:
                 expansion = ""  # A failed/cancelled expansion is not retried for memories.
                 try:
@@ -1662,8 +1754,7 @@ class ChatController:
                     logging.debug("Query expansion unavailable", exc_info=True)
             return expansion
 
-        expand_query = expand if query_expansion else None
-        recall_expansion = None if embeddings else expand_query
+        expand_query = expand if query_expansion and not (embeddings and embeddings.ready) else None
         vector_rank = None
         deferred_knowledge = []
         if embeddings:
@@ -1678,7 +1769,7 @@ class ChatController:
                 query,
                 folder,
                 self.settings,
-                expand=recall_expansion,
+                expand=expand_query,
                 stopped=lambda: self.stop_requested,
                 previous_queries=previous_queries,
                 refresh=False,
@@ -1695,7 +1786,7 @@ class ChatController:
                     self.memories,
                     query,
                     self.settings,
-                    expand=recall_expansion,
+                    expand=expand_query,
                     previous_queries=previous_queries,
                     vector_rank=vector_rank,
                 )
@@ -1708,7 +1799,7 @@ class ChatController:
                 history_context = self.history_index.context(
                     query,
                     self._generation_chat_id,
-                    expand=recall_expansion,
+                    expand=expand_query,
                     previous_queries=previous_queries,
                     vector_rank=vector_rank,
                 )
@@ -1723,7 +1814,7 @@ class ChatController:
                 archive_context = self.history_index.local_context(
                     query,
                     self._generation_chat_id,
-                    expand=recall_expansion,
+                    expand=expand_query,
                     boundary=self._generation_context_start,
                     previous_queries=previous_queries,
                     vector_rank=vector_rank,
@@ -1763,8 +1854,13 @@ class ChatController:
                 expand=expand_query,
                 previous_queries=previous_queries,
                 memory_rows=memory_rows,
-                denoise=(lambda q, rows: embeddings.denoise_knowledge(q, rows, deferred_knowledge))
+                denoise=(lambda q, rows: embeddings.denoise_knowledge(
+                    q, rows, deferred_knowledge
+                ))
                 if embeddings else None,
+                embed_query=(
+                    embeddings.query_vector if embeddings and embeddings.classifier_ready else None
+                ),
             )
         except Exception as exc:
             self.view.dispatch(self.view.notify, f"Knowledge retrieval unavailable: {exc}")

@@ -44,6 +44,8 @@ _HISTORY_STOP_WORDS = {
 
 
 class HistoryIndex:
+    model_indexing_allowed = staticmethod(lambda: True)
+
     def __init__(self, store, settings, client, model_lock, on_processing, on_indexed=None):
         self.store, self.settings, self.client = store, settings, client
         self.path = store.root.parent / "chats.sqlite"
@@ -153,6 +155,8 @@ class HistoryIndex:
                 )
 
     def _assisted(self, chat_id):
+        if not self.model_indexing_allowed():
+            return False
         settings = self.store.load_app_settings() | self.store.load_settings(chat_id)
         return settings.get("history_model_indexing", False) is True
 

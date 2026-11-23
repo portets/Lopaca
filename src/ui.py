@@ -6,6 +6,7 @@ import time
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
+from typing import ClassVar
 
 import gi
 
@@ -47,7 +48,7 @@ gi.require_version("Adw", "1")
 gi.require_version("Graphene", "1.0")
 gi.require_version("Gsk", "4.0")
 # GI namespace versions must be selected before importing their bindings.
-from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gsk, Gtk, Pango  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gsk, Gtk, Pango  # noqa: E402
 
 ATTACH_DOCUMENTS_ICON = "mail-attachment-symbolic"
 ATTACHMENT_THUMBNAIL_SIZE = 64
@@ -650,9 +651,6 @@ window.lopaca-main, .transcript-scroll, .transcript {
 .knowledge-packs-switch {
     /* Theme defaults; add overrides here when needed. */
 }
-.knowledge-packs-remove {
-    /* Theme defaults; add overrides here when needed. */
-}
 .knowledge-packs-info {
     /* Theme defaults; add overrides here when needed. */
 }
@@ -793,6 +791,32 @@ def add_operation_indicator(row, text="", active=False, *, visible=True):
     return label, spinner
 
 
+def model_file_size(size):
+    return f" · {size / 10**9:.1f} GB"
+
+
+class DownloadAction(Gtk.Button):
+    def __init__(self, label, **actions):
+        super().__init__(
+            valign=Gtk.Align.CENTER, sensitive=False, css_classes=["knowledge-packs-button"]
+        )
+        self._label, self._actions = label, actions
+        self._action = None
+        self.connect("clicked", lambda *_: self._actions[self._action]())
+
+    def show_action(self, action, *, enabled=True):
+        self._action = action
+        icon, tooltip = {
+            "download": ("list-add-symbolic", f"Download {self._label}"),
+            "remove": ("user-trash-symbolic", f"Remove {self._label}"),
+            "update": ("software-update-available-symbolic", f"Update {self._label}"),
+            "cancel": ("process-stop-symbolic", "Cancel Download"),
+        }[action]
+        self.set_icon_name(icon)
+        self.set_tooltip_text(tooltip)
+        self.set_sensitive(enabled)
+
+
 def attachment_display_name(name, limit):
     name = " ".join(name.splitlines())
     if len(name) <= limit:
@@ -852,6 +876,13 @@ class TranscriptViewport(Gtk.Viewport):
 
 
 class ChatWindow(Adw.ApplicationWindow):
+    __gsignals__: ClassVar = {
+        "retrieval-settings-changed": (GObject.SignalFlags.RUN_LAST, None, ())
+    }
+
+    def refresh_retrieval_settings(self):
+        self.emit("retrieval-settings-changed")
+
     def __init__(self, app, controller):
         super().__init__(application=app, title="Lopaca")
         self.add_css_class("lopaca-main")
@@ -2485,6 +2516,30 @@ class ChatWindow(Adw.ApplicationWindow):
         overrides = self.controller.get_chat_overrides(chat_id) if chat_id is not None else set()
         markers = []
         setting_controls = {}
+        recall_switches = {}
+        recall_handler = None
+
+        def update_recall_switches(*_):
+            active = self.controller.embedding_ready()
+            configured = self.controller.embedding_configured()
+            for key, (row, button, handler, title, tooltip) in recall_switches.items():
+                with button.handler_block(handler):
+                    button.set_active(active or settings[key] is True)
+                row.set_sensitive(not active)
+                row.set_tooltip_text("Handled by the embedding model." if active else tooltip)
+                if key in ("rag_model_indexing", "history_model_indexing"):
+                    row.set_title(title if configured else f"{title} (SLOW)")
+
+        def connect_recall_switches(*_):
+            nonlocal recall_handler
+            recall_handler = self.connect("retrieval-settings-changed", update_recall_switches)
+            update_recall_switches()
+
+        def disconnect_recall_switches(*_):
+            nonlocal recall_handler
+            if recall_handler is not None:
+                self.disconnect(recall_handler)
+                recall_handler = None
 
         def update_markers():
             for marker, key, button in markers:
@@ -2550,6 +2605,8 @@ class ChatWindow(Adw.ApplicationWindow):
 
             handler = button.connect("notify::active", changed)
             setting_controls[key] = [(button, handler, False if inverted else None)]
+            if key in ("rag_query_expansion", "rag_model_indexing", "history_model_indexing"):
+                recall_switches[key] = (row, button, handler, title, tooltip)
             group.add(row)
 
         if chat_id is None:
@@ -2581,20 +2638,22 @@ class ChatWindow(Adw.ApplicationWindow):
         add_switch(
             "rag_query_expansion",
             "Expand Retrieval Searches",
-            "Ask the current model for related search terms. With embeddings enabled, "
-            "this only applies to knowledge packs.",
+            "Ask the current model for related search terms.",
         )
         add_switch(
             "rag_model_indexing",
-            "Model-Assisted Document Indexing (SLOW)",
+            "Model-Assisted Document Indexing",
             "Modestly improves document info retrieval. CAN BE SLOW, best used with t/s > 80.",
         )
         add_switch(
             "history_model_indexing",
-            "Model-Assisted History Indexing (SLOW)",
+            "Model-Assisted History Indexing",
             "Improves search in archived messages in this chat and in other chats. "
             "CAN BE SLOW, best used with t/s > 80.",
         )
+        page.connect("map", connect_recall_switches)
+        page.connect("unmap", disconnect_recall_switches)
+        update_recall_switches()
 
         def add_choices(title, options, key, setter):
             choice_group = Adw.PreferencesGroup(title=title)
@@ -2692,12 +2751,6 @@ class ChatWindow(Adw.ApplicationWindow):
                 "Public License v3.0</a>",
             ),
             (
-                "Wikipedia knowledge packs",
-                "Adapted from Wikipedia contributors · "
-                '<a href="https://creativecommons.org/licenses/by-sa/4.0/"'
-                ">CC BY-SA 4.0 License</a>",
-            ),
-            (
                 "llama.cpp llama-server",
                 'Copyright © The ggml authors · <a href="https://github.com/ggml-org/llama.cpp/'
                 'blob/master/LICENSE">MIT License</a>',
@@ -2706,6 +2759,12 @@ class ChatWindow(Adw.ApplicationWindow):
                 "Qwen Models",
                 'Copyright © Alibaba Cloud · <a href="https://huggingface.co/Qwen/Qwen3.8-27B/'
                 'blob/main/LICENSE">Apache 2.0 License</a>',
+            ),
+            (
+                "Wikipedia knowledge packs",
+                "Adapted from Wikipedia contributors · "
+                '<a href="https://creativecommons.org/licenses/by-sa/4.0/"'
+                ">CC BY-SA 4.0 License</a>",
             ),
         ):
             licenses.add(Adw.ActionRow(title=title, subtitle=notice, use_markup=True))
@@ -2888,7 +2947,7 @@ class ChatWindow(Adw.ApplicationWindow):
         file_job = self.controller.model_file_download
         setup_busy = self.controller.model_server.busy
         for role, widgets in self._model_rows.items():
-            row, download, switch, remove, indicator, handler = widgets
+            row, action, switch, indicator, handler = widgets
             key = getattr(rule, role)
             asset = MODEL_DOWNLOADS[key]
             path = model_path(folder, key)
@@ -2897,21 +2956,29 @@ class ChatWindow(Adw.ApplicationWindow):
             in_progress = percent is not None if key == downloading else key == file_job
             row.set_subtitle(
                 f"{asset.name} · {asset.publisher} | {asset.quantization}"
-                f" · {asset.size / 10**9:.1f} GB"
+                + model_file_size(asset.size)
             )
             if installed:
                 row.remove_css_class("dim-label")
             else:
                 row.add_css_class("dim-label")
-            download.set_sensitive(not installed and not setup_busy and not file_job)
-            download.set_visible(not installed)
+            cancellable = not installed and (key == file_job or (setup_busy and in_progress))
+            cancelling = cancellable and self.controller.download_cancels["model"].is_set()
+            if cancellable:
+                action.show_action("cancel", enabled=not cancelling)
+            elif installed:
+                action.show_action(
+                    "remove", enabled=not (in_progress or setup_busy or external)
+                )
+            else:
+                action.show_action("download", enabled=not setup_busy and not file_job)
+            switch.set_visible(installed)
             switch.set_sensitive(installed and not setup_busy and not external)
-            remove.set_visible(installed)
-            remove.set_sensitive(installed and not in_progress and not setup_busy and not external)
             with switch.handler_block(handler):
                 switch.set_active(active)
             self._update_download_indicator(
-                indicator, "Downloading", in_progress, percent if key == downloading else None
+                indicator, "Cancelling" if cancelling else "Downloading", in_progress,
+                percent if key == downloading and not cancelling else None,
             )
         self._refresh_vision_rows(config, rule, external)
         self._refresh_embedding_row(folder)
@@ -2925,33 +2992,47 @@ class ChatWindow(Adw.ApplicationWindow):
         with suppress(RuntimeError):
             selected = selected.expanduser()
         config = self.controller.store.load_app_settings().get("embedding_model", {})
-        row, download, switch, remove, indicator, handler = self._embedding_row
+        row, action, switch, indicator, handler = self._embedding_row
         installed = embedding_path(folder).is_file()
         available = selected.is_file() and not legacy_embedding_file(selected)
         if installed or available:
             row.remove_css_class("dim-label")
         else:
             row.add_css_class("dim-label")
-        download.set_visible(not installed)
-        download.set_sensitive(not active)
-        remove.set_visible(installed)
-        remove.set_sensitive(not active)
+        cancelling = active and self.controller.download_cancels["embedding"].is_set()
+        if active:
+            action.show_action("cancel", enabled=not cancelling)
+        else:
+            action.show_action("remove" if installed else "download")
+        switch.set_visible(installed or available)
         switch.set_sensitive((installed or available) and not active)
         with switch.handler_block(handler):
             switch.set_active(available and config.get("enabled", True))
-        self._update_download_indicator(indicator, "Downloading", active, percent)
+        self._update_download_indicator(
+            indicator, "Cancelling" if cancelling else "Downloading", active,
+            None if cancelling else percent,
+        )
 
     def _embedding_choice(self):
         group = Adw.PreferencesGroup(title="Embedding")
         group.add_css_class("model-settings-summary")
         asset = EMBEDDING_DOWNLOAD
-        row = Adw.ActionRow(title=asset.name, subtitle=asset.quantization, use_markup=False)
+        row = Adw.ActionRow(
+            title=asset.name,
+            subtitle=asset.quantization + model_file_size(asset.size),
+            use_markup=False,
+        )
+        row.set_tooltip_text(
+            "Allows Lopaca to use an embedding model to drastically speed up and improve "
+            "certain features. This runs on the CPU without interfering with the main loaded model."
+        )
         self._embedding_row = self._model_row_controls(
             row,
             "Embedding Model",
             self.controller.download_embedding,
             self.controller.select_embedding,
             lambda: self._confirm_model_removal(asset.name, self.controller.delete_embedding),
+            "embedding",
         )
         group.add(row)
         return group
@@ -2971,14 +3052,7 @@ class ChatWindow(Adw.ApplicationWindow):
         busy = self.controller.vision_file_jobs_busy()
         model_available = bool(selected and Path(config["model"]).expanduser().is_file())
         visible = False
-        for family, (
-            row,
-            download,
-            switch,
-            remove,
-            indicator,
-            handler,
-        ) in self._vision_rows.items():
+        for family, (row, action, switch, indicator, handler) in self._vision_rows.items():
             installed = [
                 variant
                 for variant in VISION_DOWNLOADS[family]
@@ -2989,11 +3063,10 @@ class ChatWindow(Adw.ApplicationWindow):
             visible |= row_visible
             compatible = family == selected and not external and model_available
             custom = bool(compatible and projector and not managed_vision_file(folder, projector))
+            switch.set_visible(
+                bool(installed) or bool(custom and Path(projector).expanduser().is_file())
+            )
             switch.set_sensitive(compatible and not busy and bool(installed or custom))
-            download.set_visible(not installed)
-            download.set_sensitive(not busy)
-            remove.set_visible(bool(installed))
-            remove.set_sensitive(not busy)
             if compatible:
                 row.remove_css_class("dim-label")
             else:
@@ -3008,6 +3081,11 @@ class ChatWindow(Adw.ApplicationWindow):
                 switch.set_active(enabled)
             job = downloading or explicit
             in_progress = job is not None and job[0] == family
+            cancelling = in_progress and self.controller.download_cancels["vision"].is_set()
+            if in_progress:
+                action.show_action("cancel", enabled=downloading is not None and not cancelling)
+            else:
+                action.show_action("remove" if installed else "download", enabled=not busy)
             precision = job[1] if in_progress else default_precision
             if custom:
                 precision = "Custom file"
@@ -3016,9 +3094,16 @@ class ChatWindow(Adw.ApplicationWindow):
                 precision = chosen or (
                     installed[0] if installed and precision not in installed else precision
                 )
-            row.set_subtitle(precision)
+            subtitle = precision
+            if custom:
+                with suppress(OSError):
+                    subtitle += model_file_size(Path(projector).expanduser().stat().st_size)
+            elif asset := VISION_DOWNLOADS[family].get(precision):
+                subtitle += model_file_size(asset.size)
+            row.set_subtitle(subtitle)
             self._update_download_indicator(
-                indicator, "Downloading", in_progress, percent if job == downloading else None
+                indicator, "Cancelling" if cancelling else "Downloading", in_progress,
+                percent if job == downloading and not cancelling else None,
             )
         self._vision_group.set_visible(visible)
 
@@ -3028,6 +3113,10 @@ class ChatWindow(Adw.ApplicationWindow):
         self._vision_rows = {}
         for family, size in (("3.8", "27B"), ("3.5", "9B")):
             row = Adw.ActionRow(title=f"Qwen {family} Vision {size}", use_markup=False)
+            row.set_tooltip_text(
+                "Provides the ability for the model to view images. NOTE: "
+                "this doesn't give the model the ability to create images."
+            )
             self._vision_rows[family] = self._model_row_controls(
                 row,
                 "Vision Files",
@@ -3037,30 +3126,24 @@ class ChatWindow(Adw.ApplicationWindow):
                     f"the downloaded Qwen {family} Vision files",
                     lambda: self.controller.delete_vision(family),
                 ),
+                "vision",
             )
             self._vision_group.add(row)
         return self._vision_group
 
-    @staticmethod
-    def _model_row_controls(row, label, on_download, on_select, on_remove):
+    def _model_row_controls(self, row, label, on_download, on_select, on_remove, kind):
         row.add_css_class("knowledge-packs-row")
         indicator = add_operation_indicator(row, visible=False)
-        download = Gtk.Button(
-            icon_name="list-add-symbolic", valign=Gtk.Align.CENTER, tooltip_text=f"Download {label}"
-        )
-        download.add_css_class("knowledge-packs-button")
         switch = Gtk.Switch(valign=Gtk.Align.CENTER)
         switch.add_css_class("knowledge-packs-switch")
-        remove = Gtk.Button(
-            icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER, tooltip_text=f"Remove {label}"
+        action = DownloadAction(
+            label, download=on_download, remove=on_remove,
+            cancel=lambda: self.controller.cancel_model_download(kind),
         )
-        remove.add_css_class("knowledge-packs-remove")
-        for widget in (switch, download, remove):
-            row.add_suffix(widget)
-        download.connect("clicked", lambda *_: on_download())
-        remove.connect("clicked", lambda *_: on_remove())
+        row.add_suffix(switch)
+        row.add_suffix(action)
         handler = switch.connect("notify::active", lambda button, _: on_select(button.get_active()))
-        return row, download, switch, remove, indicator, handler
+        return row, action, switch, indicator, handler
 
     def _model_choices(self):
         group = Adw.PreferencesGroup(title="Configured Model")
@@ -3082,6 +3165,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 lambda role=role: self.controller.download_model(model_key(role)),
                 lambda active, role=role: self.controller.select_model(model_key(role), active),
                 lambda role=role: self._confirm_model_delete(model_key(role)),
+                "model",
             )
             group.add(row)
         return group
@@ -3552,16 +3636,9 @@ class ChatWindow(Adw.ApplicationWindow):
                     row.set_tooltip_text(
                         f"This pack is unused while {manifest['unused_by']} is enabled."
                     )
-                remove = Gtk.Button(
-                    icon_name="user-trash-symbolic",
-                    valign=Gtk.Align.CENTER,
-                    tooltip_text="Remove Pack",
-                )
-                remove.add_css_class("knowledge-packs-remove")
                 if pending:
                     add_status(row, pending)
                     switch.set_sensitive(False)
-                    remove.set_sensitive(False)
 
                 def toggled(button, _, k=key):
                     enabled = button.get_active()
@@ -3584,17 +3661,18 @@ class ChatWindow(Adw.ApplicationWindow):
                     threading.Thread(target=run, daemon=True).start()
 
                 switch.connect("notify::active", toggled)
-                remove.connect(
-                    "clicked",
-                    lambda _, k=key, title=manifest["title"]: enqueue(
-                        {"kind": "delete", "key": k, "title": title}
-                    ),
-                )
-                if compatible and (error or newer):
-                    update = download_button(release, pending, update=True)
-                    row.add_suffix(update)
+                if compatible and (error or newer) and not pending:
+                    row.add_suffix(pack_action(release, None, update=True))
                 row.add_suffix(switch)
-                row.add_suffix(remove)
+                row.add_suffix(
+                    pack_action(
+                        release,
+                        pending,
+                        remove=lambda k=key, title=manifest["title"]: enqueue(
+                            {"kind": "delete", "key": k, "title": title}
+                        ),
+                    )
+                )
                 group.add(row)
                 rows.append(row)
             installed_ids = {key for key, _, _ in installed}
@@ -3612,11 +3690,9 @@ class ChatWindow(Adw.ApplicationWindow):
                 pending = next((job for job in jobs if job.get("key") == key), None)
                 if pending:
                     add_status(row, pending)
-                download = download_button(release, pending)
                 if key in covered:
-                    download.set_sensitive(False)
                     row.set_tooltip_text(f"Included in {covered[key]}.")
-                row.add_suffix(download)
+                row.add_suffix(pack_action(release, pending, covered=key in covered))
                 group.add(row)
                 rows.append(row)
             for job in jobs:
@@ -3635,25 +3711,40 @@ class ChatWindow(Adw.ApplicationWindow):
                 size /= 1024
             return "Unknown size"
 
-        def download_button(release, pending, *, update=False):
-            button = Gtk.Button(
-                icon_name="software-update-available-symbolic" if update else "list-add-symbolic",
-                tooltip_text="Update Pack" if update else "Download Pack",
-                valign=Gtk.Align.CENTER,
-                sensitive=not pending and (not compatibility_error(release)),
-            )
-            button.add_css_class("knowledge-packs-button")
-            button.connect(
-                "clicked",
-                lambda *_: enqueue(
+        def pack_action(release, pending, *, remove=None, update=False, covered=False):
+            def download():
+                enqueue(
                     {
                         "kind": "download",
                         "key": release["pack_id"],
                         "title": release["title"],
                         "release": release,
                     }
-                ),
+                )
+
+            def cancel_download():
+                pending["cancel"].set()
+                if pending.get("active"):
+                    pending["status"] = "Cancelling…"
+                else:
+                    self._knowledge_jobs.remove(pending)
+                    start_next()
+                notify()
+
+            button = DownloadAction(
+                "Pack", download=download, update=download, remove=remove, cancel=cancel_download
             )
+            if pending and "cancel" in pending and (
+                pending.get("stage") is None or "Downloading" in pending["stage"]
+            ):
+                button.show_action("cancel", enabled=not pending["cancel"].is_set())
+            elif remove:
+                button.show_action("remove", enabled=not pending)
+            else:
+                button.show_action(
+                    "update" if update else "download",
+                    enabled=not (pending or covered or compatibility_error(release)),
+                )
             return button
 
         def add_status(row, job):
@@ -3665,6 +3756,8 @@ class ChatWindow(Adw.ApplicationWindow):
                 self._knowledge_refresh(job)
 
         def enqueue(job):
+            if job["kind"] in ("download", "dependencies"):
+                job["cancel"] = threading.Event()
             job["status"] = "Waiting…"
             self._knowledge_jobs.append(job)
             notify()
@@ -3702,6 +3795,8 @@ class ChatWindow(Adw.ApplicationWindow):
                 last_update = now
 
                 def update():
+                    if "cancel" in job and job["cancel"].is_set():
+                        return
                     same_stage = job.get("stage") == stage and (not title or title == job["title"])
                     job["stage"] = stage
                     if title:
@@ -3724,15 +3819,21 @@ class ChatWindow(Adw.ApplicationWindow):
 
             def run():
                 error = None
+                stopped = job["cancel"].is_set if "cancel" in job else lambda: False
                 try:
                     if job["kind"] == "download":
-                        self.controller.knowledge.download_pack(job["release"], progress)
+                        self.controller.knowledge.download_pack(
+                            job["release"], progress, stopped=stopped
+                        )
                     elif job["kind"] == "dependencies":
-                        self.controller.knowledge.ensure_dependencies(progress)
+                        self.controller.knowledge.ensure_dependencies(progress, stopped=stopped)
                     elif job["kind"] == "merge":
                         self.controller.knowledge.merge_all(progress, list(catalog.values()))
                     else:
                         self.controller.knowledge.change(job["key"])
+                except InterruptedError as exc:
+                    if not stopped():
+                        error = str(exc)
                 except Exception as exc:
                     error = str(exc)
                 self.dispatch(finish, error)

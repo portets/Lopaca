@@ -895,6 +895,11 @@ def _quote(text):
     return '"' + text.replace('"', '""') + '"'
 
 
+def _add_rank_votes(scores, keys, weight):
+    for rank, key in enumerate(keys, 1):
+        scores[key] = scores.get(key, 0.0) + weight / (60 + rank)
+
+
 def retrieve_memories(
     store, query, expansion="", previous_queries=(), *, expand=None, vector_rank=None
 ):
@@ -919,8 +924,7 @@ def retrieve_memories(
                 "ORDER BY bm25(memory_search) LIMIT 20",
                 (" OR ".join(_quote(term) for term in words),),
             ).fetchall()
-            for rank, (memory_id,) in enumerate(rows, 1):
-                scores[memory_id] += weight / (60 + rank)
+            _add_rank_votes(scores, (memory_id for (memory_id,) in rows), weight)
         selected = sorted(scores, key=scores.get, reverse=True)[:6]
         records = {}
         if selected:
@@ -1364,9 +1368,21 @@ def _literal_terms(value):
     return tokens
 
 
+def _query_literals(query):
+    return {re.sub(r"\W+", "", term) for term in _terms(query)}
+
+
+def _literal_score(terms, numbers, literals):
+    """Use shared wording and exact values to separate nearby semantic matches."""
+    return (
+        0.10 * len(terms & literals) / max(1, len(terms))
+        + 0.075 * len(numbers & literals) / max(1, len(numbers))
+    )
+
+
 def _coherent_results(query, rows, text):
     """Prefer corroborated matches over single-word tangents for short queries."""
-    terms = {re.sub(r"\W+", "", term) for term in _terms(query)}
+    terms = _query_literals(query)
     if not 2 <= len(terms) <= 3:
         return rows
     counts = [len(terms & _literal_terms(text(row))) for row in rows]
@@ -1544,10 +1560,8 @@ def _rank(
         for rank, (rowid,) in enumerate(hits, 1):
             ranks[rowid] = max(ranks[rowid], 0.7 / (60 + rank))
     for weight, expression in expressions:
-        for rank, (rowid,) in enumerate(
-            _search(connection, expression, max(1, settings.rag_candidates), sources), 1
-        ):
-            ranks[rowid] += weight / (60 + rank)
+        hits = _search(connection, expression, max(1, settings.rag_candidates), sources)
+        _add_rank_votes(ranks, (rowid for (rowid,) in hits), weight)
     if not ranks:
         return []
     # Complementary searches often find the same passages. Decode each candidate once.
