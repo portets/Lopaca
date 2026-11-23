@@ -3273,13 +3273,33 @@ class ChatWindow(Adw.ApplicationWindow):
         self._embedding_row = self._model_row_controls(
             row,
             "Embedding Model",
-            self.controller.download_embedding,
-            self.controller.select_embedding,
-            lambda: self._confirm_model_removal(asset.name, self.controller.delete_embedding),
+            lambda: self._change_embedding("Install", self.controller.download_embedding),
+            lambda active: self._change_embedding(
+                "Enable" if active else "Disable",
+                lambda: self.controller.select_embedding(active),
+            ),
+            lambda: self._change_embedding("Remove", self.controller.delete_embedding),
             "embedding",
         )
         group.add(row)
         return group
+
+    def _change_embedding(self, action, apply):
+        recommended = MODEL_RECOMMENDATIONS[self.controller.model_recommendation()].embedding
+        enabling = action in ("Install", "Enable")
+        if enabling == recommended:
+            if action == "Remove":
+                self._confirm_model_removal(EMBEDDING_DOWNLOAD.name, apply)
+            else:
+                apply()
+            return
+        # The switch should show the current state while the user decides.
+        self.refresh_model_configuration()
+        message = (
+            "Gives better results but not recommended for users without a GPU."
+            if enabling else "The embedding model gives Lopaca better and faster results."
+        )
+        self._confirm_model_action("Are you sure?", message, action, apply)
 
     def _refresh_vision_rows(self, config, rule, external):
         folder = self.controller.store.root.parent
@@ -3314,9 +3334,9 @@ class ChatWindow(Adw.ApplicationWindow):
                 row.add_css_class("dim-label")
             enabled = bool(
                 compatible
-                and vision_file_precision(folder, family, projector)
+                and installed
+                and (not projector or vision_file_precision(folder, family, projector))
                 and family not in config.get("vision_disabled", ())
-                and Path(projector).expanduser().is_file()
             )
             with switch.handler_block(handler):
                 switch.set_active(enabled)
@@ -3357,9 +3377,12 @@ class ChatWindow(Adw.ApplicationWindow):
                 row,
                 "Vision Files",
                 lambda family=family: self.controller.download_vision(family),
-                lambda active, family=family: self.controller.select_vision(family, active),
-                lambda family=family: self._confirm_model_removal(
-                    f"the downloaded Qwen {family} Vision files",
+                lambda active, family=family: self._change_vision(
+                    "Enable" if active else "Disable",
+                    lambda: self.controller.select_vision(family, active),
+                ),
+                lambda family=family: self._change_vision(
+                    "Remove",
                     lambda: self.controller.delete_vision(family),
                 ),
                 "vision",
@@ -3367,6 +3390,17 @@ class ChatWindow(Adw.ApplicationWindow):
             self._vision_group.add(row)
         self._add_custom_file_button(self._vision_group, "mmproj", "vision file")
         return self._vision_group
+
+    def _change_vision(self, action, apply):
+        if action == "Enable":
+            apply()
+            return
+        self.refresh_model_configuration()
+        self._confirm_model_action(
+            "Are you sure?",
+            "Vision models are not actually loaded and used until you send the assistant an image.",
+            action, apply,
+        )
 
     def _model_row_controls(self, row, label, on_download, on_select, on_remove, kind):
         row.add_css_class("knowledge-packs-row")
@@ -3492,13 +3526,27 @@ class ChatWindow(Adw.ApplicationWindow):
         remove = self._list_remove_button("Remove custom entry")
 
         def toggled(button, _):
-            self.controller.select_custom_model_file(kind, path, button.get_active())
+            active = button.get_active()
+            if kind == "mmproj":
+                self._change_vision(
+                    "Enable" if active else "Disable",
+                    lambda: self.controller.select_custom_model_file(kind, path, active),
+                )
+            else:
+                self.controller.select_custom_model_file(kind, path, active)
             self.refresh_model_configuration()
 
         toggle_handler = toggle.connect("notify::active", toggled)
-        remove.connect("clicked", lambda *_: self.controller.select_custom_model_file(
-            kind, path, False, remove=True
-        ))
+        def remove_file(*_):
+            def apply():
+                self.controller.select_custom_model_file(kind, path, False, remove=True)
+
+            if kind == "mmproj":
+                self._change_vision("Remove", apply)
+            else:
+                apply()
+
+        remove.connect("clicked", remove_file)
         row.add_suffix(toggle)
         row.add_suffix(remove)
         return row, toggle, toggle_handler, remove
@@ -3551,22 +3599,25 @@ class ChatWindow(Adw.ApplicationWindow):
         )
 
     def _confirm_model_removal(self, name, remove):
+        self._confirm_model_action(
+            "Remove model?", f"Remove {name} from this computer?", "Remove", remove
+        )
+
+    def _confirm_model_action(self, heading, message, action, apply):
         if self._model_remove_dialog is not None:
             return
-        alert = Adw.AlertDialog(
-            heading="Remove model?",
-            body=f"Remove {name} from this computer?",
-        )
+        alert = Adw.AlertDialog(heading=heading, body=message)
         alert.add_response("cancel", "Cancel")
-        alert.add_response("delete", "Remove")
+        alert.add_response("apply", action)
         alert.set_default_response("cancel")
         alert.set_close_response("cancel")
-        alert.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        if action == "Remove":
+            alert.set_response_appearance("apply", Adw.ResponseAppearance.DESTRUCTIVE)
 
         def chosen(alert, result):
             self._model_remove_dialog = None
-            if alert.choose_finish(result) == "delete":
-                remove()
+            if alert.choose_finish(result) == "apply":
+                apply()
                 self.refresh_model_configuration()
 
         self._model_remove_dialog = alert

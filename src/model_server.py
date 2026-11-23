@@ -117,8 +117,9 @@ def launch_command(config, server_url):
     args = [str(executable.resolve()), "--model", str(model.resolve())]
     family = config.get("vision_family")
     vision = config.get("mmproj")
-    if family:
-        # A managed model's projector source comes from the Vision settings.
+    vision_off = config.get("load_vision") is False or config.get("vision_fallback")
+    if family or vision_off:
+        # Keep vision unloaded for text-only chats, including manual launch flags.
         source_flags = {"-mm", "--mmproj", "-mmu", "--mmproj-url"}
         toggle_flags = {"--mmproj-auto", "--no-mmproj", "--no-mmproj-auto"}
         remaining = []
@@ -131,7 +132,7 @@ def launch_command(config, server_url):
             elif flag not in toggle_flags:
                 remaining.append(arg)
         extra = remaining
-        if family in config.get("vision_disabled", ()) or not vision:
+        if vision_off or family in config.get("vision_disabled", ()) or not vision:
             args.append("--no-mmproj")
             vision = None
     if vision:
@@ -317,7 +318,20 @@ class ModelServer:
                     self._restart_process()
                 replacing = False
                 try:
-                    if not self._launch(args, selected):
+                    try:
+                        started = self._launch(args, selected)
+                    except (OSError, RuntimeError):
+                        if not (selected.get("load_vision") and selected.get("vision_inferred")):
+                            raise
+                        selected["vision_fallback"] = True
+                        args = launch_command(selected, self.url)
+                        started = self._launch(args, selected)
+                        if started:
+                            self.on_error(
+                                "The inferred vision file could not be loaded. The model is "
+                                "running without vision. You can select a different file in Vision."
+                            )
+                    if not started:
                         return
                 except (OSError, RuntimeError) as exc:
                     if not installed or not self._backend_failed(installed["backend"], exc):
@@ -393,7 +407,10 @@ class ModelServer:
                         for key, value in os.environ.items()
                         if key not in {"LLAMA_ARG_MMPROJ", "LLAMA_ARG_MMPROJ_URL"}
                     }
-                    if config.get("vision_family")
+                    if (
+                        config.get("vision_family") or config.get("load_vision") is False
+                        or config.get("vision_fallback")
+                    )
                     else None
                 ),
             )

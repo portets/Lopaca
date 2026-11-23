@@ -70,6 +70,7 @@ from server_builds import (
     install_embedding,
     install_model,
     install_vision,
+    installed_vision_path,
     managed_server_file,
     managed_vision_file,
     model_download_path,
@@ -302,7 +303,7 @@ class ChatController:
             return managed_server_file(folder, path)
         if kind == "mmproj":
             return managed_vision_file(folder, path)
-        path = Path(path).expanduser()
+        path = Path(path or ".").expanduser()
         return any(path == model_path(folder, key) for key in MODEL_DOWNLOADS)
 
     def _register_existing_model_files(self, settings):
@@ -423,9 +424,13 @@ class ChatController:
             return
         if switching and kind == "executable":
             self._refresh_embedding_indexes()
-        if switching and config.get("model") and config.get("executable"):
+        running = self.model_server.running_config
+        inactive_vision = kind == "mmproj" and running and not (
+            running.get("load_vision") or self._chat_needs_vision(config, self._next_model_chat())
+        )
+        if switching and config.get("model") and config.get("executable") and not inactive_vision:
             self._connect_configured_model(config)
-        elif switching and self.model_server.running_config is not None:
+        elif switching and running and not inactive_vision:
             self.model_server.disconnect(lambda: self.view.dispatch(
                 self.view.refresh_model_configuration
             ))
@@ -496,11 +501,24 @@ class ChatController:
             config = self.model_server.running_config
             if config is None:
                 return None  # The connected server is owned by another process.
+            config = self._configured_vision_preferences(config)
             executable, version = self._reported_server_version or (None, None)
             if not config.get("version") and version and executable == config.get("executable"):
                 return {**config, "version": version}
             return config
         return self.store.load_app_settings().get("model_server", {})
+
+    def _configured_vision_preferences(self, running):
+        # A text-only server can keep running when the user changes vision preferences.
+        saved = self.store.load_app_settings().get("model_server", {})
+        if saved.get("model") == running.get("model"):
+            return running | {
+                key: saved[key] for key in (
+                    "mmproj", "mmproj_manual", "custom_projectors", "vision_disabled",
+                    "vision_precision",
+                ) if key in saved
+            }
+        return running
 
     def connect_model_server(self):
         self.cancel_chat_warm()
@@ -707,7 +725,9 @@ class ChatController:
         return self.model_server.connect(
             config if custom_model else {**config, "mmproj": "", "mmproj_manual": False},
             prepare=prepare,
-            prepare_config=self._prepare_model_vision,
+            prepare_config=lambda paths, stopped: self._prepare_model_vision(
+                paths, stopped, download=not installed
+            ),
             on_finished=on_finished,
             on_config=lambda paths: self.view.dispatch(save, paths),
         )
@@ -729,17 +749,21 @@ class ChatController:
                     raise
                 return None
 
-    def _prepare_model_vision(self, config, stopped, *, strict=False):
+    def _prepare_model_vision(self, config, stopped, *, strict=False, download=False):
         folder = self.store.root.parent
         model = config.get("model")
         if not model or not Path(model).expanduser().is_file():
             return config
         config = {**config, "recommendation": recommendation_for_config(config)}
+        config.pop("vision_fallback", None)
+        config.pop("vision_inferred", None)
+        config.pop("vision_family", None)
         if (projector := config.get("custom_projectors", {}).get(model)) and (
             Path(projector).expanduser().is_file()
         ):
             config.update(mmproj=projector, mmproj_manual=True)
         family = model_vision_family(folder, model)
+        config["load_vision"] = self._chat_needs_vision(config, self._next_model_chat())
         if not family:
             return config
         selected = {**config, "vision_family": family}
@@ -749,9 +773,24 @@ class ChatController:
         ):
             return selected
         chosen = vision_file_precision(folder, family, projector)
+        installed = installed_vision_path(folder, family, chosen or config.get("vision_precision"))
+        if not self._is_managed_asset("model", model):
+            if chosen and config.get("mmproj_manual") and Path(projector).is_file():
+                return selected
+            if installed and self._tier_recommends_vision_family(config, family):
+                return {
+                    **selected, "mmproj": str(installed), "vision_inferred": True,
+                    "vision_precision": vision_file_precision(folder, family, installed),
+                }
+            return {**selected, "mmproj": ""}
+        if not (selected["load_vision"] or strict or download):
+            return {**selected, "mmproj": str(installed) if installed else ""}
         if not strict and not MODEL_RECOMMENDATIONS[config["recommendation"]].vision:
-            if chosen and Path(projector).expanduser().is_file():
-                return {**selected, "vision_precision": chosen}
+            if installed:
+                return {
+                    **selected, "mmproj": str(installed),
+                    "vision_precision": vision_file_precision(folder, family, installed),
+                }
             return {**selected, "mmproj": ""}
         # Preserve explicit file choices, but let automatic selections follow the new backend.
         precision = (
@@ -772,6 +811,40 @@ class ChatController:
             self.view.dispatch(self.view._show_alert, "Vision download failed", str(exc))
             return {**selected, "mmproj": ""}
         return {**selected, "mmproj": str(path) if path and path.is_file() else ""}
+
+    def _tier_recommends_vision_family(self, config, family):
+        rule = MODEL_RECOMMENDATIONS[config.get("recommendation") or self.model_recommendation()]
+        return rule.vision and any(
+            MODEL_DOWNLOADS[key].vision_family == family
+            for key in (rule.balanced, rule.faster, rule.better)
+        )
+
+    def _next_model_chat(self):
+        if self._pending_messages:
+            return self._pending_messages[0][0]
+        return self.chat["id"] if self.chat else None
+
+    def _chat_needs_vision(self, config, chat_id):
+        if not chat_id or self.store.load_settings(chat_id).get("vision_needed") is not True:
+            return False
+        folder = self.store.root.parent
+        model = config.get("model")
+        family = model_vision_family(folder, model)
+        if family in config.get("vision_disabled", ()):
+            return False
+        projector = config.get("custom_projectors", {}).get(model) or config.get("mmproj")
+        if projector and Path(projector).expanduser().is_file():
+            return True
+        if family and model and self._is_managed_asset("model", model):
+            profile = config.get("recommendation") or self.model_recommendation()
+            rule = MODEL_RECOMMENDATIONS[profile]
+            return rule.vision or installed_vision_path(folder, family) is not None
+        return bool(
+            (family and self._tier_recommends_vision_family(config, family))
+            or re.search(
+                r"(?:^|\s)(?:--mmproj|-mm|--mmproj-url|-mmu)(?:\s|=)", config.get("extra", "")
+            )
+        )
 
     def _save_vision_settings(self, original, paths, update_preference=False):
         config = self.store.load_app_settings().get("model_server", {})
@@ -808,12 +881,18 @@ class ChatController:
             disabled.discard(family)
             if not managed_vision_file(self.store.root.parent, selected.get("mmproj")):
                 selected.update(mmproj="", mmproj_manual=False)
+            folder = self.store.root.parent
+            if not self._is_managed_asset("model", selected.get("model")) and (
+                projector := installed_vision_path(folder, family, selected.get("vision_precision"))
+            ):
+                selected.update(mmproj=str(projector), mmproj_manual=True)
             selected["custom_projectors"] = {
                 model: projector for model, projector in saved.get("custom_projectors", {}).items()
                 if model != selected.get("model")
             }
         else:
             disabled.add(family)
+        selected["vision_disabled"] = sorted(disabled)
 
         def save(paths):
             if active and selected["custom_projectors"] != saved.get("custom_projectors", {}):
@@ -822,8 +901,14 @@ class ChatController:
             if on_config is not None:
                 on_config()
 
+        running = self.model_server.running_config or {}
+        if not running.get("load_vision") and not self._chat_needs_vision(
+            selected, self._next_model_chat()
+        ):
+            save(selected)
+            return
         self.model_server.connect(
-            {**selected, "vision_disabled": sorted(disabled)},
+            selected,
             prepare_config=lambda config, stopped: self._prepare_model_vision(
                 config, stopped, strict=True
             ),
@@ -866,17 +951,16 @@ class ChatController:
                 running = self.model_server.running_config or {}
                 if (
                     "mmproj" in changes and running.get("model") == saved.get("model")
+                    and running.get("load_vision")
                     and self.model_switch_target is None
                     and (running.get("mmproj") != str(path)
                          or family in running.get("vision_disabled", ()))
                 ):
-                    key = next(
-                        (key for key in MODEL_DOWNLOADS if str(model_path(folder, key))
-                         == running.get("model")),
-                        None,
-                    )
+                    key = self._running_model_key(running)
                     if key is not None:
                         self.request_model_switch(key, reload=True)
+                else:
+                    self._drain_messages()
             finally:
                 self.view.refresh_model_configuration()
 
@@ -1293,6 +1377,8 @@ class ChatController:
         self.view.update_send_button()
         if self.model_switch_target is not None:
             self.view.schedule_model_switch()
+        elif not self._pending_messages:
+            self._schedule_chat_warm()
 
     def select_model(self, key, active):
         config = self.model_configuration()
@@ -1386,7 +1472,10 @@ class ChatController:
         model_download_path(folder, key).unlink(missing_ok=True)
 
     def _save_downloaded_model(self, paths):
-        paths = {key: value for key, value in paths.items() if key != "vision_family"}
+        paths = {
+            key: value for key, value in paths.items()
+            if key not in {"vision_family", "load_vision", "vision_inferred", "vision_fallback"}
+        }
         settings = self.store.load_app_settings()
         config = settings.get("model_server", {}) | paths
         settings["model_server"] = config
@@ -1593,6 +1682,7 @@ class ChatController:
                 self.store.save_app_settings(app_settings)
             except OSError as exc:
                 self.view.notify(f"Could not save active chat: {exc}")
+        self._drain_messages()
         self._schedule_chat_warm()
 
     def cancel_chat_warm(self):
@@ -1606,6 +1696,7 @@ class ChatController:
             or self.busy
             or self.model_server.busy
             or self.model_switch_target is not None
+            or self.switching_model
         ):
             return
         chat = self.chat
@@ -1957,14 +2048,12 @@ class ChatController:
         timestamp = time.time()
         message = {"role": "user", "content": text, "timestamp": timestamp}
         attachment_names = {}
-        images, documents = [], []
+        images = self._attached_images(attached)
+        documents = []
         for path in attached:
             name, folder_suffix, _ = path.removeprefix("documents/").partition("/")
             attachment_names.setdefault(name + folder_suffix, None)
-            if image_mime_type(path):
-                if not folder_suffix:  # A folder import may contain many unrelated images.
-                    images.append(path)
-            else:
+            if not image_mime_type(path):
                 documents.append(path)
         if attachment_names:
             message["attachments"] = list(attachment_names)
@@ -2060,14 +2149,45 @@ class ChatController:
             messages.append(item)
         return messages
 
+    @staticmethod
+    def _attached_images(paths):
+        # A folder import may contain many unrelated images.
+        return [
+            path for path in paths
+            if "/" not in path.removeprefix("documents/") and image_mime_type(path)
+        ]
+
+    def _sync_chat_vision(self, chat_id):
+        running = self.model_server.running_config
+        if self.external_model_server or not running or not chat_id:
+            return False
+        desired = self._chat_needs_vision(self._configured_vision_preferences(running), chat_id)
+        if desired == bool(running.get("load_vision")):
+            return False
+        key = self._running_model_key(running)
+        if key is None:
+            return False
+        self.request_model_switch(key, reload=True)
+        return True
+
+    def _running_model_key(self, running):
+        path = Path(running.get("model") or ".").expanduser()
+        for key in self.installed_models():
+            if self.installed_model_path(key) == path:
+                return key
+        return None
+
     def _drain_messages(self):
         while (
             self.connected
             and not self.busy
             and not self.model_server.busy
+            and not self.switching_model
             and self.model_switch_target is None
-            and self._pending_messages
         ):
+            if not self._pending_messages:
+                self._sync_chat_vision(self._next_model_chat())
+                return
             chat_id, text, steering, attachments = self._pending_messages[0]
             if not self.store.folder(chat_id).exists():
                 self._pending_messages.popleft()
@@ -2075,8 +2195,14 @@ class ChatController:
             # Wait for the copy results so the saved bubble describes what was attached.
             if any(not batch.done() for batch in attachments):
                 return
-            self._pending_messages.popleft()
             attached = [path for batch in attachments for path in batch.result()]
+            if self._attached_images(attached):
+                settings = self.store.load_settings(chat_id)
+                if settings.get("vision_needed") is not True:
+                    self.store.save_settings(chat_id, {**settings, "vision_needed": True})
+            if self._sync_chat_vision(chat_id):
+                return
+            self._pending_messages.popleft()
             if text or attached:
                 self._send_message(chat_id, text, steering, attached)
 

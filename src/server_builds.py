@@ -623,7 +623,7 @@ def model_download_path(folder, key):
 
 def model_vision_family(folder, filename):
     path = Path(filename or ".").expanduser()
-    return next(
+    managed = next(
         (
             asset.vision_family
             for key, asset in MODEL_DOWNLOADS.items()
@@ -631,6 +631,26 @@ def model_vision_family(folder, filename):
         ),
         "",
     )
+    if managed:
+        return managed
+    match = re.search(
+        r"(?i)(?:^|[^a-z0-9])qwen[ -]?3[._-]([58])[ _-]+(9|27)b(?=$|[^a-z0-9])", path.stem
+    )
+    families = {("5", "9"): "3.5", ("8", "27"): "3.8"}
+    family = families.get(match.groups()) if match else None
+    if family and any(
+        asset.vision_family == family and model_path(folder, key).is_file()
+        for key, asset in MODEL_DOWNLOADS.items()
+    ) and installed_vision_path(folder, family):
+        return family
+    return ""
+
+
+def installed_vision_path(folder, family, preferred=None):
+    for precision in dict.fromkeys((preferred, *VISION_DOWNLOADS[family])):
+        if precision and (path := vision_path(folder, family, precision)).is_file():
+            return path
+    return None
 
 
 def vision_path(folder, family, precision):
