@@ -47,6 +47,11 @@ from memory import (
     view_memories,
 )
 from model_server import ModelServer
+from optional_features import (
+    install_optional_features,
+    launch_with_optional_python,
+    optional_features_ready,
+)
 from rag import (
     DocumentIndexer,
     MissingDocumentLibraryError,
@@ -74,6 +79,7 @@ from server_builds import (
     vision_path,
 )
 from settings import (
+    APP_DIR,
     CHAT_SETTING_DEFAULTS,
     MODEL_DOWNLOADS,
     MODEL_RECOMMENDATIONS,
@@ -150,7 +156,7 @@ class ChatController:
             self._model_lock,
             lambda active: self.view.dispatch(self.view.set_document_processing, active),
             lambda message: self.view.dispatch(
-                self.view._show_alert, "Document library required", message
+                self.view._show_alert, "Document dependency required", message
             ),
             on_indexed=self.recall_embeddings.schedule,
         )
@@ -188,6 +194,7 @@ class ChatController:
         self.model_switch_target = None
         self.switching_model = False
         self.model_file_download = None
+        self.optional_features_stage = None
         self.download_cancels = {
             kind: threading.Event() for kind in ("model", "vision", "embedding")
         }
@@ -312,7 +319,7 @@ class ChatController:
             on_config=configured,
         )
 
-    def download_default_model(self, *, reconfigure=False):
+    def download_default_model(self, *, reconfigure=False, optional_features=False):
         owned = self.model_server.running_config is not None
         if (
             (self.connected and not (reconfigure and owned))
@@ -324,7 +331,45 @@ class ChatController:
         if reconfigure and self._model_selection_busy():
             return
         if self._connect_default_model(self.store.load_app_settings().get("model_server", {})):
+            if optional_features:
+                self.download_optional_features()
             self._finish_first_launch()
+
+    def optional_features_installed(self):
+        return optional_features_ready(self.store.root.parent)
+
+    def download_optional_features(self):
+        stopped = self._model_file_stop.is_set
+        if self.optional_features_stage or stopped() or self.optional_features_installed():
+            return
+
+        def set_stage(stage):
+            self.optional_features_stage = stage
+            self.view.refresh_optional_features()
+
+        def finish(error):
+            set_stage(None)
+            if error:
+                self.view._show_alert("Could not install optional features", error)
+            elif self.optional_features_installed():
+                self.view.notify("Optional features installed. Restart Lopaca to use them.")
+
+        def run():
+            error = None
+            try:
+                install_optional_features(
+                    self.store.root.parent, stopped,
+                    lambda stage: self.view.dispatch(set_stage, stage),
+                )
+            except (
+                OSError, ValueError, RuntimeError, HTTPException, subprocess.SubprocessError
+            ) as exc:
+                error = str(exc)
+            if not stopped():
+                self.view.dispatch(finish, error)
+
+        set_stage("Installing")
+        threading.Thread(target=run, daemon=True).start()
 
     def _finish_first_launch(self):
         if not self.first_launch:
@@ -1307,7 +1352,12 @@ class ChatController:
                 if item.is_dir() or item.is_symlink():
                     continue
                 try:
-                    if not image_mime_type(item) and read_document(item) is None:
+                    if not image_mime_type(item) and read_document(
+                        item, validate_only=True,
+                        on_warning=lambda error: self.document_indexer.warn_missing_dependency(
+                            destination, error
+                        ),
+                    ) is None:
                         skipped.append(item)
                     else:
                         supported.append((item, relative))
@@ -2192,6 +2242,8 @@ class ChatController:
 
 
 def main():
+    with suppress(OSError):
+        launch_with_optional_python(APP_DIR)
     from ui import Lopaca
 
     Lopaca(ChatController(Settings())).run(None)

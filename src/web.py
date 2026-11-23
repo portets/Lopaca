@@ -1,18 +1,24 @@
 """Internet downloads for reply images and knowledge packs."""
 
+import atexit
 import hashlib
 import http.client
 import shutil
 import socket
 import ssl
+import subprocess
+import sys
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, suppress
+from importlib.util import find_spec
 from ipaddress import ip_address
 from itertools import islice
+from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 from threading import Event
 from time import monotonic
-from urllib.parse import quote, urljoin, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit
 from urllib.request import Request, urlopen
 
 from images import IMAGE_SIZE_LIMIT, supported_image_mimes
@@ -35,6 +41,35 @@ _HEADERS = {
     "Accept": "image/*",
     "User-Agent": "Lopaca (https://github.com/portets/Lopaca)",
 }
+_XET_WORKER = """
+import os
+import sys
+from importlib.metadata import version
+
+# Xet 1.7+ sizes high-performance buffers to available memory.
+if tuple(map(int, version("hf_xet").split(".")[:2])) >= (1, 7):
+    os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+from huggingface_hub import constants, get_hf_file_metadata, hf_hub_download
+from tqdm.auto import tqdm
+
+url, repo_type, repo, revision, filename, folder, size = sys.argv[1:]
+size = int(size)
+if constants.HF_HUB_DISABLE_XET:
+    sys.exit(1)
+metadata = get_hf_file_metadata(url, token=False)
+if not metadata.xet_file_data or metadata.size != size:
+    sys.exit(1)
+
+class DownloadProgress(tqdm):
+    def display(self, *args, **kwargs):
+        if self.total == size:
+            print(int(self.n), flush=True)
+
+hf_hub_download(
+    repo, filename, repo_type=repo_type, revision=metadata.commit_hash or revision,
+    local_dir=folder, token=False, tqdm_class=DownloadProgress,
+)
+"""
 
 
 def fetch_knowledge_catalog():
@@ -154,6 +189,74 @@ def _download_ranges(url, path, size, offset, digest, stopped, on_progress):
     return offset
 
 
+def _huggingface_file(url):
+    parsed = urlsplit(url)
+    if (parsed.scheme, parsed.netloc) != ("https", "huggingface.co"):
+        return None
+    parts = parsed.path.strip("/").split("/")
+    repo_type = parts.pop(0).removesuffix("s") if parts[0] in {"datasets", "spaces"} else "model"
+    if len(parts) < 5 or parts[2] != "resolve":
+        return None
+    filename = unquote("/".join(parts[4:]))
+    if PurePosixPath(filename).is_absolute() or ".." in PurePosixPath(filename).parts:
+        return None
+    return repo_type, "/".join(parts[:2]), unquote(parts[3]), filename
+
+
+def _download_xet(url, path, size, sha256, stopped, on_progress):
+    if not (file := _huggingface_file(url)) or not all(
+        find_spec(name) for name in ("hf_xet", "huggingface_hub")
+    ):
+        return False
+    # Preserve the existing startup signal for restarting interrupted model downloads.
+    path.touch()
+    # Isolate the native transfer so Stop can terminate it. local_dir keeps the file on
+    # the destination filesystem and lets us publish it with a rename, without a cache copy.
+    with TemporaryDirectory(prefix=".xet-", dir=path.parent) as staging:
+        progress_path = Path(staging) / "progress"
+        local_dir = Path(staging) / "download"
+        with (
+            progress_path.open("w") as output,
+            progress_path.open() as updates,
+            subprocess.Popen(
+                [sys.executable, "-c", _XET_WORKER, url, *file, str(local_dir), str(size)],
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+            ) as process,
+        ):
+            received = 0
+            atexit.register(process.kill)
+            try:
+                while process.poll() is None:
+                    if stopped():
+                        raise InterruptedError("Download cancelled.")
+                    for update in updates:
+                        if update.strip().isdigit():
+                            current = min(int(update), size - 1)
+                            if on_progress and current > received:
+                                on_progress(current, size)
+                            received = max(received, current)
+                    with suppress(subprocess.TimeoutExpired):
+                        process.wait(timeout=0.2)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                atexit.unregister(process.kill)
+        if stopped():
+            raise InterruptedError("Download cancelled.")
+        if process.returncode:
+            if on_progress and received:
+                on_progress(0, size)
+            return False
+        downloaded = local_dir / file[-1]
+        if not matches_download(downloaded, size=size, sha256=sha256, stopped=stopped):
+            raise DownloadChecksumError("Xet download failed size or checksum verification.")
+        downloaded.replace(path)
+        if on_progress:
+            on_progress(size, size)
+        return True
+
+
 def download_verified_file(url, path, *, size, sha256, on_progress=None, stopped=lambda: False):
     """Resume a staged download and check its advertised size and checksum."""
     offset = path.stat().st_size if path.exists() else 0
@@ -166,6 +269,11 @@ def download_verified_file(url, path, *, size, sha256, on_progress=None, stopped
     digest = _hash_file(path, stopped) if offset else hashlib.sha256()
     if stopped():
         raise InterruptedError("Download cancelled.")
+    # Keep existing HTTP partials resumable and leave small transfers on the lightweight path.
+    if not offset and size >= _RANGE_MINIMUM_SIZE and _download_xet(
+        url, path, size, sha256, stopped, on_progress
+    ):
+        return
     if size - offset >= _RANGE_MINIMUM_SIZE:
         offset = _download_ranges(url, path, size, offset, digest, stopped, on_progress)
     if offset < size:

@@ -14,8 +14,11 @@ import lzma
 import math
 import queue
 import re
+import shutil
 import sqlite3
 import stat
+import subprocess
+import sys
 import tarfile
 import threading
 import time
@@ -25,8 +28,10 @@ from collections import defaultdict
 from contextlib import closing, nullcontext, suppress
 from email import policy
 from email.parser import BytesParser
+from functools import partial
 from html.parser import HTMLParser
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 QUERY_EXPANSION_INSTRUCTION = (
     "Return up to six comma-separated search terms or short phrases for the current question: "
@@ -153,12 +158,14 @@ class DocumentIndexer:
             if stopped():
                 break
 
-    def _missing_document(self, path, error):
-        key = (path.parent, str(error))
-        if key not in self._missing_libraries:
+    def warn_missing_dependency(self, folder, error):
+        key = (folder, str(error))
+        with self._lock:
+            if key in self._missing_libraries:
+                return
             self._missing_libraries.add(key)
-            if self._on_missing:
-                self._on_missing(str(error))
+        if self._on_missing:
+            self._on_missing(str(error))
 
     def _run(self):
         while True:
@@ -174,7 +181,8 @@ class DocumentIndexer:
                 if folder.is_dir():
                     with closing(_connect_index(folder.parent / "documents.sqlite")) as connection:
                         changed = _index(
-                            connection, folder, self.settings, lambda: False, self._missing_document
+                            connection, folder, self.settings, lambda: False,
+                            partial(self.warn_missing_dependency, folder),
                         )
                         if self._on_indexed and (changed or folder == self.active_folder):
                             self._on_indexed(folder.parent / "documents.sqlite")
@@ -392,7 +400,11 @@ PDF_SIZE_LIMIT = 64 * 1024 * 1024
 _PDF_PAGE_HEADING = re.compile(r"# (PDF page [1-9]\d*)\s*$")
 
 
-class MissingDocumentLibraryError(ValueError):
+class MissingDocumentDependencyError(ValueError):
+    pass
+
+
+class MissingDocumentLibraryError(MissingDocumentDependencyError):
     def __init__(self, suffix, package):
         super().__init__(
             f"Warning: {suffix} files require the {package} library. "
@@ -529,21 +541,75 @@ def _optional_document_library(suffix, module_name, package):
         raise
 
 
-def _formatted_document_text(source, suffix):
+def _ocr_pdf_pages(source, module, scanned_pages, pages):
+    with TemporaryDirectory(prefix="lopaca-ocr-") as folder:
+        original = Path(folder) / "source.pdf"
+        output = Path(folder) / "ocr.pdf"
+        source.seek(0)
+        with original.open("wb") as stream:
+            shutil.copyfileobj(source, stream)
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "ocrmypdf", "--skip-text", "--output-type", "pdf",
+                "--optimize", "0", "--jobs", "2", "--pages",
+                ",".join(str(index + 1) for index in scanned_pages), str(original), str(output),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        if result.returncode:
+            raise ValueError(result.stderr.strip()[-1000:] or "OCRmyPDF failed")
+        with output.open("rb") as stream:
+            document = module.PdfReader(stream)
+            for index in scanned_pages:
+                pages[index] = (document.pages[index].extract_text() or "").strip()
+
+
+def _pdf_text(source, module, heading, *, validate_only, on_warning):
+    if source.seek(0, io.SEEK_END) > PDF_SIZE_LIMIT:
+        raise ValueError(f"PDF exceeds the {PDF_SIZE_LIMIT // (1024 * 1024)} MiB limit")
+    source.seek(0)
+    document = module.PdfReader(source)
+    if document.is_encrypted:
+        raise ValueError("Encrypted PDFs are unsupported")
+    pages = [(page.extract_text() or "").strip() for page in document.pages]
+    if importlib.util.find_spec("ocrmypdf"):
+        scans = [
+            index for index, (page, text) in enumerate(zip(document.pages, pages, strict=True))
+            if not text and page.images
+        ]
+        if scans:
+            tesseract = shutil.which("tesseract")
+            if not tesseract:
+                error = MissingDocumentDependencyError(
+                    "Install Tesseract (tesseract-ocr) for PDF image support in scanned documents."
+                )
+                if on_warning:
+                    on_warning(error)
+                elif not any(pages):
+                    raise error
+            if validate_only:
+                return ""  # Accept the scan and leave OCR to the background indexer.
+            if tesseract:
+                try:
+                    _ocr_pdf_pages(source, module, scans, pages)
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    logging.warning("Could not OCR scanned PDF pages: %s", exc)
+    lines = [heading]
+    for number, text in enumerate(pages, 1):
+        if text:
+            lines.extend(("", f"# PDF page {number}", text))
+    return "\n".join(lines) if len(lines) > 1 else None
+
+
+def _formatted_document_text(source, suffix, *, validate_only=False, on_warning=None):
     module = _optional_document_library(suffix, *DOCUMENT_LIBRARIES[suffix])
     lines = ["Extracted document text; line numbers refer to this extraction."]
     if suffix == ".pdf":
-        if source.seek(0, io.SEEK_END) > PDF_SIZE_LIMIT:
-            raise ValueError(f"PDF exceeds the {PDF_SIZE_LIMIT // (1024 * 1024)} MiB limit")
-        source.seek(0)
-        document = module.PdfReader(source)
-        if document.is_encrypted:
-            raise ValueError("Encrypted PDFs are unsupported")
-        for number, page in enumerate(document.pages, 1):
-            page_text = (page.extract_text() or "").strip()
-            if page_text:
-                lines.extend(("", f"# PDF page {number}", page_text))
-        return "\n".join(lines) if len(lines) > 1 else None
+        return _pdf_text(
+            source, module, lines[0], validate_only=validate_only, on_warning=on_warning
+        )
     if suffix == ".rtf":
         data = source.read()
         if not data.lstrip().startswith(b"{\\rtf"):
@@ -774,16 +840,19 @@ def _archive_text(source, suffix):
     return "\n\n".join(parts) if len(parts) > 2 else None
 
 
-def read_document(path):
+def read_document(path, *, validate_only=False, on_warning=None):
     """Read common text encodings, skipping likely binary and unsupported documents."""
     try:
         with path.open("rb") as source:
-            return read_document_stream(source, suffix=document_suffix(path))
+            return read_document_stream(
+                source, suffix=document_suffix(path), validate_only=validate_only,
+                on_warning=on_warning,
+            )
     except OSError:
         return None
 
 
-def read_document_stream(source, *, suffix=""):
+def read_document_stream(source, *, suffix="", validate_only=False, on_warning=None):
     """Decode a binary stream using the same text checks for RAG and file tools."""
     if suffix in ARCHIVE_SUFFIXES:
         try:
@@ -807,9 +876,11 @@ def read_document_stream(source, *, suffix=""):
             return (
                 _email_text(source, suffix)
                 if suffix in (".eml", ".mbox")
-                else _formatted_document_text(source, suffix)
+                else _formatted_document_text(
+                    source, suffix, validate_only=validate_only, on_warning=on_warning
+                )
             )
-        except MissingDocumentLibraryError:
+        except MissingDocumentDependencyError:
             raise
         except Exception as exc:
             logging.warning("Could not extract %s document: %s", suffix, exc)
@@ -1209,6 +1280,19 @@ def _index(connection, folder, settings, stopped, on_missing=None):
             connection.execute(
                 "INSERT OR REPLACE INTO index_state VALUES ('chunking', ?)", (signature,)
             )
+    # Revisit cached scans when optional features or Tesseract become available.
+    ocr_state = "off"
+    if importlib.util.find_spec("ocrmypdf"):
+        ocr_state = "ready" if shutil.which("tesseract") else "missing-tesseract"
+    if connection.execute("SELECT value FROM index_state WHERE key = 'pdf_ocr'").fetchone() != (
+        ocr_state,
+    ):
+        with connection:
+            if ocr_state != "off":
+                connection.execute("UPDATE files SET mtime_ns = -1 WHERE lower(path) GLOB '*.pdf'")
+            connection.execute(
+                "INSERT OR REPLACE INTO index_state VALUES ('pdf_ocr', ?)", (ocr_state,)
+            )
     cached = {
         path: (mtime, ctime, size)
         for path, mtime, ctime, size in connection.execute(
@@ -1228,13 +1312,13 @@ def _index(connection, folder, settings, stopped, on_missing=None):
             stamp = stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size
             if cached.get(name) == stamp:
                 continue
-            text = read_document(path)
+            text = read_document(path, on_warning=on_missing)
             after = path.stat()
             if stamp != (after.st_mtime_ns, after.st_ctime_ns, after.st_size):
                 continue  # Retry a file being edited on the next request.
-        except MissingDocumentLibraryError as exc:
+        except MissingDocumentDependencyError as exc:
             if on_missing:
-                on_missing(path, exc)
+                on_missing(exc)
             continue  # Leave it uncached so installing its reader permits a retry.
         except OSError:
             continue

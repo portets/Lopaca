@@ -51,6 +51,10 @@ gi.require_version("Gsk", "4.0")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gsk, Gtk, Pango  # noqa: E402
 
 ATTACH_DOCUMENTS_ICON = "mail-attachment-symbolic"
+OPTIONAL_FEATURES_TOOLTIP = (
+    "Downloads additional dependencies for document indexing, faster downloads, "
+    "and retrieval speedups."
+)
 ATTACHMENT_THUMBNAIL_SIZE = 64
 
 CSS = """
@@ -540,6 +544,9 @@ window.lopaca-main, .transcript-scroll, .transcript {
 .settings-row {
     /* Theme defaults; add overrides here when needed. */
 }
+.optional-features-row {
+    box-shadow: inset 0 0 0 2px @accent_color;
+}
 .settings-button {
     /* Theme defaults; add overrides here when needed. */
 }
@@ -877,11 +884,16 @@ class TranscriptViewport(Gtk.Viewport):
 
 class ChatWindow(Adw.ApplicationWindow):
     __gsignals__: ClassVar = {
-        "retrieval-settings-changed": (GObject.SignalFlags.RUN_LAST, None, ())
+        "retrieval-settings-changed": (GObject.SignalFlags.RUN_LAST, None, ()),
+        "optional-features-changed": (GObject.SignalFlags.RUN_LAST, None, ()),
     }
 
     def refresh_retrieval_settings(self):
         self.emit("retrieval-settings-changed")
+
+    def refresh_optional_features(self):
+        self.emit("optional-features-changed")
+        self.set_status(self._activity_status)
 
     def __init__(self, app, controller):
         super().__init__(application=app, title="Lopaca")
@@ -1443,6 +1455,10 @@ class ChatWindow(Adw.ApplicationWindow):
     def _display_status(self, text):
         if self._model_server_activity:
             text = self._model_server_activity
+        elif text in ("Ready", "Disconnected", "Not connected") and (
+            stage := self.controller.optional_features_stage
+        ):
+            text = f"{stage} optional features"
         if text == self._status_text:
             return
         self._status_text = text
@@ -1462,6 +1478,8 @@ class ChatWindow(Adw.ApplicationWindow):
             "Condensing context",
             "Connecting to model",
             DOWNLOADING_MODEL,
+            "Downloading optional features",
+            "Installing optional features",
         ):
             self._status_timer = GLib.timeout_add(650, self._animate_status)
 
@@ -2504,6 +2522,8 @@ class ChatWindow(Adw.ApplicationWindow):
         page.add_css_class("settings-page")
         page.connect("map", self._sync_native_scroll)
         dialog.add(page)
+        if chat_id is None:
+            page.add(self._optional_features_group(dialog))
         group = Adw.PreferencesGroup()
         group.add_css_class("settings-group")
         page.add(group)
@@ -2799,6 +2819,31 @@ class ChatWindow(Adw.ApplicationWindow):
             self._model_download[stage] = server, percent
         self.refresh_model_configuration()
 
+    def _optional_features_group(self, dialog):
+        group = Adw.PreferencesGroup()
+        group.add_css_class("settings-group")
+        row = Adw.ActionRow(title="Download Optional Features (Recommended)", activatable=True)
+        row.add_css_class("model-settings-summary-row")
+        row.add_css_class("optional-features-row")
+        row.set_tooltip_text(OPTIONAL_FEATURES_TOOLTIP)
+        arrow = Gtk.Image(icon_name="go-next-symbolic", valign=Gtk.Align.CENTER)
+        row.add_suffix(arrow)
+        indicator = add_operation_indicator(row, visible=False)
+        row.connect("activated", lambda *_: self.controller.download_optional_features())
+        group.add(row)
+
+        def refresh(*_):
+            stage = self.controller.optional_features_stage
+            group.set_visible(not self.controller.optional_features_installed())
+            row.set_activatable(stage is None)
+            arrow.set_visible(stage is None)
+            self._update_download_indicator(indicator, stage or "", bool(stage), None)
+
+        handler = self.connect("optional-features-changed", refresh)
+        dialog.connect("closed", lambda *_: self.disconnect(handler))
+        refresh()
+        return group
+
     def confirm_model_download(self, *, reconfigure=False):
         rule = MODEL_RECOMMENDATIONS[self.controller.model_recommendation()]
         model = MODEL_DOWNLOADS[rule.balanced]
@@ -2845,9 +2890,18 @@ class ChatWindow(Adw.ApplicationWindow):
         alert.add_response("yes", "Yes")
         alert.set_default_response("cancel")
         alert.set_close_response("cancel")
+        extras = Gtk.CheckButton(label="Download optional features?", active=True)
+        extras.set_tooltip_text(OPTIONAL_FEATURES_TOOLTIP)
+        extras.set_sensitive(
+            not self.controller.optional_features_installed()
+            and self.controller.optional_features_stage is None
+        )
+        alert.set_extra_child(extras)
         alert.connect(
             "response::yes",
-            lambda *_: self.controller.download_default_model(reconfigure=reconfigure),
+            lambda *_: self.controller.download_default_model(
+                reconfigure=reconfigure, optional_features=extras.get_active()
+            ),
         )
         alert.present(self)
 
