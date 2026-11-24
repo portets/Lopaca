@@ -318,7 +318,7 @@ MODEL_RECOMMENDATIONS = {
         vram_gib=32,
         cuda_compute=100,
         launch_parameters={
-            "ctx-size": 262144,
+            "ctx-size": 131072,
             "fit-target": 1024,
             "spec-draft-n-max": 3,
         }
@@ -334,7 +334,7 @@ MODEL_RECOMMENDATIONS = {
         ram_gib=32,
         cuda_compute=100,
         launch_parameters={
-            "ctx-size": 131072,
+            "ctx-size": 65536,
             "fit-target": 1024,
             "cache-ram": 16384,
             "spec-draft-n-max": 3,
@@ -350,7 +350,7 @@ MODEL_RECOMMENDATIONS = {
         vram_gib=24,
         cuda_compute=100,
         launch_parameters={
-            "ctx-size": 131072,
+            "ctx-size": 65536,
             "fit-target": 1024,
             "spec-draft-n-max": 3,
         }
@@ -366,7 +366,7 @@ MODEL_RECOMMENDATIONS = {
         ram_gib=32,
         cuda_compute=100,
         launch_parameters={
-            "ctx-size": 65536,
+            "ctx-size": 32768,
         }
     ),
     "blackwell-12gb": ModelRecommendation(
@@ -395,7 +395,7 @@ MODEL_RECOMMENDATIONS = {
         vram_gib=32,
         ram_gib=32,
         launch_parameters={
-            "ctx-size": 262144,
+            "ctx-size": 131072,
             "fit-target": 1024,
             "cache-ram": 16384,
             "spec-draft-n-max": 3,
@@ -410,7 +410,7 @@ MODEL_RECOMMENDATIONS = {
         backends=("cuda", "vulkan"),
         vram_gib=32,
         launch_parameters={
-            "ctx-size": 262144,
+            "ctx-size": 131072,
             "fit-target": 1024,
             "spec-draft-n-max": 3,
         }
@@ -425,7 +425,7 @@ MODEL_RECOMMENDATIONS = {
         vram_gib=24,
         ram_gib=32,
         launch_parameters={
-            "ctx-size": 131072,
+            "ctx-size": 65536,
             "fit-target": 1024,
             "cache-ram": 16384,
             "spec-draft-n-max": 3,
@@ -441,7 +441,7 @@ MODEL_RECOMMENDATIONS = {
         backends=("cuda", "vulkan"),
         vram_gib=24,
         launch_parameters={
-            "ctx-size": 131072,
+            "ctx-size": 65536,
             "fit-target": 1024,
             "spec-draft-n-max": 3,
         }
@@ -457,7 +457,7 @@ MODEL_RECOMMENDATIONS = {
         vram_gib=12,
         ram_gib=32,
         launch_parameters={
-            "ctx-size": 65536,
+            "ctx-size": 32768,
         }
     ),
     "gpu-12gb": ModelRecommendation(
@@ -485,7 +485,7 @@ MODEL_RECOMMENDATIONS = {
         vram_gib=8,
         ram_gib=32,
         launch_parameters={
-            "ctx-size": 32768,
+            "ctx-size": 16384,
             "cache-ram": 4096,
         }
     ),
