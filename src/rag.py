@@ -33,6 +33,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from images import pdf_renderer_available
+
 QUERY_EXPANSION_INSTRUCTION = (
     "Return up to six comma-separated search terms or short phrases for the current question: "
     "technical terms, synonyms or alternate names. Use recent_messages only to resolve references, "
@@ -541,13 +543,17 @@ def _optional_document_library(suffix, module_name, package):
         raise
 
 
-def _ocr_pdf_pages(source, module, scanned_pages, pages):
+def _ocr_pdf_pages(source, module, scanned_pages, pages, *, decrypted=None):
     with TemporaryDirectory(prefix="lopaca-ocr-") as folder:
         original = Path(folder) / "source.pdf"
         output = Path(folder) / "ocr.pdf"
-        source.seek(0)
         with original.open("wb") as stream:
-            shutil.copyfileobj(source, stream)
+            if decrypted is not None:
+                writer = module.PdfWriter(clone_from=decrypted)
+                writer.write(stream)
+            else:
+                source.seek(0)
+                shutil.copyfileobj(source, stream)
         result = subprocess.run(
             [
                 sys.executable, "-m", "ocrmypdf", "--skip-text", "--output-type", "pdf",
@@ -571,8 +577,8 @@ def _pdf_text(source, module, heading, *, validate_only, on_warning):
         raise ValueError(f"PDF exceeds the {PDF_SIZE_LIMIT // (1024 * 1024)} MiB limit")
     source.seek(0)
     document = module.PdfReader(source)
-    if document.is_encrypted:
-        raise ValueError("Encrypted PDFs are unsupported")
+    if document.is_encrypted and not document.decrypt(""):
+        raise ValueError("This PDF requires a password to open.")
     pages = [(page.extract_text() or "").strip() for page in document.pages]
     if importlib.util.find_spec("ocrmypdf"):
         scans = [
@@ -582,20 +588,31 @@ def _pdf_text(source, module, heading, *, validate_only, on_warning):
         if scans:
             tesseract = shutil.which("tesseract")
             if not tesseract:
+                # tesseract-ocr is the Debian/Ubuntu package name. Other distributions
+                # and platforms may use a different name or installation procedure.
+                vision_available = pdf_renderer_available()
                 error = MissingDocumentDependencyError(
-                    "Install Tesseract (tesseract-ocr) for PDF image support in scanned documents."
+                    "Lopaca and a vision-equipped model can view this image-based PDF, "
+                    "but for better support install tesseract-ocr."
+                    if vision_available else
+                    "Install Tesseract (tesseract-ocr) to make scanned PDF text searchable."
                 )
                 if on_warning:
                     on_warning(error)
-                elif not any(pages):
+                elif not vision_available and not any(pages):
                     raise error
             if validate_only:
                 return ""  # Accept the scan and leave OCR to the background indexer.
             if tesseract:
                 try:
-                    _ocr_pdf_pages(source, module, scans, pages)
+                    _ocr_pdf_pages(
+                        source, module, scans, pages,
+                        decrypted=document if document.is_encrypted else None,
+                    )
                 except (OSError, ValueError, subprocess.SubprocessError) as exc:
                     logging.warning("Could not OCR scanned PDF pages: %s", exc)
+    if validate_only:
+        return ""  # Image-only PDFs can still be opened by the page viewer.
     lines = [heading]
     for number, text in enumerate(pages, 1):
         if text:

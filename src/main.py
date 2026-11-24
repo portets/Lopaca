@@ -31,7 +31,7 @@ from agentic import (
 )
 from embeddings import RecallEmbeddings
 from history import HistoryIndex
-from images import image_mime_type
+from images import image_mime_type, pdf_page_reference, pdf_renderer_available
 from knowledge import KnowledgeStore
 from llama_client import (
     LlamaClient,
@@ -164,7 +164,7 @@ class ChatController:
             self._model_lock,
             lambda active: self.view.dispatch(self.view.set_document_processing, active),
             lambda message: self.view.dispatch(
-                self.view._show_alert, "Document dependency required", message
+                self.view._show_alert, "Document support", message
             ),
             on_indexed=self.recall_embeddings.schedule,
         )
@@ -749,7 +749,7 @@ class ChatController:
                     raise
                 return None
 
-    def _prepare_model_vision(self, config, stopped, *, strict=False, download=False):
+    def _prepare_model_vision(self, config, stopped, *, strict=False, download=False, chat_id=None):
         folder = self.store.root.parent
         model = config.get("model")
         if not model or not Path(model).expanduser().is_file():
@@ -763,7 +763,7 @@ class ChatController:
         ):
             config.update(mmproj=projector, mmproj_manual=True)
         family = model_vision_family(folder, model)
-        config["load_vision"] = self._chat_needs_vision(config, self._next_model_chat())
+        config["load_vision"] = self._chat_needs_vision(config, chat_id or self._next_model_chat())
         if not family:
             return config
         selected = {**config, "vision_family": family}
@@ -825,8 +825,13 @@ class ChatController:
         return self.chat["id"] if self.chat else None
 
     def _chat_needs_vision(self, config, chat_id):
-        if not chat_id or self.store.load_settings(chat_id).get("vision_needed") is not True:
-            return False
+        return (
+            bool(chat_id)
+            and self.store.load_settings(chat_id).get("vision_needed") is True
+            and self._can_load_vision(config)
+        )
+
+    def _can_load_vision(self, config):
         folder = self.store.root.parent
         model = config.get("model")
         family = model_vision_family(folder, model)
@@ -845,6 +850,37 @@ class ChatController:
                 r"(?:^|\s)(?:--mmproj|-mm|--mmproj-url|-mmu)(?:\s|=)", config.get("extra", "")
             )
         )
+
+    def _enable_pdf_vision(self, chat_id):
+        """Reload the owned chat server between model turns, while holding the model lock."""
+        running = self.model_server.running_config
+        if self.external_model_server or not running or self.stop_requested:
+            return False
+        config = self._configured_vision_preferences(running)
+        if not self._can_load_vision(config) or running.get("vision_fallback"):
+            return False
+        self._remember_chat_vision(chat_id)
+        finished = threading.Event()
+        if not self.model_server.connect(
+            config, on_finished=finished.set,
+            on_config=lambda paths: self.view.dispatch(self._save_vision_settings, config, paths),
+            prepare_config=lambda paths, stopped: self._prepare_model_vision(
+                paths, stopped, chat_id=chat_id
+            ),
+        ):
+            return False
+        finished.wait()
+        connected, props = self._probe_connection()
+        props = props or {}
+        self.client.vision_enabled = props.get("modalities", {}).get("vision") is True
+        capacity = props.get("default_generation_settings", {}).get("n_ctx")
+        if isinstance(capacity, int) and capacity > 0:
+            self.client.context_capacity = self._generation_context_capacity = capacity
+        self.view.dispatch(
+            self._apply_connection_probe, self.model_server.process, connected, props,
+            self.client.base_url,
+        )
+        return connected and self.client.vision_enabled and not self.stop_requested
 
     def _save_vision_settings(self, original, paths, update_preference=False):
         config = self.store.load_app_settings().get("model_server", {})
@@ -2051,6 +2087,8 @@ class ChatController:
         images = self._attached_images(attached)
         documents = []
         for path in attached:
+            if pdf_page_reference(path):
+                continue
             name, folder_suffix, _ = path.removeprefix("documents/").partition("/")
             attachment_names.setdefault(name + folder_suffix, None)
             if not image_mime_type(path):
@@ -2154,8 +2192,14 @@ class ChatController:
         # A folder import may contain many unrelated images.
         return [
             path for path in paths
-            if "/" not in path.removeprefix("documents/") and image_mime_type(path)
+            if "/" not in path.removeprefix("documents/")
+            and (image_mime_type(path) or pdf_page_reference(path))
         ]
+
+    def _remember_chat_vision(self, chat_id):
+        settings = self.store.load_settings(chat_id)
+        if settings.get("vision_needed") is not True:
+            self.store.save_settings(chat_id, {**settings, "vision_needed": True})
 
     def _sync_chat_vision(self, chat_id):
         running = self.model_server.running_config
@@ -2197,9 +2241,7 @@ class ChatController:
                 return
             attached = [path for batch in attachments for path in batch.result()]
             if self._attached_images(attached):
-                settings = self.store.load_settings(chat_id)
-                if settings.get("vision_needed") is not True:
-                    self.store.save_settings(chat_id, {**settings, "vision_needed": True})
+                self._remember_chat_vision(chat_id)
             if self._sync_chat_vision(chat_id):
                 return
             self._pending_messages.popleft()
@@ -2487,6 +2529,20 @@ class ChatController:
         def context_trimmed(removed):
             self._generation_context_start = initial_start + removed
 
+        pdf_relevant = (
+            any(path.lower().endswith(".pdf") for path in attached)
+            or any(".pdf, lines " in reference.lower() for reference, _ in retrieved)
+            or re.search(r"\bpdf\b", query, re.IGNORECASE)
+            or any(".pdf" in item["content"].lower() for item in history[-4:])
+        )
+        pdf_pages = bool(pdf_relevant and pdf_renderer_available() and (
+            self.client.vision_enabled or (
+                not self.external_model_server
+                and (running := self.model_server.running_config)
+                and self._can_load_vision(self._configured_vision_preferences(running))
+            )
+        ))
+        chat_id = self._generation_chat_id
         answer, reasoning, error = self.client.stream(
             messages,
             preserve_thinking,
@@ -2509,6 +2565,8 @@ class ChatController:
             on_waiting=lambda: setattr(self, "_generation_streaming", False),
             expand_context=self._generation_expanding,
             image_paths=images,
+            pdf_pages=pdf_pages,
+            enable_pdf_vision=lambda: self._enable_pdf_vision(chat_id),
         )
         finished_at = time.time()
         self._generation_answer_complete = not error and not self.stop_requested

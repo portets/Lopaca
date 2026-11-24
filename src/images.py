@@ -1,9 +1,16 @@
 """Image formats and conversion using the installed GdkPixbuf loaders."""
 
+import io
+import re
+from contextlib import closing
 from functools import cache
+from importlib.util import find_spec
 from pathlib import Path
+from threading import Lock
 
 IMAGE_SIZE_LIMIT = 16 * 1024 * 1024
+_PDFIUM_LOCK = Lock()
+_PDF_PAGE_REFERENCE = re.compile(r"(.+\.pdf)#page=([1-9][0-9]{0,8})\Z", re.IGNORECASE)
 _NATIVE_IMAGE_TYPES = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -110,3 +117,46 @@ def image_to_png(mime, data):
             f"Converted PNG exceeds the {IMAGE_SIZE_LIMIT // (1024 * 1024)} MiB limit."
         )
     return encoded
+
+
+def pdf_renderer_available():
+    return find_spec("pypdfium2") is not None and find_spec("PIL") is not None
+
+
+def pdf_page_reference(path):
+    match = _PDF_PAGE_REFERENCE.fullmatch(path)
+    return (match[1], int(match[2])) if match else None
+
+
+def pdf_page_image(source, number):
+    """Render one PDF page to PNG using the installed PDFium."""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as exc:
+        raise ValueError("Install Lopaca Optional Features to view PDF pages.") from exc
+    # PDFium cannot safely run concurrently in one process.
+    with _PDFIUM_LOCK:
+        try:
+            with pdfium.PdfDocument(source) as document:
+                count = len(document)
+                if type(number) is not int or not 1 <= number <= count:
+                    raise ValueError(f"Choose a PDF page between 1 and {count}.")
+                with closing(document[number - 1]) as page:
+                    width, height = page.get_size()
+                    if width <= 0 or height <= 0:
+                        raise ValueError("The PDF page has an invalid size.")
+                    scale = min(2.5, 2048 / max(width, height))
+                    with (
+                        closing(page.render(
+                            scale=scale, rev_byteorder=True,
+                            force_bitmap_format=pdfium.raw.FPDFBitmap_BGR,
+                        )) as bitmap,
+                        bitmap.to_pil() as image,
+                        io.BytesIO() as output,
+                    ):
+                        image.save(output, format="PNG", compress_level=1)
+                        return "image/png", output.getvalue()
+        except ImportError as exc:
+            raise ValueError("Install Lopaca Optional Features to render PDF pages.") from exc
+        except pdfium.PdfiumError as exc:
+            raise ValueError(f"Could not open PDF: {exc}") from exc

@@ -19,7 +19,14 @@ from functools import cache
 from pathlib import Path, PurePosixPath
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from images import NATIVE_IMAGE_MIMES, image_mime_type, image_to_png, read_image
+from images import (
+    NATIVE_IMAGE_MIMES,
+    image_mime_type,
+    image_to_png,
+    pdf_page_image,
+    pdf_page_reference,
+    read_image,
+)
 from rag import (
     ARCHIVE_SUFFIXES,
     PDF_SIZE_LIMIT,
@@ -58,7 +65,10 @@ RUNTIME_TOOLS = [GET_OSINFO_TOOL, GET_DATETIME_TOOL]
 
 
 def image_attachment_note(paths):
-    return "\n\n[Images attached to this message: " + json.dumps(paths, ensure_ascii=False) + "]"
+    note = "\n\n[Images attached to this message: " + json.dumps(paths, ensure_ascii=False) + "]"
+    if any(pdf_page_reference(path) for path in paths):
+        note += " PDF images use #page=N. Cite the PDF filename and that page number."
+    return note
 
 
 def get_osinfo():
@@ -166,6 +176,18 @@ VIEW_IMAGE_TOOL = _tool(
     ["path"],
 )
 
+VIEW_PDF_PAGE_TOOL = _tool(
+    "view_pdf_page",
+    "Inspect one PDF page visually when text is insufficient for a chart, diagram, scan, or "
+    "layout. Use read_file for extracted text. Page numbers start at 1. Cite the filename "
+    "and page number.",
+    {
+        "path": {"type": "string", "description": "PDF path starting with documents/."},
+        "page": {"type": "integer", "minimum": 1},
+    },
+    ["path", "page"],
+)
+
 
 def _line_excerpt(path, lines, start_line, line_count):
     if (
@@ -223,10 +245,23 @@ class DocumentFiles:
                     raise ValueError(f"File exceeds the {limit // (1024 * 1024)} MiB limit.")
                 result = read_document_stream(io.BytesIO(data), suffix=suffix)
         if result is None:
+            if suffix == ".pdf":
+                raise ValueError(
+                    "No searchable PDF text is available. Use view_pdf_page to inspect a scan "
+                    "if the tool is available."
+                )
             raise ValueError("Unsupported/binary document.")
         return result
 
     def image(self, name):
+        if page := pdf_page_reference(name):
+            filename, number = page
+            with self._open_file(filename) as (stream, size):
+                if size > PDF_SIZE_LIMIT:
+                    raise ValueError(
+                        f"PDF exceeds the {PDF_SIZE_LIMIT // (1024 * 1024)} MiB limit."
+                    )
+                return pdf_page_image(stream, number)
         mime = image_mime_type(name)
         if not mime:
             raise ValueError("Unsupported image format.")

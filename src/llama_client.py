@@ -14,7 +14,15 @@ from contextlib import closing, suppress
 from itertools import accumulate
 from pathlib import Path
 
-from agentic import FILE_TOOLS, RUNTIME_TOOLS, VIEW_IMAGE_TOOL, ChatFiles, handle_tool_call
+from agentic import (
+    FILE_TOOLS,
+    RUNTIME_TOOLS,
+    VIEW_IMAGE_TOOL,
+    VIEW_PDF_PAGE_TOOL,
+    ChatFiles,
+    handle_tool_call,
+)
+from images import pdf_page_reference
 from memory import VIEW_MEMORIES_TOOL, _fence_after, memory_review
 from rag import (
     DOCUMENT_QUESTIONS_INSTRUCTION,
@@ -117,10 +125,12 @@ def _stream_packet(data):
     return chunk
 
 
-def chat_tools(*, files, memories, vision=False):
+def chat_tools(*, files, memories, vision=False, pdf_pages=False):
     tools = RUNTIME_TOOLS + FILE_TOOLS if files else RUNTIME_TOOLS
     if files and vision:
         tools = [*tools, VIEW_IMAGE_TOOL]
+    if files and pdf_pages:
+        tools = [*tools, VIEW_PDF_PAGE_TOOL]
     return [*tools, VIEW_MEMORIES_TOOL] if memories else tools
 
 
@@ -673,6 +683,8 @@ class LlamaClient:
         on_waiting=None,
         expand_context=False,
         image_paths=(),
+        pdf_pages=False,
+        enable_pdf_vision=None,
     ):
         """Keep read-only tool exchanges local to this request, with bounded follow-ups."""
         with closing(_DebugCapture()) as self._capture:
@@ -691,6 +703,8 @@ class LlamaClient:
                         on_notice(f"Could not attach image {path}: {exc}")
                 if images:
                     history[-1] = {**history[-1], "image_parts": images}
+            elif any(pdf_page_reference(path) for path in image_paths):
+                on_notice("PDF page images need vision. Extracted PDF text is still available.")
             self._context_current = id(
                 next((m for m in reversed(history) if m["role"] == "user"), None)
             )
@@ -702,7 +716,8 @@ class LlamaClient:
             self.trimmed_knowledge_context = None
             self._context_retry = self._context_expanding = expand_context
             tools = chat_tools(
-                files=files is not None, memories=memory_view is not None, vision=vision
+                files=files is not None, memories=memory_view is not None, vision=vision,
+                pdf_pages=pdf_pages,
             )
             self._context_tools = tools
             self.last_context_used = None
@@ -804,12 +819,36 @@ class LlamaClient:
                         return answer, reasoning, None
                     tool_message = {"role": "tool", "tool_call_id": call["id"]}
                     name = call["function"]["name"]
-                    if name == "view_image" and vision:
+                    if (name == "view_image" and vision) or (name == "view_pdf_page" and pdf_pages):
                         try:
-                            path = json.loads(call["function"]["arguments"])["path"]
-                            image = _image_part(*files.view_image(path))
-                            tool_message["image_parts"] = [image]
-                            output = json.dumps({"path": path})
+                            arguments = json.loads(call["function"]["arguments"])
+                            path = arguments["path"]
+                            if name == "view_pdf_page":
+                                number = arguments["page"]
+                                if (
+                                    not isinstance(path, str) or not path.lower().endswith(".pdf")
+                                    or type(number) is not int or not 1 <= number <= 999_999_999
+                                ):
+                                    raise ValueError(
+                                        "Choose a PDF path and a positive page number."
+                                    )
+                                image = files.view_image(f"{path}#page={number}")
+                                if not vision:
+                                    vision = bool(enable_pdf_vision and enable_pdf_vision())
+                                    if not vision:
+                                        raise ValueError(
+                                            "Vision could not be loaded for this model."
+                                        )
+                                    tools = chat_tools(
+                                        files=True, memories=memory_view is not None,
+                                        vision=True, pdf_pages=True,
+                                    )
+                                    self._context_tools = tools
+                                output = json.dumps({"path": path, "page": number})
+                            else:
+                                image = files.view_image(path)
+                                output = json.dumps({"path": path})
+                            tool_message["image_parts"] = [_image_part(*image)]
                         except (KeyError, OSError, ValueError, TypeError) as exc:
                             output = json.dumps({"error": f"Could not open image: {exc}"})
                     elif name == "view_memories" and memory_view is not None:
