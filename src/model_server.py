@@ -25,6 +25,9 @@ from settings import (
 
 DOWNLOADING_MODEL = "Downloading model"
 _GPU_LAYERS = re.compile(r"\boffloaded (\d+)/\d+ layers to GPU\b")
+_KV_CACHE_TYPES = (
+    "f32", "f16", "bf16", "f8_e4m3", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1",
+)
 
 SERVER_FIELDS = (
     ("port", "Server port", "Local port from 1 to 65535; default 9931"),
@@ -36,23 +39,25 @@ SERVER_FIELDS = (
     ("ubatch-size", "Micro batch size", "Physical prompt batch size"),
     ("parallel", "Parallel slots", "Maximum simultaneous requests; -1 uses automatic detection"),
     ("cache-ram", "Prompt cache RAM", "MiB; 0 disables the cache and -1 removes its limit"),
+    ("cache-type-k", "KV cache key type", "Precision for cached attention keys"),
+    ("cache-type-v", "KV cache value type", "Quantized values require Flash Attention"),
     ("flash-attn", "Flash Attention", "on, off or auto"),
     ("fit", "Fit to device memory", "on or off"),
     ("fit-ctx", "Minimum fitted context", "Minimum context size in tokens when fitting"),
     ("fit-target", "Fit memory margin", "MiB to leave free per device; use commas for each device"),
     ("reasoning", "Reasoning", "on, off or auto"),
     ("reasoning-budget", "Reasoning budget", "Server default thinking token budget"),
-    ("reasoning-effort", "Reasoning effort", "Server default; requires model support"),
     ("spec-type", "Speculative decoding", "none, draft-mtp or another supported mode"),
     ("spec-draft-n-max", "Maximum drafted tokens", "Tokens predicted per speculative step"),
 )
-# Choices from the bundled llama-server release. The server still accepts custom
-# template levels and comma-separated speculative modes from existing settings.
+# Choices from the bundled llama-server release. The server also accepts
+# comma-separated speculative modes.
 SERVER_FIELD_CHOICES = {
+    "cache-type-k": _KV_CACHE_TYPES,
+    "cache-type-v": _KV_CACHE_TYPES,
     "flash-attn": ("auto", "on", "off"),
     "fit": ("on", "off"),
     "reasoning": ("auto", "on", "off"),
-    "reasoning-effort": ("default", "minimal", "low", "medium", "high", "xhigh", "max"),
     "spec-type": (
         "none", "draft-mtp", "draft-simple", "draft-eagle3", "draft-dflash", "draft-dspark",
         "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache",

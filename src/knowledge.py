@@ -1114,7 +1114,10 @@ class KnowledgeLibrary:
         result = []
         for path, manifest, enabled in entries:
             parent = suppressed.get(manifest["pack_id"])
-            manifest = dict(manifest, unused_by=parent, size_bytes=path.stat().st_size)
+            manifest = dict(
+                manifest, unused_by=parent, preferred_enabled=enabled,
+                size_bytes=path.stat().st_size,
+            )
             result.append(
                 (
                     manifest["pack_id"],

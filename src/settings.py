@@ -209,32 +209,33 @@ VISION_DOWNLOADS = {
 
 # llama-server b12359 launch defaults. Set tier-specific changes in launch_parameters below.
 SERVER_LAUNCH_DEFAULTS = {
-    "ctx-size": 0,
+    "ctx-size": 8192,               # Lopaca default, llama-server default was 0
     "n-gpu-layers": "auto",
     "threads": -1,
     "threads-batch": -1,
     "batch-size": 2048,
     "ubatch-size": 512,
-    "parallel": -1,
-    "cache-ram": 8192,
+    "parallel": 1,                  # Lopaca default, llama-server default was -1
+    "cache-ram": 8192,              # Change below
+    "cache-type-k": "f16",
+    "cache-type-v": "f16",
     "flash-attn": "auto",
     "fit": "on",
     "fit-ctx": 4096,
-    "fit-target": 1024,
+    "fit-target": 512,              # Lopaca default, llama-server default was 1024
     "reasoning": "auto",
-    "reasoning-effort": "default",
-    "reasoning-budget": -1,
-    "spec-type": "none",
-    "spec-draft-n-max": 3,
+    "reasoning-budget": 16384,      # Lopaca default, llama-server default was -1
+    "spec-type": "draft-mtp",       # Lopaca default, llama-server default was none
+    "spec-draft-n-max": 2,          # Lopaca default, llama-server default was 3
 }
 
-DEFAULT_TEMPERATURE = 0.7  # Lopaca's existing default for other models and external servers.
+DEFAULT_TEMPERATURE = 0.8  # Lopaca's existing default for other models and external servers.
 SERVER_SAMPLING_DEFAULTS = {
     "temperature": DEFAULT_TEMPERATURE,
     "top_p": 0.95,
-    "top_k": 40,
-    "min_p": 0.05,
-    "presence_penalty": 0.0,
+    "top_k": 30,
+    "min_p": 0.02,
+    "presence_penalty": 0.5,
     "repetition_penalty": 1.0,
 }
 # Match model filenames by family and parameter count, across quantizations.

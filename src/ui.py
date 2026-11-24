@@ -3106,8 +3106,9 @@ class ChatWindow(Adw.ApplicationWindow):
             downloading_server,
             server_percent,
         )
-        self._refresh_model_rows(config, downloaded_server, external)
-        self._refresh_custom_file_rows(settings, config, external)
+        selected_config = settings.get("model_server", {}) if external else config
+        self._refresh_model_rows(selected_config, downloaded_server, external)
+        self._refresh_custom_file_rows(settings, selected_config, external)
         self._refresh_model_parameter_defaults()
 
     @staticmethod
@@ -3374,9 +3375,11 @@ class ChatWindow(Adw.ApplicationWindow):
             else:
                 row.add_css_class("dim-label")
             enabled = bool(
-                compatible
-                and installed
-                and (not projector or vision_file_precision(folder, family, projector))
+                installed
+                and (
+                    family != selected or not projector
+                    or vision_file_precision(folder, family, projector)
+                )
                 and family not in config.get("vision_disabled", ())
             )
             with switch.handler_block(handler):
@@ -4201,8 +4204,9 @@ class ChatWindow(Adw.ApplicationWindow):
                     )
                     row.add_suffix(info)
                 pending = next((job for job in jobs if job.get("key") == key), None)
+                preferred = manifest.get("preferred_enabled", enabled)
                 switch = Gtk.Switch(
-                    active=pending.get("enabled", enabled) if pending else enabled,
+                    active=pending.get("enabled", preferred) if pending else preferred,
                     valign=Gtk.Align.CENTER, focus_on_click=False,
                 )
                 switch.add_css_class("knowledge-packs-switch")
