@@ -90,10 +90,7 @@ def server_parameters(config):
         parameters.update(rule.launch_parameters)
     for key in parameters.keys() & config.keys():
         value = config[key]
-        # Older settings stored the Flash Attention and Fit checkboxes as booleans.
-        if key in ("flash-attn", "fit") and isinstance(value, bool):
-            value = "on" if value else ""
-        if value is not None and str(value).strip():
+        if type(value) in (str, int, float) and str(value).strip():
             parameters[key] = value
     return parameters
 

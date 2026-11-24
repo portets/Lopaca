@@ -520,15 +520,13 @@ _GGUF_PRECISION = {
 }
 
 
-def _gguf_labels(path, *, validate):
+def _gguf_labels(path):
     """Read display strings from a bounded prefix without loading any tensor data."""
     labels = {}
     with path.open("rb") as source:
         data = source.read(256 * 1024)
     if data[:4] != b"GGUF" or len(data) < 24:
-        if validate:
-            raise ValueError("The selected file does not have a valid GGUF header.")
-        return labels
+        raise ValueError("The selected file does not have a valid GGUF header.")
     offset = 24
 
     def integer(fmt):
@@ -577,11 +575,9 @@ def _gguf_labels(path, *, validate):
     return labels
 
 
-def custom_asset_info(kind, filename, *, inspect=True):
+def custom_asset_info(kind, filename):
     path = Path(filename)
     if kind == "executable":
-        if not inspect:
-            return {"name": "llama.cpp"}
         if not path.is_file() or not os.access(path, os.X_OK):
             raise ValueError("Choose an executable llama-server file.")
         version = re.search(
@@ -596,9 +592,9 @@ def custom_asset_info(kind, filename, *, inspect=True):
             "backend": backend,
             "recommendation": detect_recommendation(backend or "cpu"),
         }
-    if inspect and (not path.is_file() or path.suffix.casefold() != ".gguf"):
+    if not path.is_file() or path.suffix.casefold() != ".gguf":
         raise ValueError("Choose a local GGUF file.")
-    labels = _gguf_labels(path, validate=inspect) if path.is_file() else {}
+    labels = _gguf_labels(path)
     stem = re.sub(r"-\d{5}-of-\d{5}$", "", path.stem)
     quant = re.search(r"(?i)(?:^|[-_.])(NVFP4|IQ\d[\w]*|Q\d[\w]*|BF16|FP16|F16|F32)$", stem)
     name = labels.get("general.name") or labels.get("general.basename") or path.stem
@@ -609,7 +605,7 @@ def custom_asset_info(kind, filename, *, inspect=True):
             "general.quantized_by", "general.organization", "general.author"
         ) if labels.get(key)), ""),
         "quantization": "FP16" if quantization == "F16" else quantization,
-        "size": path.stat().st_size if path.is_file() else 0,
+        "size": path.stat().st_size,
     }
 
 

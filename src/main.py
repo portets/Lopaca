@@ -149,7 +149,6 @@ class ChatController:
         self.recall_embeddings = RecallEmbeddings(
             lambda session: self.view.dispatch(self._embedding_changed, session),
             server_busy=lambda: self.model_server.busy,
-            legacy_executables=self._legacy_embedding_executables,
         )
         self._indexed_embedding_session = None
         self.knowledge = KnowledgeStore()
@@ -162,18 +161,26 @@ class ChatController:
             settings,
             indexing_client.document_questions,
             self._model_lock,
-            lambda active: self.view.dispatch(self.view.set_document_processing, active),
+            lambda active: self.view.dispatch(
+                self.view.set_model_activity, "Assistant processing documents", active
+            ),
             lambda message: self.view.dispatch(
                 self.view._show_alert, "Document support", message
             ),
             on_indexed=self.recall_embeddings.schedule,
+            on_indexing=lambda active: self.view.dispatch(
+                self.view.set_background_activity, "documents",
+                "Indexing documents" if active else "", 10,
+            ),
         )
         self.history_index = HistoryIndex(
             self.store,
             settings,
             LlamaClient(settings),
             self._model_lock,
-            lambda active: self.view.dispatch(self.view.set_document_processing, active),
+            lambda active: self.view.dispatch(
+                self.view.set_model_activity, "Assistant indexing history", active
+            ),
             on_indexed=self.recall_embeddings.schedule,
         )
         self.history_index.model_indexing_allowed = lambda: not self.embedding_ready()
@@ -224,7 +231,6 @@ class ChatController:
         app_settings = self.store.load_app_settings()
         try:
             app_settings = self._apply_advanced_model_settings(app_settings)
-            self._register_existing_model_files(app_settings)
         except OSError as exc:
             self.view._show_alert("Could not save model settings", str(exc))
         self.first_launch = app_settings.get("first_launch") is True
@@ -305,36 +311,6 @@ class ChatController:
             return managed_vision_file(folder, path)
         path = Path(path or ".").expanduser()
         return any(path == model_path(folder, key) for key in MODEL_DOWNLOADS)
-
-    def _register_existing_model_files(self, settings):
-        config = settings.get("model_server", {})
-        assets = settings.setdefault("custom_model_files", {})
-        changed = assets.pop("path", None) is not None
-        embedding = settings.get("embedding_model", {})
-        if (filename := embedding.get("path")):
-            bundled = embedding_path(self.store.root.parent)
-            if Path(filename).expanduser() != bundled:
-                embedding["path"] = str(bundled) if bundled.is_file() else ""
-                changed = True
-        for kind in CUSTOM_MODEL_FILE_KINDS:
-            path = config.get(kind)
-            if path and not self._is_managed_asset(kind, path):
-                entries = assets.setdefault(kind, {})
-                if path in entries:
-                    continue
-                with suppress(OSError):
-                    entries[path] = {
-                        **custom_asset_info(kind, Path(path).expanduser(), inspect=False),
-                        "added": time.time_ns(),
-                    }
-                    if kind == "executable":
-                        entries[path].update(
-                            (key, config[key]) for key in ("version", "backend", "recommendation")
-                            if config.get(key)
-                        )
-                    changed = True
-        if changed:
-            self.store.save_app_settings(settings)
 
     def custom_model_files(self):
         return self.store.load_app_settings().get("custom_model_files", {})
@@ -1076,14 +1052,6 @@ class ChatController:
             ):
                 return executable, str(bundled), embedding.get("parameters")
         return None
-
-    def _legacy_embedding_executables(self):
-        settings = self.store.load_app_settings()
-        return (
-            *settings.get("custom_model_files", {}).get("executable", {}),
-            settings.get("model_server", {}).get("executable"),
-            *(self.store.root.parent / "server").glob("*/llama-server"),
-        )
 
     def _refresh_embedding_indexes(self):
         config = self._embedding_configuration()
@@ -1845,6 +1813,7 @@ class ChatController:
         if attach:
             self._draft_attachments.setdefault(chat_id, []).append(ready)
         self._document_imports[chat_id] = (*self._document_imports.get(chat_id, ()), ready)
+        self.view.set_background_activity("document_import", "Adding documents", 15)
         threading.Thread(
             target=self._import_documents, args=(list(paths), chat_id, ready), daemon=True
         ).start()
@@ -1867,6 +1836,8 @@ class ChatController:
             self._document_imports[chat_id] = remaining
         else:
             self._document_imports.pop(chat_id, None)
+        if not self._document_imports:
+            self.view.set_background_activity("document_import", "", 15)
         self._drain_messages()
         return False
 
@@ -2584,7 +2555,7 @@ class ChatController:
                 and memories_enabled()
             ):
                 self.updating_memories = True
-                self.view.dispatch(self.view.notify, "Updating memories")
+                self.view.dispatch(self.view.set_model_activity, "Updating memories")
                 try:
                     if self.client.trimmed_knowledge_context is not None:
                         knowledge_context = self.client.trimmed_knowledge_context
@@ -2604,6 +2575,7 @@ class ChatController:
                         self.view.dispatch(self.view.notify, f"Could not save memories: {exc}")
                 finally:
                     self.updating_memories = False
+                    self.view.dispatch(self.view.set_model_activity, "Updating memories", False)
 
         if not error and not self.stop_requested and self.client.needs_context_roll():
             self._post_response_condensing = True
@@ -2679,7 +2651,7 @@ class ChatController:
             and not self._condensing_context
         ):
             self.stop_requested = True
-            self.view.notify("Cancelling")
+            self.view.set_model_activity("Cancelling")
             self.client.cancel()
 
     @staticmethod
@@ -2844,7 +2816,7 @@ class ChatController:
             self.view.notify(f"Could not create file: {exc}")
 
     def run_command(self, args):
-        self.view.set_status("Running command…")
+        self.view.set_command_running(True)
         cwd = self.store.projects(self.chat["id"])
         threading.Thread(target=self._run_command, args=(args, cwd), daemon=True).start()
 

@@ -3,6 +3,7 @@
 import re
 import threading
 import time
+from collections import deque
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
@@ -481,6 +482,9 @@ window.lopaca-main, .transcript-scroll, .transcript {
 .composer-status {
     border-spacing: 14px;
 }
+.composer-activity {
+    border-spacing: 6px;
+}
 .composer-frame-row {
     border-spacing: 10px;
 }
@@ -940,6 +944,56 @@ class TranscriptViewport(Gtk.Viewport):
             Gtk.Viewport.do_size_allocate(self, width, height, baseline)
 
 
+class StatusLabel(Gtk.Label):
+    def __init__(self, *, reserve_dots=False):
+        super().__init__(xalign=0, ellipsize=Pango.EllipsizeMode.END, width_chars=1)
+        self.add_css_class("response-status")
+        self.add_css_class("muted")
+        self._reserve_dots = reserve_dots
+        self._message = ""
+        self._animated = False
+        self._timer = None
+        self._dots = 0
+        self.connect("map", lambda *_: self._start_timer())
+        self.connect("unmap", lambda *_: self._stop_timer())
+
+    def display(self, message, *, animated=False):
+        if (message, animated) == (self._message, self._animated):
+            return
+        self._stop_timer()
+        self._message, self._animated = message, animated
+        self._dots = 0
+        self._render()
+        self.set_tooltip_text(message or None)
+        self._start_timer()
+
+    def _start_timer(self):
+        if self._animated and self.get_mapped() and self._timer is None:
+            self._timer = GLib.timeout_add(650, self._animate)
+
+    def _stop_timer(self):
+        if self._timer is not None:
+            GLib.source_remove(self._timer)
+            self._timer = None
+
+    def _animate(self):
+        self._dots = (self._dots + 1) % 4
+        self._render()
+        return GLib.SOURCE_CONTINUE
+
+    def _render(self):
+        dots = "." * self._dots
+        if self._reserve_dots and self._animated and self._dots < 3:
+            # Pango markup uses 1 as its smallest supported alpha.
+            remaining = "." * (3 - self._dots)
+            self.set_markup(
+                f'{GLib.markup_escape_text(self._message)}{dots}'
+                f'<span alpha="1">{remaining}</span>'
+            )
+        else:
+            self.set_text(self._message + dots)
+
+
 class ChatWindow(Adw.ApplicationWindow):
     __gsignals__: ClassVar = {
         "retrieval-settings-changed": (GObject.SignalFlags.RUN_LAST, None, ()),
@@ -953,7 +1007,11 @@ class ChatWindow(Adw.ApplicationWindow):
         self.emit("optional-features-changed")
         self._update_setup_highlights()
         self.refresh_model_configuration()
-        self.set_status(self._activity_status)
+        stage = self.controller.optional_features_stage
+        self.set_background_activity(
+            "optional_features", f"{stage} optional features" if stage else "",
+            priority=30 if stage == "Downloading" else 20,
+        )
 
     def __init__(self, app, controller):
         super().__init__(application=app, title="Lopaca")
@@ -977,20 +1035,21 @@ class ChatWindow(Adw.ApplicationWindow):
         self._thinking_pending = []
         self._thinking_flush_id = None
         self._inband_thinking = ""
-        self._status_text = None
-        self._status_timer = None
-        self._status_dots = 0
-        self._activity_status = "Not Connected"
+        self._activity_status = "Not connected"
+        self._model_activity = ""
         self._model_server_activity = ""
+        self._model_setup_downloading = False
         self._model_download = {}
         self._model_switch_timer = None
         self._model_setup_dialog = self._model_remove_dialog = None
         self._welcome_pending = False
         self._app_settings_dialog = None
-        self._processing_documents = False
+        self._background_activities = {}
+        self._notices = deque()
         self._notification_timer = None
         self._notification_deadline = 0
         self._notification_model_busy = False
+        self._running_commands = 0
         self._condensing_context = False
         self._response_row = None
         self._response_chat_id = None
@@ -1178,12 +1237,17 @@ class ChatWindow(Adw.ApplicationWindow):
         compose.add_css_class("composer")
         status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         status_row.add_css_class("composer-status")
-        self.status = Gtk.Label(label=" Not Connected", xalign=0)
-        self.status.add_css_class("response-status")
-        self.status.add_css_class("muted")
-        self.status.set_ellipsize(Pango.EllipsizeMode.END)
-        self.status.set_width_chars(1)
-        status_row.append(self.status)
+        activities = Gtk.Box()
+        activities.add_css_class("composer-activity")
+        self.status = StatusLabel(reserve_dots=True)
+        self.status.display(self._activity_status)
+        self._status_separator = Gtk.Label(label="|", visible=False)
+        self._status_separator.add_css_class("muted")
+        self._background_status = StatusLabel()
+        self._background_status.set_visible(False)
+        for widget in (self.status, self._status_separator, self._background_status):
+            activities.append(widget)
+        status_row.append(activities)
         status_spacer = Gtk.Box()
         status_spacer.add_css_class("status-spacer")
         status_spacer.set_hexpand(True)
@@ -1459,103 +1523,74 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def set_status(self, text):
         self._activity_status = text
-        if (
-            self._notification_timer is not None
-            and self._status_text == "Cancelling"
-            and not self.controller.busy
-        ):
-            GLib.source_remove(self._notification_timer)
-            self._notification_timer = None
-        if (
-            self._notification_timer is not None
-            and self._notification_model_busy
-            and not self.controller.busy
-            and text in ("Ready", "Disconnected", "Not connected")
-            and self._notification_deadline - GLib.get_monotonic_time() > 1_000_000
-        ):
-            GLib.source_remove(self._notification_timer)
-            self._notification_deadline = GLib.get_monotonic_time() + 1_000_000
-            self._notification_timer = GLib.timeout_add(1000, self._restore_status)
-        if self._notification_timer is None:
-            self._display_status(
-                "Assistant processing documents" if self._processing_documents else text
-            )
+        if not self.controller.busy and text in ("Ready", "Disconnected", "Not connected"):
+            if self._model_activity == "Cancelling":
+                self._model_activity = ""
+            if (
+                self._notification_timer is not None
+                and self._notification_model_busy
+                and self._notification_deadline - GLib.get_monotonic_time() > 1_000_000
+            ):
+                GLib.source_remove(self._notification_timer)
+                self._start_notice_timer(1000)
+        self._refresh_model_status()
 
-    def set_document_processing(self, active):
-        self._processing_documents = active
-        if (
-            active
-            and self._notification_timer is not None
-            and self._status_text != "Condensing context"
-        ):
-            GLib.source_remove(self._notification_timer)
-            self._notification_timer = None
-        self.set_status(self._activity_status)
+    def set_model_activity(self, text, active=True):
+        if active:
+            self._model_activity = text
+        elif self._model_activity == text:
+            self._model_activity = ""
+        self._refresh_model_status()
+
+    def _refresh_model_status(self):
+        text = self._model_server_activity or self._model_activity or self._activity_status
+        self.status.display(text, animated=text not in ("Ready", "Disconnected", "Not connected"))
 
     def set_context_processing(self, active):
         self._condensing_context = active
-        if active:
-            self.notify("Condensing context")
-        else:
-            self.update_send_button()
-
-    def notify(self, text):
-        if self._notification_timer is not None:
-            GLib.source_remove(self._notification_timer)
-        self._display_status(text)
-        self._notification_model_busy = self.controller.busy
-        self._notification_deadline = GLib.get_monotonic_time() + 3_000_000
-        self._notification_timer = GLib.timeout_add(3000, self._restore_status)
+        self.set_model_activity("Condensing context", active)
         self.update_send_button()
 
-    def _restore_status(self):
-        if self.controller.busy and (
-            self._status_text == "Cancelling"
-            or (self._status_text == "Condensing context" and self._condensing_context)
-            or (self._status_text == "Updating memories" and self.controller.updating_memories)
-        ):
-            self._notification_deadline = GLib.get_monotonic_time() + 3_000_000
-            self._notification_timer = GLib.timeout_add(3000, self._restore_status)
-            return False
+    def set_background_activity(self, source, text, priority):
+        # Keep obscured jobs so the next one is visible as soon as the current one finishes.
+        if text:
+            self._background_activities[source] = priority, text
+        else:
+            self._background_activities.pop(source, None)
+        self._refresh_background_status()
+
+    def _refresh_background_status(self):
+        if self._notices:
+            text = self._notices[0]
+        else:
+            _, text = max(
+                self._background_activities.values(), key=lambda activity: activity[0],
+                default=(0, ""),
+            )
+        self._status_separator.set_visible(bool(text))
+        self._background_status.set_visible(bool(text))
+        self._background_status.display(text, animated=bool(text) and not self._notices)
+
+    def notify(self, text):
+        if not self._notices or self._notices[-1] != text:
+            self._notices.append(text)
+        if self._notification_timer is None:
+            self._start_notice_timer()
+            self._refresh_background_status()
+        self.update_send_button()
+
+    def _start_notice_timer(self, duration=3000):
+        self._notification_model_busy = self.controller.busy
+        self._notification_deadline = GLib.get_monotonic_time() + duration * 1000
+        self._notification_timer = GLib.timeout_add(duration, self._expire_notice)
+
+    def _expire_notice(self):
+        self._notices.popleft()
         self._notification_timer = None
-        self.set_status(self._activity_status)
-        return False
-
-    def _display_status(self, text):
-        if self._model_server_activity:
-            text = self._model_server_activity
-        elif text in ("Ready", "Disconnected", "Not connected") and (
-            stage := self.controller.optional_features_stage
-        ):
-            text = f"{stage} optional features"
-        if text == self._status_text:
-            return
-        self._status_text = text
-        self._status_dots = 0
-        if self._status_timer is not None:
-            GLib.source_remove(self._status_timer)
-            self._status_timer = None
-        self.status.set_text(text)
-        self.status.set_tooltip_text(text)
-        if text in (
-            "Waiting",
-            "Thinking",
-            "Responding",
-            "Assistant processing documents",
-            "Updating memories",
-            "Cancelling",
-            "Condensing context",
-            "Connecting to model",
-            DOWNLOADING_MODEL,
-            "Downloading optional features",
-            "Installing optional features",
-        ):
-            self._status_timer = GLib.timeout_add(650, self._animate_status)
-
-    def _animate_status(self):
-        self._status_dots = (self._status_dots + 1) % 4
-        self.status.set_text(self._status_text + "." * self._status_dots)
-        return True
+        if self._notices:
+            self._start_notice_timer()
+        self._refresh_background_status()
+        return GLib.SOURCE_REMOVE
 
     def set_context_capacity(self, capacity):
         self.context_capacity = capacity
@@ -2892,13 +2927,9 @@ class ChatWindow(Adw.ApplicationWindow):
             if not self.controller.model_file_download:
                 self._model_download.pop("model", None)
             self._model_download.pop("server", None)
-        activity = (text if text == DOWNLOADING_MODEL else "Connecting to model") if busy else ""
-        if self._model_server_activity != activity:
-            self._model_server_activity = activity
-            if self._notification_timer is not None:
-                GLib.source_remove(self._notification_timer)
-                self._notification_timer = None
-            self.set_status(self._activity_status)
+        self._model_setup_downloading = busy and text == DOWNLOADING_MODEL
+        self._model_server_activity = "Connecting to model" if busy else ""
+        self._refresh_model_status()
         if hasattr(self, "_model_server_status"):
             self._model_server_status.set_label(text)
             self._model_connect_button.set_sensitive(not busy)
@@ -3014,6 +3045,16 @@ class ChatWindow(Adw.ApplicationWindow):
         alert.choose(self, None, chosen)
 
     def refresh_model_configuration(self):
+        downloading = (
+            self._model_setup_downloading
+            or self.controller.model_file_download
+            or self.controller.vision_download_active
+            or self.controller.embedding_download_active
+            or any(percent is not None for _, percent in self._model_download.values())
+        )
+        self.set_background_activity(
+            "model_download", "Downloading files" if downloading else "", 30,
+        )
         self._update_model_picker()
         if not hasattr(self, "_configured_server"):
             return
@@ -4055,6 +4096,27 @@ class ChatWindow(Adw.ApplicationWindow):
         load_handler = page.connect("map", load)
         return page
 
+    def _refresh_knowledge_activity(self):
+        activities = []
+        for job in self._knowledge_jobs:
+            if not job.get("active") or job["kind"] == "toggle":
+                continue
+            match job["kind"]:
+                case "delete":
+                    activities.append((20, "Removing knowledge packs"))
+                case "merge":
+                    activities.append((20, "Merging knowledge packs"))
+                case _:
+                    status = job["status"]
+                    if status.startswith("Cancelling"):
+                        activities.append((20, "Cancelling download"))
+                    elif "Downloading" in status:
+                        activities.append((30, "Downloading files"))
+                    else:
+                        activities.append((20, "Installing knowledge packs"))
+        priority, text = max(activities, key=lambda activity: activity[0], default=(0, ""))
+        self.set_background_activity("knowledge", text, priority)
+
     def _populate_knowledge_packs(self, dialog, group):
         group.set_description("Download and manage knowledge packs.")
         from packs import compatibility_error, load_catalog
@@ -4257,6 +4319,9 @@ class ChatWindow(Adw.ApplicationWindow):
             indicators[id(job)] = label
 
         def notify(job=None):
+            # Percentage-only updates change the pack row, not the composer activity.
+            if job is None:
+                self._refresh_knowledge_activity()
             if self._knowledge_refresh:
                 self._knowledge_refresh(job)
 
@@ -4690,6 +4755,12 @@ class ChatWindow(Adw.ApplicationWindow):
         self.set_sensitive(False)
         dialog.present()
 
+    def set_command_running(self, active):
+        self._running_commands += 1 if active else -1
+        self.set_background_activity(
+            "commands", "Running command" if self._running_commands else "", 15,
+        )
+
     def show_command_result(self, output, exit_code, note):
         message = (
             "Command completed successfully."
@@ -4701,12 +4772,12 @@ class ChatWindow(Adw.ApplicationWindow):
         elif output:
             message += f"\n\n```text\n{output}\n```"
         self.append_message("assistant", message)
-        self.set_status(self.controller.idle_status())
+        self.set_command_running(False)
         self.scroll_bottom()
         return False
 
     def show_command_error(self, error):
-        self.set_status(self.controller.idle_status())
+        self.set_command_running(False)
         self.notify(f"Command failed: {error}")
         self.append_message("assistant", f"Command could not be started: {error}")
         self.scroll_bottom()

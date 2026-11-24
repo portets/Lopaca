@@ -65,13 +65,12 @@ def _vector_options(args):
 class RecallEmbeddings:
     """Keep one local embedding session and discard it when its configuration changes."""
 
-    def __init__(self, on_state_changed=None, *, server_busy=None, legacy_executables=None):
+    def __init__(self, on_state_changed=None, *, server_busy=None):
         self._lock = threading.Lock()
         self._session = None
         self._closed = False
         self._on_state_changed = on_state_changed
         self._server_busy = server_busy
-        self._legacy_executables = legacy_executables or tuple
 
     def configure(self, config):
         with self._lock:
@@ -82,7 +81,7 @@ class RecallEmbeddings:
                 self._session = None
             if self._session is None and config:
                 self._session = _EmbeddingSession(
-                    config, self._on_state_changed, self._server_busy, self._legacy_executables()
+                    config, self._on_state_changed, self._server_busy
                 )
             if self._session and self._session.available:
                 return self._session
@@ -102,11 +101,10 @@ class RecallEmbeddings:
 
 
 class _EmbeddingSession:
-    def __init__(self, config, on_state_changed=None, server_busy=None, legacy_executables=()):
+    def __init__(self, config, on_state_changed=None, server_busy=None):
         self.config = config
         self._on_state_changed = on_state_changed
         self._server_busy = server_busy or (lambda: False)
-        self._legacy_executables = legacy_executables
         self._stopped = threading.Event()
         self._background_allowed = threading.Event()
         self._background_allowed.set()
@@ -120,7 +118,6 @@ class _EmbeddingSession:
         self._passage_vectors = {}
         self._retry_at = {}
         self._vector_model = None
-        self._compatible_vector_models = set()
         self._query_vectors = {}
         self.classifier_ready = False
         self._thinking_timeouts = 0
@@ -244,7 +241,6 @@ class _EmbeddingSession:
     def _start(self):
         self.classifier_ready = False
         self._vector_model = None
-        self._compatible_vector_models.clear()
         self._passage_vectors.clear()
         with self._lock:
             self._query_vectors.clear()
@@ -303,40 +299,10 @@ class _EmbeddingSession:
         with model.open("rb") as file:
             digest = hashlib.file_digest(file, "sha256").hexdigest()
         self.classifier_ready = self._supports_thinking_classifier(digest, extra)
-        self._set_vector_identity(model, digest, executable, extra, parameters)
+        identity = ("passage-v2", digest, _vector_options(extra))
+        self._vector_model = hashlib.sha256(repr(identity).encode()).hexdigest()
         if self._on_state_changed:
             self._on_state_changed(self)
-
-    def _set_vector_identity(self, model, digest, executable, extra, parameters):
-        stat = model.stat()
-        legacy_identity = (
-            "passage-v1",
-            str(model),
-            stat.st_ino,
-            stat.st_dev,
-            stat.st_size,
-            stat.st_mtime_ns,
-            stat.st_ctime_ns,
-        )
-
-        def fingerprint(identity):
-            return hashlib.sha256(repr(identity).encode()).hexdigest()
-
-        vector_options = _vector_options(extra)
-        self._vector_model = fingerprint(("passage-v2", digest, vector_options))
-        option_variants = [vector_options, extra]
-        if not parameters:
-            # Older versions stored auto-detected thread counts in the fingerprint.
-            option_variants.extend(
-                [*vector_options, "--threads", str(n), "--threads-batch", str(n)]
-                for n in range(1, 25)
-            )
-        executables = {str(Path(path).expanduser().resolve())
-                       for path in (executable, *self._legacy_executables) if path}
-        self._compatible_vector_models = {self._vector_model} | {
-            fingerprint((*legacy_identity, path, options))
-            for path in executables for options in option_variants
-        }
 
     @staticmethod
     def _supports_thinking_classifier(digest, args):
@@ -510,10 +476,7 @@ class _EmbeddingSession:
                     db.execute("BEGIN IMMEDIATE")
                     if not self.available:
                         return False
-                    state = _vector_model(db)
-                    if state in self._compatible_vector_models:
-                        db.execute("UPDATE rag_vector_model SET model=?", (self._vector_model,))
-                    elif state != self._vector_model:
+                    if _vector_model(db) != self._vector_model:
                         _initialize_vectors(db, table, column, self._vector_model, memory)
             batch = db.execute(
                 f"SELECT v.id, s.{column} FROM rag_vectors v JOIN {table} s ON s.id=v.id "
@@ -545,7 +508,7 @@ class _EmbeddingSession:
         model = self._vector_model
         if not model or not self.available or stopped():
             return rows
-        if _vector_model(db) not in self._compatible_vector_models:
+        if _vector_model(db) != model:
             return rows
         if not db.execute("SELECT 1 FROM rag_vectors WHERE vector IS NOT NULL LIMIT 1").fetchone():
             return rows

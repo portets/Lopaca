@@ -20,9 +20,13 @@ def _read_json_object(path):
 
 
 def _write_json(path, data):
-    temp_path = path.with_name(path.name + ".tmp")
-    temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(path)
+    # Concurrent writers must each finish their own file before publishing it.
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 class _PagedMessages:
@@ -35,6 +39,11 @@ class _PagedMessages:
 
     def __len__(self):
         return self.start + len(self.recent)
+
+    def __iter__(self):
+        for first in range(0, self.start, 128):
+            yield from self[first : min(first + 128, self.start)]
+        yield from self.recent
 
     def append(self, message):
         self.recent.append(message)

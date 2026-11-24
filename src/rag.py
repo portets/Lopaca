@@ -110,7 +110,7 @@ class DocumentIndexer:
 
     def __init__(
         self, settings, generate_questions, model_lock, on_processing, on_missing=None,
-        on_indexed=None,
+        on_indexed=None, *, on_indexing=None,
     ):
         self.settings = settings
         self.enabled = settings.rag_model_indexing
@@ -121,6 +121,7 @@ class DocumentIndexer:
         self._on_processing = on_processing
         self._on_missing = on_missing
         self._on_indexed = on_indexed
+        self._on_indexing = on_indexing
         self._missing_libraries = set()
         self._retry_after = 0
         self._hint_version = (
@@ -182,10 +183,7 @@ class DocumentIndexer:
             try:
                 if folder.is_dir():
                     with closing(_connect_index(folder.parent / "documents.sqlite")) as connection:
-                        changed = _index(
-                            connection, folder, self.settings, lambda: False,
-                            partial(self.warn_missing_dependency, folder),
-                        )
+                        changed = self._index_documents(connection, folder)
                         if self._on_indexed and (changed or folder == self.active_folder):
                             self._on_indexed(folder.parent / "documents.sqlite")
                         version = self._hint_version if self.enabled else "off"
@@ -209,6 +207,24 @@ class DocumentIndexer:
                     self._active = None
                     ready.set()
                 self._queue.task_done()
+
+    def _index_documents(self, connection, folder):
+        indexing = False
+
+        def started():
+            nonlocal indexing
+            indexing = True
+            self._on_indexing(True)
+
+        try:
+            return _index(
+                connection, folder, self.settings, lambda: False,
+                partial(self.warn_missing_dependency, folder),
+                on_indexing=started if self._on_indexing else None,
+            )
+        finally:
+            if indexing:
+                self._on_indexing(False)
 
     def _update_hints(self, connection, folder):
         """Apply cached search text; generate missing questions outside write transactions."""
@@ -1276,7 +1292,7 @@ def _document_chunks(text, source, settings, stopped):
         yield section, body, _keywords(source, section, body), first, last
 
 
-def _index(connection, folder, settings, stopped, on_missing=None):
+def _index(connection, folder, settings, stopped, on_missing=None, *, on_indexing=None):
     connection.executescript("""
         CREATE TABLE IF NOT EXISTS files (
             path TEXT PRIMARY KEY, mtime_ns INTEGER, ctime_ns INTEGER, size INTEGER
@@ -1329,6 +1345,9 @@ def _index(connection, folder, settings, stopped, on_missing=None):
             stamp = stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size
             if cached.get(name) == stamp:
                 continue
+            if on_indexing:
+                on_indexing()
+                on_indexing = None
             text = read_document(path, on_warning=on_missing)
             after = path.stat()
             if stamp != (after.st_mtime_ns, after.st_ctime_ns, after.st_size):
@@ -1345,8 +1364,11 @@ def _index(connection, folder, settings, stopped, on_missing=None):
             chunks = _document_chunks(text, name, settings, stopped) if text else ()
             _replace_source_chunks(connection, name, chunks)
             connection.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?)", (name, *stamp))
+    removed = cached.keys() - seen
+    if removed and on_indexing:
+        on_indexing()
     with connection:
-        for name in cached.keys() - seen:
+        for name in removed:
             changed = True
             connection.execute("DELETE FROM index_state WHERE key = 'model_indexing'")
             connection.execute("DELETE FROM chunk_content WHERE source = ?", (name,))

@@ -41,7 +41,6 @@ NumPy speeds up vector searches across knowledge packs, documents, memories, and
 **Model-Assisted Document Indexing** in App settings optionally allows the LLM to help process documents for better info retrieval. Very slow and depends on your model speed. Modest quality improvement. Recommended for t/s greater than 80.
 
 # TO-DO
-- Add embedding model support?
 - Make features list
 
 # Further TO-DOs
