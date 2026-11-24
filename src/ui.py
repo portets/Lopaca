@@ -3699,13 +3699,15 @@ class ChatWindow(Adw.ApplicationWindow):
         return row
 
     @staticmethod
-    def _set_settings_entry_editing(row, editing):
+    def _set_settings_entry_editing(row, editing, *, select_text=False):
         field = row.get_delegate()
         row.set_editable(editing)
         field.set_focusable(editing)
         field.set_can_target(editing)
         if editing:
             row.grab_focus_without_selecting()
+            if select_text:
+                row.select_region(0, -1)
         else:
             position = row.get_position()
             row.select_region(position, position)
@@ -3716,7 +3718,7 @@ class ChatWindow(Adw.ApplicationWindow):
         row.add_suffix(reset)
         self._set_settings_entry_editing(row, False)
         edit = self._settings_edit_button(
-            title, lambda editing: self._set_settings_entry_editing(row, editing)
+            title, lambda editing: self._set_settings_entry_editing(row, editing, select_text=True)
         )
         row.connect(
             "entry-activated", lambda *_: edit.emit("clicked") if row.get_editable() else None
