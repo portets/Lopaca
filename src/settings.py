@@ -111,6 +111,17 @@ MODEL_DOWNLOADS = {
         "3e253088108e612dac4fe845d73945234afb4e7095638711402b8317f8f65ca7",
         vision_family="3.8",
     ),
+    "27b-q4xl": ModelDownload(
+        "Qwen 3.8 27B",
+        "Unsloth",
+        "UD-Q4_K_XL",
+        _UNSLOTH_27B,
+        _UNSLOTH_27B_REVISION,
+        "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+        17_659_407_264,
+        "2a5f3565f39cf885103da591182c1266da64745737b42b452fd3e675369f1211",
+        vision_family="3.8",
+    ),
     "27b-q4m": ModelDownload(
         "Qwen 3.8 27B",
         "Unsloth",
@@ -278,17 +289,176 @@ class ModelRecommendation:
 # Example tier override: launch_parameters={"ctx-size": 65536, "fit-target": 512}.
 MODEL_TOTAL_VRAM_DISCOUNT_GIB = 1
 MODEL_FREE_VRAM_DISCOUNT_GIB = 2
-MODEL_TOTAL_RAM_DISCOUNT_GIB = 2
+MODEL_TOTAL_RAM_DISCOUNT_GIB = 1
 MODEL_RECOMMENDATIONS = {
-    "blackwell": ModelRecommendation(
+    "blackwell-32gb-hiram": ModelRecommendation(
         balanced="27b-nvfp4",
         faster="27b-q2",
         better="27b-q8",
         vision=True,
         embedding=True,
         backends=("cuda",),
+        vram_gib=32,
+        ram_gib=32,
+        cuda_compute=100,
+        launch_parameters={
+            "ctx-size": 262144,
+            "fit-target": 1024,
+            "cache-ram": 16384,
+            "spec-draft-n-max": 3,
+        }
+    ),
+    "blackwell-32gb-": ModelRecommendation(
+        balanced="27b-nvfp4",
+        faster="27b-q2",
+        better="27b-q8",
+        vision=True,
+        embedding=True,
+        backends=("cuda",),
+        vram_gib=32,
+        cuda_compute=100,
+        launch_parameters={
+            "ctx-size": 262144,
+            "fit-target": 1024,
+            "spec-draft-n-max": 3,
+        }
+    ),
+    "blackwell-24gb-hiram": ModelRecommendation(
+        balanced="27b-nvfp4",
+        faster="27b-q2",
+        better="27b-q8",
+        vision=True,
+        embedding=True,
+        backends=("cuda",),
+        vram_gib=24,
+        ram_gib=32,
+        cuda_compute=100,
+        launch_parameters={
+            "ctx-size": 131072,
+            "fit-target": 1024,
+            "cache-ram": 16384,
+            "spec-draft-n-max": 3,
+        }
+    ),
+    "blackwell-24gb": ModelRecommendation(
+        balanced="27b-nvfp4",
+        faster="27b-q2",
+        better="27b-q6",
+        vision=True,
+        embedding=True,
+        backends=("cuda",),
+        vram_gib=24,
+        cuda_compute=100,
+        launch_parameters={
+            "ctx-size": 131072,
+            "fit-target": 1024,
+            "spec-draft-n-max": 3,
+        }
+    ),
+    "blackwell-12gb-hiram": ModelRecommendation(
+        balanced="27b-nvfp4",
+        faster="27b-q2",
+        better="27b-q6",
+        vision=True,
+        embedding=True,
+        backends=("cuda",),
+        vram_gib=12,
+        ram_gib=32,
+        cuda_compute=100,
+        launch_parameters={
+            "ctx-size": 65536,
+        }
+    ),
+    "blackwell-12gb": ModelRecommendation(
+        balanced="27b-nvfp4",
+        faster="27b-q2",
+        better="27b-q6",
+        vision=True,
+        embedding=True,
+        backends=("cuda",),
         vram_gib=12,
         cuda_compute=100,
+        launch_parameters={
+            "ctx-size": 32768,
+            "cache-ram": 4096,
+            "cache-type-k": "q8_0",
+            "cache-type-v": "q8_0",
+        }
+    ),
+    "gpu-32gb-hiram": ModelRecommendation(
+        balanced="27b-q4xl",
+        faster="27b-q2",
+        better="27b-q8",
+        vision=True,
+        embedding=True,
+        backends=("cuda", "vulkan"),
+        vram_gib=32,
+        ram_gib=32,
+        launch_parameters={
+            "ctx-size": 262144,
+            "fit-target": 1024,
+            "cache-ram": 16384,
+            "spec-draft-n-max": 3,
+        }
+    ),
+    "gpu-32gb": ModelRecommendation(
+        balanced="27b-q4xl",
+        faster="27b-q2",
+        better="27b-q8",
+        vision=True,
+        embedding=True,
+        backends=("cuda", "vulkan"),
+        vram_gib=32,
+        launch_parameters={
+            "ctx-size": 262144,
+            "fit-target": 1024,
+            "spec-draft-n-max": 3,
+        }
+    ),
+    "gpu-24gb-hiram": ModelRecommendation(
+        balanced="27b-q4xl",
+        faster="27b-q2",
+        better="27b-q8",
+        vision=True,
+        embedding=True,
+        backends=("cuda", "vulkan"),
+        vram_gib=24,
+        ram_gib=32,
+        launch_parameters={
+            "ctx-size": 131072,
+            "fit-target": 1024,
+            "cache-ram": 16384,
+            "spec-draft-n-max": 3,
+        }
+    ),
+
+    "gpu-24gb": ModelRecommendation(
+        balanced="27b-q4xl",
+        faster="27b-q2",
+        better="27b-q6",
+        vision=True,
+        embedding=True,
+        backends=("cuda", "vulkan"),
+        vram_gib=24,
+        launch_parameters={
+            "ctx-size": 131072,
+            "fit-target": 1024,
+            "spec-draft-n-max": 3,
+        }
+    ),
+
+    "gpu-12gb-hiram": ModelRecommendation(
+        balanced="27b-q4m",
+        faster="27b-q2",
+        better="27b-q6",
+        vision=True,
+        embedding=True,
+        backends=("cuda", "vulkan"),
+        vram_gib=12,
+        ram_gib=32,
+        launch_parameters={
+            "ctx-size": 65536,
+        }
     ),
     "gpu-12gb": ModelRecommendation(
         balanced="27b-q4m",
@@ -298,6 +468,26 @@ MODEL_RECOMMENDATIONS = {
         embedding=True,
         backends=("cuda", "vulkan"),
         vram_gib=12,
+        launch_parameters={
+            "ctx-size": 32768,
+            "cache-ram": 4096,
+            "cache-type-k": "q8_0",
+            "cache-type-v": "q8_0",
+        }
+    ),
+    "gpu-8gb-hiram": ModelRecommendation(
+        balanced="27b-q2",
+        faster="9b-q4",
+        better="27b-q4s",
+        vision=True,
+        embedding=True,
+        backends=("cuda", "vulkan"),
+        vram_gib=8,
+        ram_gib=32,
+        launch_parameters={
+            "ctx-size": 32768,
+            "cache-ram": 4096,
+        }
     ),
     "gpu-8gb": ModelRecommendation(
         balanced="27b-q2",
@@ -307,8 +497,44 @@ MODEL_RECOMMENDATIONS = {
         embedding=True,
         backends=("cuda", "vulkan"),
         vram_gib=8,
+        launch_parameters={
+            "ctx-size": 16384,
+            "cache-ram": 2048,
+            "cache-type-k": "q8_0",
+            "cache-type-v": "q8_0",
+        }
     ),
-    # Includes CPU, unknown VRAM, GPUs under 8 GiB, but with 32gb RAM.
+    "gpu-6gb-hiram": ModelRecommendation(
+        balanced="27b-q2",
+        faster="9b-q4",
+        better="27b-q4s",
+        vision=True,
+        embedding=True,
+        backends=("cuda", "vulkan"),
+        vram_gib=6,
+        ram_gib=32,
+        launch_parameters={
+            "ctx-size": 16384,
+            "cache-ram": 4096,
+        }
+    ),
+    "gpu-6gb": ModelRecommendation(
+        balanced="9b-q4",
+        faster="9b-q3",
+        better="27b-q2",
+        vision=True,
+        embedding=True,
+        backends=("cuda", "vulkan"),
+        vram_gib=6,
+        launch_parameters={
+            "ctx-size": 16384,
+            "cache-ram": 2048,
+            "cache-type-k": "q8_0",
+            "cache-type-v": "q8_0",
+            "spec-draft-n-max": 1,
+        }
+    ),
+    # Includes CPU, unknown VRAM, GPUs under 6 GiB, but with 32gb RAM.
     "small": ModelRecommendation(
         balanced="9b-q4",
         faster="9b-q3",
@@ -316,6 +542,11 @@ MODEL_RECOMMENDATIONS = {
         vision=True,
         embedding=True,
         ram_gib=32,
+        launch_parameters={
+            "ctx-size": 16384,
+            "cache-ram": 2048,
+            "spec-draft-n-max": 1,
+        }
     ),
     # Includes remainder.
     "smaller": ModelRecommendation(
@@ -324,6 +555,13 @@ MODEL_RECOMMENDATIONS = {
         better="9b-q5",
         vision=True,
         embedding=False,
+        launch_parameters={
+            "ctx-size": 8192,
+            "cache-ram": 1024,
+            "cache-type-k": "q8_0",
+            "cache-type-v": "q8_0",
+            "spec-draft-n-max": 1,
+        }
     ),
 }
 

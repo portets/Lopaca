@@ -23,7 +23,7 @@ from agentic import (
     handle_tool_call,
 )
 from images import pdf_page_reference
-from memory import VIEW_MEMORIES_TOOL, _fence_after, memory_review
+from memory import VIEW_MEMORIES_TOOL, _fence_after, excessive_hidden_reply, memory_review
 from rag import (
     DOCUMENT_QUESTIONS_INSTRUCTION,
     QUERY_EXPANSION_GRAMMAR,
@@ -1040,7 +1040,11 @@ class LlamaClient:
                         on_thinking(reasoning)
                     if content:
                         answer_parts.append(content)
-                        on_answer("".join(answer_parts))
+                        answer = "".join(answer_parts)
+                        on_answer(answer)
+                        if not tool_calls and excessive_hidden_reply(answer):
+                            finish_reason = "hidden_text_cutoff"
+                            break
                     if budget_message and not budget_notified:
                         # Keep separate, bounded tails for reasoning and in-band content.
                         for index, text in enumerate((reasoning, content)):

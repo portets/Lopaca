@@ -356,6 +356,19 @@ def memory_review(text):
     return trimmed, decision
 
 
+def excessive_hidden_reply(text):
+    """Detect a long trailing echo of reserved application blocks after a visible reply."""
+    limit = 128
+    if len(text) <= limit or not any(opening in text for opening in _REFERENCE_OPENINGS):
+        return False
+    visible, _ = memory_review(text)
+    if not visible or not text.startswith(visible):
+        return False
+    hidden = text[len(visible):].lstrip()
+    # Short stray blocks may be followed by useful prose. Give those time to finish.
+    return len(hidden) > limit and hidden.startswith(_REFERENCE_OPENINGS)
+
+
 def edit_memories(
     client,
     store,
