@@ -719,35 +719,42 @@ class ChatController:
                     rule.vision and family and family not in selected.get("vision_disabled", ())
                     and not selected.get("custom_projectors", {}).get(str(model))
                 )
-                if vision:
-                    precision = detect_vision_precision(selected)
-                    needed += remaining(
-                        vision_path(folder, family, precision),
-                        VISION_DOWNLOADS[family][precision].size,
-                    )
                 embed = (
                     rule.embedding and not embedding_started and not self.embedding_download_active
                     and embedding.get("enabled") is not False
                     and not Path(embedding.get("path") or ".").expanduser().is_file()
                 )
-                if embed:
-                    needed += remaining(embedding_path(folder), EMBEDDING_DOWNLOAD.size)
                 if not (vision or embed):
                     return
                 model.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    check_download_space(model, needed)
-                except OSError:
-                    return  # Leave scarce disk space for the main model.
+
+                def can_overlap(size, asset):
+                    try:
+                        check_download_space(model, needed + size)
+                    except OSError:
+                        logging.debug("Deferring %s download until the main model is ready", asset)
+                        return False
+                    return True
+
                 if vision:
                     identity = (server["executable"], str(model))
-                    if identity not in parallel_vision:
+                    precision = detect_vision_precision(selected)
+                    vision_size = remaining(
+                        vision_path(folder, family, precision),
+                        VISION_DOWNLOADS[family][precision].size,
+                    )
+                    if identity in parallel_vision:
+                        needed += vision_size
+                    elif can_overlap(vision_size, "vision"):
+                        needed += vision_size
                         parallel_vision[identity] = downloads.submit(
                             self._prepare_model_vision, selected,
                             lambda: vision_stop.is_set() or stop_download(),
                             download=True, model_pending=True,
                         )
-                if embed:
+                if embed and can_overlap(
+                    remaining(embedding_path(folder), EMBEDDING_DOWNLOAD.size), "embedding"
+                ):
                     embedding_started = True
                     self.view.dispatch(start_embedding, profile, stop_download)
 

@@ -346,7 +346,11 @@ window.lopaca-main, .transcript-scroll, .transcript {
 }
 .message-copy-button:hover {
     background-color: alpha(@theme_fg_color,0.15);
-    color: alpha(@window_fg_color,0.85);
+    color: alpha(@window_fg_color,0.80);
+}
+.message-copy-button:active {
+    background-color: alpha(@theme_fg_color,0.25);
+    color: @window_fg_color;
 }
 .message-copy-button image {
     -gtk-icon-size: 1em;
