@@ -1,6 +1,7 @@
 """Detect usable hardware and install pinned llama-server release assets."""
 
 import ctypes as c
+import errno
 import io
 import logging
 import os
@@ -27,7 +28,13 @@ from settings import (
     MODEL_TOTAL_VRAM_DISCOUNT_GIB,
     VISION_DOWNLOADS,
 )
-from web import DownloadChecksumError, download_verified_file, matches_download
+from web import (
+    DownloadChecksumError,
+    DownloadDiskSpaceError,
+    check_download_space,
+    download_verified_file,
+    matches_download,
+)
 
 _RELEASE = "b12359"
 _RELEASE_URL = f"https://github.com/ggml-org/llama.cpp/releases/download/{_RELEASE}/"
@@ -897,7 +904,7 @@ def _verified_servers(folder, arch, candidates, stopped, on_progress):
 
 def default_model_configs(
     folder, stopped, on_progress, *, model_key=None, custom_model=None, installed=False,
-    discard=lambda: False,
+    discard=lambda: False, on_notice=lambda _message: None,
 ):
     """Start both downloads together when the hardware identifies a model."""
     arch = _server_arch()
@@ -927,6 +934,28 @@ def default_model_configs(
         finally:
             on_progress("model", key, None)
 
+    def download_recommended(key, profile, pending=None):
+        try:
+            return pending.result() if pending is not None else download(key, stopped)
+        except OSError as exc:
+            if model_key or not (
+                isinstance(exc, DownloadDiskSpaceError) or exc.errno == errno.ENOSPC
+            ):
+                raise
+            faster = MODEL_RECOMMENDATIONS[profile].faster
+            if stopped() or faster == key:
+                raise
+            if not model_path(folder, faster).is_file():
+                partial = model_download_path(folder, faster)
+                size = MODEL_DOWNLOADS[faster].size
+                offset = partial.stat().st_size if partial.is_file() else 0
+                try:
+                    check_download_space(partial, size - (offset if offset <= size else 0))
+                except DownloadDiskSpaceError:
+                    raise exc from None
+            on_notice("Not enough disk space for the recommended model. Switching to Faster.")
+            return download(faster, stopped)
+
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-download") as downloads:
         pending = None
         # If only the server can report VRAM, wait for its probe before transferring a model.
@@ -947,14 +976,16 @@ def default_model_configs(
                 raise RuntimeError("This model requires a compatible Blackwell or newer CUDA GPU.")
             key = model_key or MODEL_RECOMMENDATIONS[first["recommendation"]].balanced
             if pending is not None and key == predicted:
-                model = pending.result()
+                model = download_recommended(key, first["recommendation"], pending)
             else:
                 cancel_model.set()
                 if pending is not None:
                     with suppress(InterruptedError, OSError, ValueError):
                         pending.result()
                     on_progress("model", predicted, None)
-                model = model_path(folder, key) if installed else download(key, stopped)
+                model = model_path(folder, key) if installed else download_recommended(
+                    key, first["recommendation"]
+                )
         finally:
             cancel_model.set()
 
@@ -967,5 +998,5 @@ def default_model_configs(
         fallback = model_key or MODEL_RECOMMENDATIONS[server["recommendation"]].balanced
         if fallback != key:
             key = fallback
-            model = download(key, stopped)
+            model = download_recommended(key, server["recommendation"])
         yield {**server, "model": str(model)}

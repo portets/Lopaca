@@ -8,9 +8,11 @@ import subprocess
 import sys
 import sysconfig
 from contextlib import suppress
+from http.client import HTTPException
 from importlib import invalidate_caches
 from pathlib import Path
 from shutil import which
+from tarfile import TarError
 from tempfile import TemporaryDirectory
 
 from rag import _OPTIONAL_COMPRESSION_LIBRARIES, DOCUMENT_LIBRARIES
@@ -164,28 +166,18 @@ def install_optional_features(folder, stopped, progress):
     environment = folder / ".venv"
     python = environment / "bin" / "python"
     system_python = str(Path(sys.executable).resolve())
-    progress("Installing")
+    cached_uv = folder / "tools" / "uv"
+    uv = str(cached_uv) if os.access(cached_uv, os.X_OK) else which("uv")
     try:
-        _run([system_python, "-m", "venv", "--system-site-packages", str(environment)])
-    except RuntimeError as exc:
-        error = str(exc).lower()
-        if not any(
-            message in error
-            for message in (
-                "no module named venv",
-                "no module named ensurepip",
-                "ensurepip is not available",
-            )
-        ):
-            raise
-        progress("Downloading")
-        uv = _install_uv(folder, stopped)
+        if not uv:
+            progress("Downloading")
+            uv = str(_install_uv(folder, stopped))
         if stopped():
             return
         progress("Installing")
         _run(
             [
-                str(uv),
+                uv,
                 "venv",
                 "--no-python-downloads",
                 "--allow-existing",
@@ -195,18 +187,25 @@ def install_optional_features(folder, stopped, progress):
                 str(environment),
             ]
         )
-        installer = [str(uv), "pip", "install", "--python", str(python)]
-    else:
+    except (OSError, ValueError, RuntimeError, HTTPException, TarError, subprocess.TimeoutExpired):
+        if stopped():
+            return
+        logging.debug("uv setup failed. Using system Python and pip.", exc_info=True)
+        progress("Installing")
+        _run([system_python, "-m", "venv", "--system-site-packages", str(environment)])
         installer = [str(python), "-m", "pip", "install"]
+    else:
+        installer = [uv, "pip", "install", "--python", str(python)]
     if stopped():
         return
     probe = [str(python), "-c", _PROBE, json.dumps(_OPTIONAL_REQUIREMENTS)]
     missing = json.loads(_run(probe).splitlines()[-1])
     if missing:
+        requirements = [_OPTIONAL_REQUIREMENTS[name] for name in missing]
         # Try wheels first, with an exception for pure-Python odfpy.
         wheel_installer = [*installer, "--only-binary=:all:", "--no-binary=odfpy"]
         try:
-            _run([*wheel_installer, *(_OPTIONAL_REQUIREMENTS[name] for name in missing)])
+            _run([*wheel_installer, *requirements])
         except (RuntimeError, subprocess.TimeoutExpired) as exc:
             logging.debug("Optional package batch failed: %s", exc)
             retries = (wheel_installer, installer) if which("gcc") else (wheel_installer,)

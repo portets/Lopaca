@@ -263,14 +263,22 @@ def _download_xet(url, path, size, sha256, stopped, on_progress):
         return True
 
 
+class DownloadDiskSpaceError(OSError):
+    """The destination has too little free space for a download."""
+
+
+def check_download_space(path, remaining):
+    if shutil.disk_usage(path.parent).free < remaining + _DOWNLOAD_DISK_RESERVE:
+        raise DownloadDiskSpaceError(f"Not enough free space to download {path.name}.")
+
+
 def download_verified_file(url, path, *, size, sha256, on_progress=None, stopped=lambda: False):
     """Resume a staged download and check its advertised size and checksum."""
     offset = path.stat().st_size if path.exists() else 0
     if offset > size:
         path.unlink()
         offset = 0
-    if shutil.disk_usage(path.parent).free < size - offset + _DOWNLOAD_DISK_RESERVE:
-        raise OSError(f"Not enough free space to download {path.name}.")
+    check_download_space(path, size - offset)
 
     digest = _hash_file(path, stopped) if offset else hashlib.sha256()
     if stopped():
@@ -292,7 +300,7 @@ def download_verified_file(url, path, *, size, sha256, on_progress=None, stopped
             elif response.status == 200:
                 # A server may ignore Range. Reuse the disk space of the partial file.
                 if shutil.disk_usage(path.parent).free + offset < size + _DOWNLOAD_DISK_RESERVE:
-                    raise OSError("Not enough free space to restart this download.")
+                    raise DownloadDiskSpaceError("Not enough free space to restart this download.")
                 offset = 0
                 digest = hashlib.sha256()
             else:

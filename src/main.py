@@ -687,6 +687,7 @@ class ChatController:
                     custom_model=custom_model,
                     installed=installed,
                     discard=cancelled,
+                    on_notice=lambda message: self.view.dispatch(self.view.notify, message),
                 )
             except (OSError, RuntimeError, ValueError, HTTPException):
                 if not cancelled():
