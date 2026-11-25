@@ -50,10 +50,13 @@ from memory import (
 )
 from model_server import ModelServer
 from optional_features import (
+    activate_optional_packages,
     install_optional_features,
     launch_with_optional_python,
     optional_features_ready,
+    optional_python,
 )
+from packs import optional_numpy
 from rag import (
     DocumentIndexer,
     MissingDocumentLibraryError,
@@ -613,11 +616,20 @@ class ChatController:
 
         def finish(error):
             pending = self._pending_default_setup
+            active = activate_optional_packages(self.store.root.parent)
+            if active:
+                optional_numpy.cache_clear()
             set_stage(None)
             if error:
+                if not active and optional_python(self.store.root.parent):
+                    error += "\n\nRestart Lopaca to load the installed packages."
                 self.view._show_alert("Could not install optional features", error)
             elif self.optional_features_installed():
-                self.view.notify("Optional features installed. Restart Lopaca to use them.")
+                self.view.notify(
+                    "Optional features installed."
+                    if active
+                    else "Optional features installed. Restart Lopaca to use them."
+                )
             if pending is not None:
                 self._pending_default_setup = None
                 self.download_default_model(reconfigure=pending)

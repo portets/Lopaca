@@ -3,10 +3,14 @@
 import json
 import logging
 import os
+import site
 import subprocess
 import sys
+import sysconfig
 from contextlib import suppress
+from importlib import invalidate_caches
 from pathlib import Path
+from shutil import which
 from tempfile import TemporaryDirectory
 
 from rag import _OPTIONAL_COMPRESSION_LIBRARIES, DOCUMENT_LIBRARIES
@@ -85,6 +89,31 @@ def launch_with_optional_python(folder):
     python = optional_python(folder)
     if python and Path(sys.prefix).resolve() != python.parent.parent.resolve():
         os.execv(python, [str(python), *sys.argv])
+
+
+def activate_optional_packages(folder):
+    """Expose packages from a venv built with the running interpreter."""
+    python = optional_python(folder)
+    if not python or python.resolve() != Path(sys.executable).resolve():
+        return False
+
+    prefix = str(python.parent.parent)
+    scheme = sysconfig.get_paths("venv", vars={"base": prefix, "platbase": prefix})
+    library_paths = dict.fromkeys((scheme["purelib"], scheme["platlib"]))
+    directories = [path for path in library_paths if Path(path).is_dir()]
+    system_sites = {*site.getsitepackages(), site.getusersitepackages()}
+    for directory in reversed(directories):
+        if directory in sys.path:
+            continue
+        position = next(
+            (index for index, path in enumerate(sys.path) if path in system_sites), len(sys.path)
+        )
+        site.addsitedir(directory)
+        sys.path.remove(directory)
+        sys.path.insert(position, directory)
+        system_sites.add(directory)
+    invalidate_caches()
+    return bool(directories)
 
 
 def _install_uv(folder, stopped):
@@ -174,20 +203,24 @@ def install_optional_features(folder, stopped, progress):
     probe = [str(python), "-c", _PROBE, json.dumps(_OPTIONAL_REQUIREMENTS)]
     missing = json.loads(_run(probe).splitlines()[-1])
     if missing:
-        # odfpy is pure Python and published as source. Everything else must have a wheel.
-        installer += ["--only-binary=:all:", "--no-binary=odfpy"]
+        # Try wheels first, with an exception for pure-Python odfpy.
+        wheel_installer = [*installer, "--only-binary=:all:", "--no-binary=odfpy"]
         try:
-            _run([*installer, *(_OPTIONAL_REQUIREMENTS[name] for name in missing)])
-        except RuntimeError as exc:
+            _run([*wheel_installer, *(_OPTIONAL_REQUIREMENTS[name] for name in missing)])
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
             logging.debug("Optional package batch failed: %s", exc)
+            retries = (wheel_installer, installer) if which("gcc") else (wheel_installer,)
             for name in json.loads(_run(probe).splitlines()[-1]):
-                if stopped():
-                    return
                 requirement = _OPTIONAL_REQUIREMENTS[name]
-                try:
-                    _run([*installer, requirement])
-                except (RuntimeError, subprocess.TimeoutExpired) as exc:
-                    logging.warning("Could not install optional package %s: %s", requirement, exc)
+                for command in retries:
+                    if stopped():
+                        return
+                    try:
+                        _run([*command, requirement])
+                    except (RuntimeError, subprocess.TimeoutExpired) as exc:
+                        logging.debug("Optional install failed for %s: %s", requirement, exc)
+                    else:
+                        break
         missing = json.loads(_run(probe).splitlines()[-1])
     if stopped():
         return
@@ -208,6 +241,6 @@ def install_optional_features(folder, stopped, progress):
         unavailable = ", ".join(_OPTIONAL_REQUIREMENTS[name] for name in missing)
         raise RuntimeError(
             f"Unavailable for Python {sys.version_info.major}.{sys.version_info.minor}: "
-            f"{unavailable}. Successful installs are kept. Restart Lopaca to use them, "
-            "or retry in Settings later."
+            f"{unavailable}. Other optional features installed. Install GCC and retry or "
+            "retry in Settings later."
         )
