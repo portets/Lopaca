@@ -240,7 +240,7 @@ def install_optional_features(folder, stopped, progress):
     if missing:
         unavailable = ", ".join(_OPTIONAL_REQUIREMENTS[name] for name in missing)
         raise RuntimeError(
-            f"Unavailable for Python {sys.version_info.major}.{sys.version_info.minor}: "
-            f"{unavailable}. Other optional features installed. Install GCC and retry or "
-            "retry in Settings later."
+            f"Not yet available for Python {sys.version_info.major}.{sys.version_info.minor}: "
+            f"{unavailable}. Other optional features installed. Install GCC and retry, or retry "
+            "in Settings later."
         )

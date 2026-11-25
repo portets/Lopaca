@@ -616,12 +616,20 @@ class ChatController:
 
         def finish(error):
             pending = self._pending_default_setup
-            active = activate_optional_packages(self.store.root.parent)
+            folder = self.store.root.parent
+            active = False
+            try:
+                active = activate_optional_packages(folder)
+            except Exception:
+                logging.exception("Could not activate optional packages")
             if active:
                 optional_numpy.cache_clear()
+            if pending is not None:
+                self._pending_default_setup = None
+                self.download_default_model(reconfigure=pending)
             set_stage(None)
             if error:
-                if not active and optional_python(self.store.root.parent):
+                if not active and optional_python(folder):
                     error += "\n\nRestart Lopaca to load the installed packages."
                 self.view._show_alert("Could not install optional features", error)
             elif self.optional_features_installed():
@@ -630,10 +638,6 @@ class ChatController:
                     if active
                     else "Optional features installed. Restart Lopaca to use them."
                 )
-            if pending is not None:
-                self._pending_default_setup = None
-                self.download_default_model(reconfigure=pending)
-                self.view.refresh_model_configuration()
 
         def run():
             error = None
@@ -642,9 +646,8 @@ class ChatController:
                     self.store.root.parent, stopped,
                     lambda stage: self.view.dispatch(set_stage, stage),
                 )
-            except (
-                OSError, ValueError, RuntimeError, HTTPException, subprocess.SubprocessError
-            ) as exc:
+            except Exception as exc:
+                logging.exception("Optional feature setup failed")
                 error = str(exc)
             if not stopped():
                 self.view.dispatch(finish, error)

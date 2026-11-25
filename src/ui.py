@@ -3116,11 +3116,15 @@ class ChatWindow(Adw.ApplicationWindow):
         can_download = False
         managed = server_config.get("executable")
         server_available = managed and Path(managed).expanduser().is_file()
+        optional_stage = (
+            self.controller.optional_features_stage
+            if self.controller._pending_default_setup is not None else None
+        )
         downloading_server = server_percent is not None or (
             "server" not in self._model_download
-            and self._model_server_activity == DOWNLOADING_MODEL
+            and self._model_setup_downloading
         )
-        if downloading_server:
+        if downloading_server or optional_stage:
             server = "llama.cpp", "", True
         elif external and not self.controller.external_model_server:
             server = "Manually configured by user", "", False
@@ -3141,8 +3145,8 @@ class ChatWindow(Adw.ApplicationWindow):
         self._update_setup_highlights()
         self._update_download_indicator(
             self._server_download_indicator,
-            "Downloading server",
-            downloading_server,
+            f"{optional_stage} optional features" if optional_stage else "Downloading server",
+            downloading_server or bool(optional_stage),
             server_percent,
         )
         selected_config = settings.get("model_server", {}) if external else config
