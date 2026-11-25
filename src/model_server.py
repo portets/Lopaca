@@ -22,6 +22,7 @@ from settings import (
     SERVER_LAUNCH_DEFAULTS,
     SERVER_SAMPLING_DEFAULTS,
 )
+from web import is_disk_space_error
 
 DOWNLOADING_MODEL = "Downloading model"
 _GPU_LAYERS = re.compile(r"\boffloaded (\d+)/\d+ layers to GPU\b")
@@ -178,9 +179,10 @@ def _configured_gpu_offload(config, args):
 class ModelServer:
     """One asynchronous connection attempt, with bounded diagnostics and owned cleanup."""
 
-    def __init__(self, server_url, on_state, on_error):
+    def __init__(self, server_url, on_state, on_error, *, on_disk_error=None):
         self.url = server_url.rstrip("/").removesuffix("/v1")
         self.on_state, self.on_error = on_state, on_error
+        self.on_disk_error = on_disk_error or on_error
         self.process = None
         self.busy = False
         self.status = ""
@@ -359,7 +361,8 @@ class ModelServer:
             if output:
                 details += "\n\nServer output:\n" + output[-12000:]
             if not self._closed.is_set():
-                self.on_error(details)
+                report = self.on_disk_error if is_disk_space_error(exc) else self.on_error
+                report(details)
         finally:
             self.busy = False
             self.on_state(self.status, False)

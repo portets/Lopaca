@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from concurrent.futures import Future, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import suppress
 from dataclasses import replace
 from http.client import HTTPException
@@ -86,12 +86,14 @@ from server_builds import (
 from settings import (
     APP_DIR,
     CHAT_SETTING_DEFAULTS,
+    EMBEDDING_DOWNLOAD,
     MODEL_DOWNLOADS,
     MODEL_RECOMMENDATIONS,
     VISION_DOWNLOADS,
     Settings,
 )
 from storage import ChatStore, MemoryStore
+from web import check_download_space, is_disk_space_error
 
 CUSTOM_MODEL_FILE_KINDS = ("executable", "model", "mmproj")
 
@@ -226,6 +228,9 @@ class ChatController:
             settings.server_url,
             self._model_server_changed,
             lambda error: self.view.dispatch(self.view._show_alert, "Model server error", error),
+            on_disk_error=lambda error: self.view.dispatch(
+                self.view._show_alert, "Disk space error", error
+            ),
         )
 
     def attach(self, view):
@@ -631,7 +636,7 @@ class ChatController:
             if error:
                 if not active and optional_python(folder):
                     error += "\n\nRestart Lopaca to load the installed packages."
-                self.view._show_alert("Could not install optional features", error)
+                self.view._show_alert("Could not install some optional features", error)
             elif self.optional_features_installed():
                 self.view.notify(
                     "Optional features installed."
@@ -676,22 +681,109 @@ class ChatController:
             and Path(path).expanduser().is_file()
         ) else None
 
+        base_config = config if custom_model else {**config, "mmproj": "", "mmproj_manual": False}
+        parallel_vision = {}
+        embedding_started = False
+
         def prepare(stopped):
+            nonlocal embedding_started
             cancelled = self.download_cancels["model"].is_set
-            try:
-                yield from default_model_configs(
-                    self.store.root.parent,
-                    lambda: stopped() or cancelled(),
-                    self._model_download_progress,
-                    model_key=model_key,
-                    custom_model=custom_model,
-                    installed=installed,
-                    discard=cancelled,
-                    on_notice=lambda message: self.view.dispatch(self.view.notify, message),
+            folder = self.store.root.parent
+            embedding = self.store.load_app_settings().get("embedding_model", {})
+            vision_stop = threading.Event()
+
+            def stop_download():
+                return stopped() or cancelled()
+
+            def remaining(path, size):
+                if path.is_file():
+                    return 0
+                partial = path.with_suffix(".gguf.download")
+                with suppress(FileNotFoundError):
+                    offset = partial.stat().st_size
+                    if offset <= size:
+                        return size - offset
+                return size
+
+            def queue_assets(server, key):
+                nonlocal embedding_started
+                if installed or stop_download():
+                    return
+                model = model_path(folder, key)
+                profile = server["recommendation"]
+                rule = MODEL_RECOMMENDATIONS[profile]
+                selected = {**base_config, **server, "model": str(model)}
+                family = MODEL_DOWNLOADS[key].vision_family
+                needed = remaining(model, MODEL_DOWNLOADS[key].size)
+                vision = (
+                    rule.vision and family and family not in selected.get("vision_disabled", ())
+                    and not selected.get("custom_projectors", {}).get(str(model))
                 )
+                if vision:
+                    precision = detect_vision_precision(selected)
+                    needed += remaining(
+                        vision_path(folder, family, precision),
+                        VISION_DOWNLOADS[family][precision].size,
+                    )
+                embed = (
+                    rule.embedding and not embedding_started and not self.embedding_download_active
+                    and embedding.get("enabled") is not False
+                    and not Path(embedding.get("path") or ".").expanduser().is_file()
+                )
+                if embed:
+                    needed += remaining(embedding_path(folder), EMBEDDING_DOWNLOAD.size)
+                if not (vision or embed):
+                    return
+                model.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    check_download_space(model, needed)
+                except OSError:
+                    return  # Leave scarce disk space for the main model.
+                if vision:
+                    identity = (server["executable"], str(model))
+                    if identity not in parallel_vision:
+                        parallel_vision[identity] = downloads.submit(
+                            self._prepare_model_vision, selected,
+                            lambda: vision_stop.is_set() or stop_download(),
+                            download=True, model_pending=True,
+                        )
+                if embed:
+                    embedding_started = True
+                    self.view.dispatch(start_embedding, profile, stop_download)
+
+            try:
+                with ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="vision-download"
+                ) as downloads:
+                    try:
+                        yield from default_model_configs(
+                            folder, stop_download, self._model_download_progress,
+                            model_key=model_key,
+                            custom_model=custom_model,
+                            installed=installed,
+                            discard=cancelled,
+                            on_disk_warning=lambda message: self.view.dispatch(
+                                self.view._show_alert, "Disk space warning", message
+                            ),
+                            on_model=queue_assets,
+                        )
+                    finally:
+                        vision_stop.set()
             except (OSError, RuntimeError, ValueError, HTTPException):
                 if not cancelled():
                     raise
+
+        def start_embedding(profile, stopped):
+            if not stopped():
+                self.download_embedding(automatic=True, profile=profile)
+
+        def prepare_vision(paths, stopped):
+            pending = parallel_vision.pop((paths["executable"], paths["model"]), None)
+            if pending is None:
+                return self._prepare_model_vision(paths, stopped, download=not installed)
+            selected = pending.result()
+            selected["load_vision"] = self._chat_needs_vision(selected, self._next_model_chat())
+            return selected
 
         def save(paths):
             self._save_downloaded_model(
@@ -711,21 +803,24 @@ class ChatController:
                     if key in paths
                 }
             )
-            if not installed:
+            if not installed and not embedding_started:
                 self.download_embedding(automatic=True, profile=paths["recommendation"])
 
         return self.model_server.connect(
-            config if custom_model else {**config, "mmproj": "", "mmproj_manual": False},
+            base_config,
             prepare=prepare,
-            prepare_config=lambda paths, stopped: self._prepare_model_vision(
-                paths, stopped, download=not installed
-            ),
+            prepare_config=prepare_vision,
             on_finished=on_finished,
             on_config=lambda paths: self.view.dispatch(save, paths),
         )
 
     def _model_download_progress(self, stage, item, percent):
         self.view.dispatch(self.view.update_model_download, stage, item, percent)
+
+    def _show_download_error(self, title, error):
+        if is_disk_space_error(error):
+            title = "Disk space error"
+        self.view._show_alert(title, str(error))
 
     def _install_vision(self, folder, family, precision, stopped, progress):
         with self._vision_download_lock:
@@ -741,10 +836,12 @@ class ChatController:
                     raise
                 return None
 
-    def _prepare_model_vision(self, config, stopped, *, strict=False, download=False, chat_id=None):
+    def _prepare_model_vision(
+        self, config, stopped, *, strict=False, download=False, chat_id=None, model_pending=False
+    ):
         folder = self.store.root.parent
         model = config.get("model")
-        if not model or not Path(model).expanduser().is_file():
+        if not model or (not model_pending and not Path(model).expanduser().is_file()):
             return config
         config = {**config, "recommendation": recommendation_for_config(config)}
         config.pop("vision_fallback", None)
@@ -800,7 +897,7 @@ class ChatController:
         except (OSError, ValueError, HTTPException) as exc:
             if strict:
                 raise
-            self.view.dispatch(self.view._show_alert, "Vision download failed", str(exc))
+            self.view.dispatch(self._show_download_error, "Vision download failed", exc)
             return {**selected, "mmproj": ""}
         return {**selected, "mmproj": str(path) if path and path.is_file() else ""}
 
@@ -1162,7 +1259,7 @@ class ChatController:
             try:
                 path = install(self.store.root.parent, stopped, self._model_download_progress)
             except (OSError, ValueError, HTTPException) as exc:
-                result = None, str(exc)
+                result = None, exc
             else:
                 result = path, None
             if not stopped():
@@ -1172,9 +1269,9 @@ class ChatController:
             try:
                 apply(path)
             except OSError as exc:
-                error = str(exc)
+                error = exc
             if error:
-                self.view._show_alert(failure_title, error)
+                self._show_download_error(failure_title, error)
 
         threading.Thread(target=download, daemon=True).start()
 
@@ -1271,7 +1368,7 @@ class ChatController:
                 if not cancelled():
                     error = str(exc)
             except (OSError, ValueError, HTTPException) as exc:
-                error = str(exc)
+                error = exc
             if not self._model_file_stop.is_set():
                 self.view.dispatch(self._finish_model_download, key, failure_title, error)
 
@@ -1291,7 +1388,7 @@ class ChatController:
         except OSError as exc:
             self.view._show_alert("Could not save model settings", str(exc))
         if error:
-            self.view._show_alert(failure_title, error)
+            self._show_download_error(failure_title, error)
         if (
             not self.download_cancels["model"].is_set()
             and (not error or failure_title == "Vision download failed")

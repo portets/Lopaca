@@ -1,6 +1,7 @@
 """Internet downloads for reply images and knowledge packs."""
 
 import atexit
+import errno
 import hashlib
 import http.client
 import shutil
@@ -267,9 +268,16 @@ class DownloadDiskSpaceError(OSError):
     """The destination has too little free space for a download."""
 
 
+def is_disk_space_error(error):
+    return isinstance(error, DownloadDiskSpaceError) or (
+        isinstance(error, OSError) and error.errno == errno.ENOSPC
+    )
+
+
 def check_download_space(path, remaining):
     if shutil.disk_usage(path.parent).free < remaining + _DOWNLOAD_DISK_RESERVE:
-        raise DownloadDiskSpaceError(f"Not enough free space to download {path.name}.")
+        name = path.name.removesuffix(".download")
+        raise DownloadDiskSpaceError(f"Not enough free space to download {name}.")
 
 
 def download_verified_file(url, path, *, size, sha256, on_progress=None, stopped=lambda: False):

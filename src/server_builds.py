@@ -1,7 +1,6 @@
 """Detect usable hardware and install pinned llama-server release assets."""
 
 import ctypes as c
-import errno
 import io
 import logging
 import os
@@ -33,6 +32,7 @@ from web import (
     DownloadDiskSpaceError,
     check_download_space,
     download_verified_file,
+    is_disk_space_error,
     matches_download,
 )
 
@@ -832,6 +832,10 @@ def _download_gguf(path, url, expected, on_progress, stage, item, discard):
         if expected["stopped"]():
             raise InterruptedError("Download cancelled.")
         partial.replace(path)
+    except OSError as exc:
+        if is_disk_space_error(exc):
+            raise DownloadDiskSpaceError(f"Not enough free space to download {path.name}.") from exc
+        raise
     finally:
         if discard():
             partial.unlink(missing_ok=True)
@@ -854,6 +858,7 @@ def _report_progress(callback, stage, server=None):
 def _verified_servers(folder, arch, candidates, stopped, on_progress):
     verified = False
     failures = []
+    disk_failure = False
     for backend, names in candidates:
         if stopped():
             return
@@ -883,6 +888,7 @@ def _verified_servers(folder, arch, candidates, stopped, on_progress):
             tarfile.TarError,
             subprocess.TimeoutExpired,
         ) as exc:
+            disk_failure |= is_disk_space_error(exc)
             failures.append(f"{BACKEND_LABELS[backend]}: {exc}")
             logging.warning("Could not prepare %s llama-server: %s", backend, exc)
             continue
@@ -897,14 +903,16 @@ def _verified_servers(folder, arch, candidates, stopped, on_progress):
         on_progress("server", server, None)
         yield server
     if not verified and not stopped():
-        raise RuntimeError(
+        error_type = DownloadDiskSpaceError if disk_failure else RuntimeError
+        raise error_type(
             "No packaged llama-server build could be prepared.\n\n" + "\n".join(failures)
         )
 
 
 def default_model_configs(
     folder, stopped, on_progress, *, model_key=None, custom_model=None, installed=False,
-    discard=lambda: False, on_notice=lambda _message: None,
+    discard=lambda: False, on_disk_warning=lambda _message: None,
+    on_model=lambda _server, _key: None,
 ):
     """Start both downloads together when the hardware identifies a model."""
     arch = _server_arch()
@@ -934,27 +942,39 @@ def default_model_configs(
         finally:
             on_progress("model", key, None)
 
-    def download_recommended(key, profile, pending=None):
+    def download_recommended(key, server, pending=None):
         try:
+            on_model(server, key)
             return pending.result() if pending is not None else download(key, stopped)
         except OSError as exc:
-            if model_key or not (
-                isinstance(exc, DownloadDiskSpaceError) or exc.errno == errno.ENOSPC
-            ):
+            if model_key or stopped() or not is_disk_space_error(exc):
                 raise
-            faster = MODEL_RECOMMENDATIONS[profile].faster
-            if stopped() or faster == key:
-                raise
-            if not model_path(folder, faster).is_file():
+
+        no_model_fits = "Not enough disk space for any model in automatic setup."
+        faster = MODEL_RECOMMENDATIONS[server["recommendation"]].faster
+        if faster == key:
+            raise DownloadDiskSpaceError(no_model_fits)
+        faster_installed = model_path(folder, faster).is_file()
+        try:
+            if not faster_installed:
                 partial = model_download_path(folder, faster)
                 size = MODEL_DOWNLOADS[faster].size
-                offset = partial.stat().st_size if partial.is_file() else 0
-                try:
-                    check_download_space(partial, size - (offset if offset <= size else 0))
-                except DownloadDiskSpaceError:
-                    raise exc from None
-            on_notice("Not enough disk space for the recommended model. Switching to Faster.")
+                with suppress(FileNotFoundError):
+                    offset = partial.stat().st_size
+                    if offset <= size:
+                        size -= offset
+                check_download_space(partial, size)
+            on_disk_warning(
+                "Not enough disk space for the Balanced model. "
+                + ("Switching to the installed Faster model." if faster_installed else
+                   "Downloading the Faster model instead.")
+            )
+            on_model(server, faster)
             return download(faster, stopped)
+        except OSError as exc:
+            if is_disk_space_error(exc):
+                raise DownloadDiskSpaceError(no_model_fits) from exc
+            raise
 
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-download") as downloads:
         pending = None
@@ -976,7 +996,7 @@ def default_model_configs(
                 raise RuntimeError("This model requires a compatible Blackwell or newer CUDA GPU.")
             key = model_key or MODEL_RECOMMENDATIONS[first["recommendation"]].balanced
             if pending is not None and key == predicted:
-                model = download_recommended(key, first["recommendation"], pending)
+                model = download_recommended(key, first, pending)
             else:
                 cancel_model.set()
                 if pending is not None:
@@ -984,7 +1004,7 @@ def default_model_configs(
                         pending.result()
                     on_progress("model", predicted, None)
                 model = model_path(folder, key) if installed else download_recommended(
-                    key, first["recommendation"]
+                    key, first
                 )
         finally:
             cancel_model.set()
@@ -998,5 +1018,5 @@ def default_model_configs(
         fallback = model_key or MODEL_RECOMMENDATIONS[server["recommendation"]].balanced
         if fallback != key:
             key = fallback
-            model = download_recommended(key, server["recommendation"])
+            model = download_recommended(key, server)
         yield {**server, "model": str(model)}
