@@ -122,7 +122,7 @@ class ChatStore:
     def load_settings(self, chat_id):
         try:
             data = _read_json_object(self.folder(chat_id) / "chat-settings.json")
-        except OSError, json.JSONDecodeError:
+        except (OSError, json.JSONDecodeError):
             data = {}
         if not isinstance(data.get("created"), (int, float)):
             data["created"] = time.time()
@@ -138,7 +138,7 @@ class ChatStore:
             data = _read_json_object(self.root.parent / "app-settings.json")
         except FileNotFoundError:
             data = {"first_launch": True}
-        except OSError, json.JSONDecodeError:
+        except (OSError, json.JSONDecodeError):
             data = {}
         for key in ("pinned_chats", "unpinned_chat_order"):
             chat_order = data.get(key, [])

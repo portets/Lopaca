@@ -282,7 +282,7 @@ window.lopaca-main, .transcript-scroll, .transcript {
 
 /* Messages and reasoning */
 .message-row {
-    padding: 5px 0;
+    padding: 5px 0 0;
 }
 .message {
     padding: 10px 13px;
@@ -326,9 +326,30 @@ window.lopaca-main, .transcript-scroll, .transcript {
 }
 .message-time {
     opacity: 0;
+    border-spacing: 10px;
 }
-.message:hover + .message-time {
+.assistant-message + .message-time {
+    border-spacing: 14px;
+}
+.message-column:hover > .message-time,
+.message-time:focus-within {
     opacity: 1;
+}
+.message-copy-button {
+    min-width: 0;
+    min-height: 0;
+    padding: 4px;
+    border-radius: 4px;
+    background-color: transparent;
+    background-image: none;
+    box-shadow: none;
+}
+.message-copy-button:hover {
+    background-color: alpha(@theme_fg_color,0.15);
+    color: alpha(@window_fg_color,0.85);
+}
+.message-copy-button image {
+    -gtk-icon-size: 1em;
 }
 .thinking {
     background-color: alpha(@theme_fg_color,0.065);
@@ -351,6 +372,8 @@ window.lopaca-main, .transcript-scroll, .transcript {
 }
 .message-column {
     border-spacing: 3px;
+    /* Keep this inside the hover area. It replaces the row's bottom padding. */
+    padding-bottom: 5px;
 }
 .reasoning-content {
     border-spacing: 6px;
@@ -362,7 +385,7 @@ window.lopaca-main, .transcript-scroll, .transcript {
     border-spacing: 6px;
 }
 .message-time-label {
-    /* Theme defaults; add overrides here when needed. */
+    font-feature-settings: "tnum" 1;
 }
 .message-label {
     /* Theme defaults; add overrides here when needed. */
@@ -798,15 +821,15 @@ button.edit-button-pressed {
 def message_time(timestamp, now=None, clock_format=None):
     date = datetime.fromtimestamp(timestamp)
     days = ((now or datetime.now()).date() - date.date()).days
-    clock = (
-        f"{date.hour:02d}:{date.minute:02d}"
-        if (clock_format or get_clock_format()) == "24h"
-        else f"{date.hour % 12 or 12}:{date.minute:02d} {'AM' if date.hour < 12 else 'PM'}"
-    )
-    if days == 0:
-        return clock
-    prefix = date.strftime("%a") if 0 < days < 7 else f"{date.strftime('%b')} {date.day}"
-    return f"{prefix} {clock}"
+    if (clock_format or get_clock_format()) == "24h":
+        clock = f"{date.hour:02d}:{date.minute:02d}"
+    else:
+        hour = date.hour % 12 or 12
+        clock = f"{hour}:{date.minute:02d} {'AM' if date.hour < 12 else 'PM'}"
+    if days:
+        prefix = date.strftime("%a") if 0 < days < 7 else f"{date.strftime('%b')} {date.day}"
+        clock = f"{prefix} {clock}"
+    return clock
 
 
 def message_day(date, now=None):
@@ -2073,6 +2096,7 @@ class ChatWindow(Adw.ApplicationWindow):
             attachments=message.get("attachments", ()),
         )
         if earlier:
+            wrapper.message_row.message_text = earlier + "\n\n" + text
             self._earlier_prose = self._older_prose_sections(wrapper, earlier)
         return wrapper
 
@@ -2157,12 +2181,25 @@ class ChatWindow(Adw.ApplicationWindow):
         time_label = Gtk.Label(label=message_time(timestamp))
         time_label.add_css_class("message-time-label")
         time_label.add_css_class("muted")
-        time_label.add_css_class("message-time")
-        time_label.set_halign(Gtk.Align.END if role == "user" else Gtk.Align.START)
-        column.append(time_label)
+        footer = Gtk.Box(
+            halign=Gtk.Align.END if role == "user" else Gtk.Align.START,
+            css_classes=["message-time"],
+        )
+        copy_button = Gtk.Button(
+            icon_name="edit-copy-symbolic", tooltip_text="Copy message", has_frame=False,
+            css_classes=["message-copy-button", "muted"],
+        )
+        copy_button.connect(
+            "clicked",
+            lambda button: button.get_clipboard().set(GObject.Value(str, row.message_text)),
+        )
+        for widget in (copy_button, time_label) if role == "user" else (time_label, copy_button):
+            footer.append(widget)
+        column.append(footer)
         row.append(column)
         row.timestamp = timestamp
         row.time_label = time_label
+        row.message_text = text
         wrapper.message_row = row
         label = Gtk.Label(label="You" if role == "user" else "Assistant", xalign=0)
         label.add_css_class("message-label")
@@ -2396,6 +2433,7 @@ class ChatWindow(Adw.ApplicationWindow):
             self.set_status("Responding")
             self._collapse_thinking()
         self._render_streamed_answer(text)
+        self._response_row.message_text = text
         if self._response_row.get_parent() == self.transcript:
             self.scroll_bottom()
         return False
@@ -2451,6 +2489,7 @@ class ChatWindow(Adw.ApplicationWindow):
         if reasoning and self.current_thinking is None:
             self.current_thinking = self._create_thinking_widget(self.current_wrapper, "", True)
         answer = answer.strip()
+        self._response_row.message_text = answer
         if (
             self.current_answer.images.requests
             and not self._answer_committed
@@ -4128,7 +4167,7 @@ class ChatWindow(Adw.ApplicationWindow):
 
         try:
             catalog = load_catalog()
-        except OSError, ValueError:
+        except (OSError, ValueError):
             catalog = {}
         rows = []
         indicators = {}

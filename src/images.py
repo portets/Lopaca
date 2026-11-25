@@ -43,7 +43,7 @@ def _image_formats():
     mime_types = {mime: mime for mime in NATIVE_IMAGE_MIMES}
     try:
         pixbuf, _ = _pixbuf_libraries()
-    except ImportError, ValueError:
+    except (ImportError, ValueError):
         return extensions, mime_types
     for image_format in pixbuf.Pixbuf.get_formats():
         if image_format.is_disabled() or not (types := image_format.get_mime_types()):

@@ -424,7 +424,7 @@ class ModelServer:
         try:
             if not self._wait_for_health(process):
                 return False
-        except OSError, RuntimeError:
+        except (OSError, RuntimeError):
             if process.poll() is None:
                 self._stop_process(process)
             reader.join(timeout=1)

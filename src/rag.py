@@ -1060,7 +1060,7 @@ def _sections(text, filename):
     elif filename.lower().endswith((".py", ".pyi")):
         try:
             tree = ast.parse(text)
-        except SyntaxError, ValueError, RecursionError:
+        except (SyntaxError, ValueError, RecursionError):
             tree = None
 
         def visit(node, parents=()):

@@ -390,7 +390,7 @@ class _EmbeddingSession:
                             self._retry_at[job] = time.monotonic() + 30
                             self._jobs.pop(job, None)
                         logging.debug("Could not index embeddings for %s", path, exc_info=True)
-        except OSError, HTTPException, KeyError, TypeError, ValueError, RuntimeError:
+        except (OSError, HTTPException, KeyError, TypeError, ValueError, RuntimeError):
             if self.available:
                 logging.warning(
                     "Local embeddings unavailable. Using keyword recall.", exc_info=True
@@ -409,7 +409,7 @@ class _EmbeddingSession:
             vectors = self._embed_passages(texts)
             if vectors is None:
                 return
-        except OSError, HTTPException, KeyError, TypeError, ValueError:
+        except (OSError, HTTPException, KeyError, TypeError, ValueError):
             logging.debug("Could not score knowledge excerpts", exc_info=True)
             return
         with self._lock:
@@ -547,7 +547,7 @@ class _EmbeddingSession:
                 if self._thinking_timeouts >= _THINKING_TIMEOUT_LIMIT:
                     self._thinking_retry_at = time.monotonic() + _THINKING_COOLDOWN
             return None
-        except OSError, HTTPException, KeyError, TypeError, ValueError:
+        except (OSError, HTTPException, KeyError, TypeError, ValueError):
             return None
         finally:
             self._inference.release()

@@ -1055,7 +1055,7 @@ class KnowledgeLibrary:
     def _catalog(self):
         try:
             return load_catalog(folder=self.folder)
-        except OSError, ValueError:
+        except (OSError, ValueError):
             return {}
 
     def _entries(self):
@@ -1561,7 +1561,7 @@ class KnowledgeLibrary:
             if catalog is None:
                 try:
                     catalog = list(load_catalog().values())
-                except OSError, ValueError:
+                except (OSError, ValueError):
                     catalog = []
             parent = next(
                 (

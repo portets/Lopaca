@@ -169,7 +169,7 @@ def _download_ranges(url, path, size, offset, digest, stopped, on_progress):
                 while pending:
                     try:
                         block = pending.popleft().result()
-                    except OSError, http.client.HTTPException, _RangeUnavailableError:
+                    except (OSError, http.client.HTTPException, _RangeUnavailableError):
                         if stopped():
                             raise InterruptedError("Download cancelled.") from None
                         # The sequential downloader can resume from this prefix.

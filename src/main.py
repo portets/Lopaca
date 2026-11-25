@@ -130,7 +130,7 @@ def build_system_prompt(agent_mode, style="neutral", *, memories=False):
                 styles = style_path.read_text(encoding="utf-8")
             except FileNotFoundError:
                 styles = (style_path.parent.parent / "style.md").read_text(encoding="utf-8")
-        except OSError, UnicodeError:
+        except (OSError, UnicodeError):
             return prompt
         sections = re.split(r"(?m)^# ([^\n]+)\n", styles)
         for heading, instructions in zip(sections[1::2], sections[2::2], strict=True):
@@ -1739,7 +1739,7 @@ class ChatController:
                 self._model_lock,
                 lambda: stop.is_set() or self.busy or self.model_server.busy or not self.connected,
             )
-        except OSError, ValueError, KeyError, RuntimeError, sqlite3.Error:
+        except (OSError, ValueError, KeyError, RuntimeError, sqlite3.Error):
             # Warming is opportunistic. Normal generation handles connection errors.
             return
 

@@ -12,12 +12,13 @@ if [[ ! "$SOURCE_DIR" -ef "$INSTALL_DIR" ]]; then
     cp -- "$SOURCE_DIR"/*.py "$INSTALL_DIR/"
 fi
 cp -- "$SCRIPT_DIR/lopaca.svg" "$INSTALL_DIR/"
+cp -- "$SCRIPT_DIR/lopaca.sh" "$INSTALL_DIR/"
 if [[ ! "$SOURCE_DIR/style.md" -ef "$DATA_DIR/style.md" ]]; then
     cp -- "$SOURCE_DIR/style.md" "$DATA_DIR/style.md"
 fi
 
 # Escape special characters for a quoted desktop-entry Exec argument.
-LAUNCH_PATH=$(printf '%s' "$INSTALL_DIR/main.py" | sed \
+LAUNCH_PATH=$(printf '%s' "$INSTALL_DIR/lopaca.sh" | sed \
     -e 's/\\/\\\\\\\\/g' -e 's/["$`]/\\\\&/g' -e 's/%/%%/g')
 ICON_PATH=$(printf '%s' "$INSTALL_DIR/lopaca.svg" | sed 's/\\/\\\\/g')
 
@@ -26,7 +27,7 @@ cat > "$APPLICATIONS_DIR/app.lopaca.Lopaca.desktop" <<EOF
 Type=Application
 Name=Lopaca
 Comment=Chat with a local language model
-Exec=python3 "$LAUNCH_PATH"
+Exec=bash "$LAUNCH_PATH"
 Icon=$ICON_PATH
 Terminal=false
 Categories=Utility;

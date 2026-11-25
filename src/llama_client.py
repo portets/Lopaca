@@ -71,7 +71,7 @@ def _valid_tool_calls(calls, tools):
                 or not arguments.keys() <= schema.get("properties", {}).keys()
             ):
                 return False
-        except KeyError, TypeError, ValueError:
+        except (KeyError, TypeError, ValueError):
             return False
     return True
 

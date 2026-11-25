@@ -1,11 +1,13 @@
 """Detect usable hardware and install pinned llama-server release assets."""
 
 import ctypes as c
+import io
 import logging
 import os
 import platform
 import re
 import shlex
+import shutil
 import struct
 import subprocess
 import tarfile
@@ -71,6 +73,20 @@ _CUDA_RUNTIMES = {
         "75a12d227f44a391608992329241765343bd143ee9445b90dc62e154ee726e5d",
     ),
 }
+# Debian Bookworm security packages for OpenSSL 3.0.22 (3.0.22-1~deb12u2).
+# The snapshot URLs are permanent and the downloads are verified with SHA-256.
+_OPENSSL_RUNTIMES = {
+    "x64": (
+        "x86_64", "9646c07cf15db75bb019e7aa9bdfda2961f9addf", 2039888,
+        "cb4784740daa9b3b0eaea2b444bbefa686794afbbf3d678d238c1fd9875f2efd",
+    ),
+    "arm64": (
+        "aarch64", "3ab5134060ac0cccd08cc0a28c12cf68ad0c48a7", 1829128,
+        "3d04ecd8d0f57fed50d205abaeedfcc84c1960073ea085719c00add44b0ccd7f",
+    ),
+}
+_OPENSSL_LIBRARIES = ("libcrypto.so.3", "libssl.so.3")
+_OPENSSL_LOCK = Lock()
 _SERVER_LIBRARY = re.compile(
     r"(?:libggml(?:-base|-cpu(?:-[\w-]+)?|-cuda|-vulkan)?"
     r"|libllama(?:-server-impl|-common)?|libmtmd)\.so(?:\.\d+)*"
@@ -141,7 +157,7 @@ def _nvidia_board_memory(driver, device):
                 return memory[0] // 1024**2 or None
         finally:
             nvml.nvmlShutdown()
-    except OSError, AttributeError:
+    except (OSError, AttributeError):
         pass
     return None
 
@@ -428,11 +444,62 @@ def _server_info(executable, option, *, timeout=20):
     return result.stdout
 
 
+def _deb_data(archive):
+    # A Debian package is an ar archive. The pinned packages use xz for their payload.
+    if archive.read(8) != b"!<arch>\n":
+        raise ValueError("Invalid OpenSSL package.")
+    while header := archive.read(60):
+        if len(header) != 60 or header[58:] != b"`\n":
+            break
+        size = int(header[48:58])
+        if header[:16].strip().rstrip(b"/") == b"data.tar.xz":
+            return io.BytesIO(archive.read(size))
+        archive.seek(size + size % 2, os.SEEK_CUR)
+    raise ValueError("The OpenSSL package has no data.tar.xz payload.")
+
+
+def _install_openssl(executable, arch, stopped):
+    architecture, snapshot, size, digest = _OPENSSL_RUNTIMES[arch]
+    server = executable.parent.parent
+    runtime = server / f"openssl-{arch}-{digest[:12]}"
+    with _OPENSSL_LOCK:
+        if stopped():
+            raise InterruptedError("Download cancelled.")
+        if not runtime.is_dir():
+            with TemporaryDirectory(dir=server, prefix=".openssl-") as temporary:
+                staging = Path(temporary)
+                package = staging / "openssl.deb"
+                download_verified_file(
+                    f"https://snapshot.debian.org/file/{snapshot}", package,
+                    size=size, sha256=digest, stopped=stopped,
+                )
+                libraries = staging / "libraries"
+                libraries.mkdir()
+                with (
+                    package.open("rb") as archive,
+                    tarfile.open(fileobj=_deb_data(archive), mode="r:xz") as payload,
+                ):
+                    for name in _OPENSSL_LIBRARIES:
+                        member = payload.getmember(f"./usr/lib/{architecture}-linux-gnu/{name}")
+                        if not member.isfile():
+                            raise ValueError(f"Invalid OpenSSL library: {name}")
+                        with (
+                            payload.extractfile(member) as source,
+                            (libraries / name).open("wb") as output,
+                        ):
+                            shutil.copyfileobj(source, output)
+                libraries.rename(runtime)
+        # The packaged libllama-server-impl.so already searches its own directory.
+        for name in _OPENSSL_LIBRARIES:
+            with suppress(FileExistsError):
+                (executable.parent / name).symlink_to(Path("..") / runtime.name / name)
+
+
 def custom_server_backend(filename):
     try:
         executable = Path(filename).expanduser().resolve()
         output = _server_info(executable, "--list-devices", timeout=3)
-    except OSError, RuntimeError, subprocess.TimeoutExpired:
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
         return None
     _, header, devices = output.partition("Available devices:")
     if not header:
@@ -685,7 +752,7 @@ def _embedding_threads():
     """Size the worker pool from Linux's usable physical cores and SMT siblings."""
     try:
         available = os.sched_getaffinity(0)
-    except AttributeError, OSError:
+    except (AttributeError, OSError):
         return max(1, min(24, (os.cpu_count() or 1) - 1))
     try:
         topology = Path("/sys/devices/system/cpu")
@@ -787,7 +854,16 @@ def _verified_servers(folder, arch, candidates, stopped, on_progress):
             executable = _install_server(
                 folder / "server", arch, backend, stopped, _report_progress(on_progress, "server")
             )
-            devices, recommendation = _verify_devices(executable, backend, names)
+            try:
+                devices, recommendation = _verify_devices(executable, backend, names)
+            except RuntimeError as exc:
+                if not any(
+                    f"{library}: cannot open shared object file" in str(exc)
+                    for library in _OPENSSL_LIBRARIES
+                ):
+                    raise
+                _install_openssl(executable, arch, stopped)
+                devices, recommendation = _verify_devices(executable, backend, names)
             version = re.search(
                 r"^version: (.+)", _server_info(executable, "--version"), re.MULTILINE
             )

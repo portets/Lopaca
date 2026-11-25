@@ -1,6 +1,7 @@
 """Install optional libraries in a local environment for Lopaca."""
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -44,6 +45,13 @@ import sys
 missing = []
 for name, requirement in json.loads(sys.argv[1]).items():
     try:
+        if name == "zstandard":
+            try:
+                from compression import zstd
+            except ImportError:
+                pass
+            else:
+                continue
         import_module(name)
         package, _, minimum = requirement.partition(">=")
         if minimum:
@@ -52,7 +60,7 @@ for name, requirement in json.loads(sys.argv[1]).items():
             actual = tuple(map(int, match[0].split("."))) if match else ()
             if (actual + (0,) * len(target))[:len(target)] < target:
                 missing.append(name)
-    except (ImportError, OSError):
+    except Exception:
         missing.append(name)
 print(json.dumps(missing))
 """
@@ -166,9 +174,23 @@ def install_optional_features(folder, stopped, progress):
     probe = [str(python), "-c", _PROBE, json.dumps(_OPTIONAL_REQUIREMENTS)]
     missing = json.loads(_run(probe).splitlines()[-1])
     if missing:
-        _run([*installer, *(_OPTIONAL_REQUIREMENTS[name] for name in missing)])
-        if unavailable := json.loads(_run(probe).splitlines()[-1]):
-            raise RuntimeError("Could not load optional libraries: " + ", ".join(unavailable))
+        # odfpy is pure Python and published as source. Everything else must have a wheel.
+        installer += ["--only-binary=:all:", "--no-binary=odfpy"]
+        try:
+            _run([*installer, *(_OPTIONAL_REQUIREMENTS[name] for name in missing)])
+        except RuntimeError as exc:
+            logging.debug("Optional package batch failed: %s", exc)
+            for name in json.loads(_run(probe).splitlines()[-1]):
+                if stopped():
+                    return
+                requirement = _OPTIONAL_REQUIREMENTS[name]
+                try:
+                    _run([*installer, requirement])
+                except (RuntimeError, subprocess.TimeoutExpired) as exc:
+                    logging.warning("Could not install optional package %s: %s", requirement, exc)
+        missing = json.loads(_run(probe).splitlines()[-1])
+    if stopped():
+        return
     _run(
         [
             str(python),
@@ -177,5 +199,15 @@ def install_optional_features(folder, stopped, progress):
             "from gi.repository import Gtk, Adw",
         ]
     )
-    if not stopped():
-        (environment / ".lopaca-ready").write_text(_READY_VERSION)
+    if stopped():
+        return
+    # Allow the app and the downloader to use a working partial installation.
+    if len(missing) < len(_OPTIONAL_REQUIREMENTS):
+        (environment / ".lopaca-ready").write_text("partial" if missing else _READY_VERSION)
+    if missing:
+        unavailable = ", ".join(_OPTIONAL_REQUIREMENTS[name] for name in missing)
+        raise RuntimeError(
+            f"Unavailable for Python {sys.version_info.major}.{sys.version_info.minor}: "
+            f"{unavailable}. Successful installs are kept. Restart Lopaca to use them, "
+            "or retry in Settings later."
+        )

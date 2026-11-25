@@ -67,7 +67,7 @@ def _show_picture_when_mapped(widget, request, loaded, failed):
     def display(result):
         try:
             pixbuf = result.result()
-        except OSError, ValueError, GLib.Error:
+        except (OSError, ValueError, GLib.Error):
             failed()
         else:
             loaded(pixbuf)

@@ -99,7 +99,7 @@ def _desktop_clock_settings():
         schema = source.lookup("org.gnome.desktop.interface", True) if source else None
         if schema and schema.has_key("clock-format"):
             return Gio.Settings.new_full(schema, None, None)
-    except ImportError, RuntimeError:
+    except (ImportError, RuntimeError):
         pass
     return None
 
@@ -111,7 +111,7 @@ def get_clock_format():
         return value
     try:
         pattern = locale.nl_langinfo(locale.T_FMT)
-    except AttributeError, ValueError:
+    except (AttributeError, ValueError):
         return "24h"
     return "12h" if re.search(r"%(?:E|O)?[Ilrp]", pattern) else "24h"
 
@@ -127,7 +127,7 @@ def get_datetime():
     if zone:
         try:
             now = now.astimezone(ZoneInfo(zone))
-        except ZoneInfoNotFoundError, ValueError:
+        except (ZoneInfoNotFoundError, ValueError):
             zone = ""
     return {
         "datetime": now.isoformat(timespec="seconds"),
@@ -319,7 +319,7 @@ class DocumentFiles:
                     continue
                 try:
                     text = self._text(relative)
-                except OSError, ValueError:
+                except (OSError, ValueError):
                     continue
                 size += len(text)
                 if name_matches:
@@ -638,7 +638,7 @@ def _scan_text(text, python=False):
     ]
     try:
         tree = ast.parse(text)
-    except SyntaxError, ValueError, RecursionError:
+    except (SyntaxError, ValueError, RecursionError):
         if python:
             risks.append(CommandRisk(0, len(text), "warning", "Python code could not be parsed"))
         return risks
@@ -899,22 +899,29 @@ def prepare_command(command):
 def run_command(args, cwd):
     """Run a reviewed command and return ``(output, exit_code, note)``."""
     if command_needs_terminal(args, cwd):
-        terminal, option = shutil.which("x-terminal-emulator"), "-e"
-        if not terminal:
-            terminal, option = shutil.which("gnome-terminal"), "--"
-        if not terminal:
-            raise RuntimeError(
-                "Interactive program needs a terminal, but no terminal emulator was found."
-            )
-        subprocess.Popen(
-            [terminal, option, *args],
-            cwd=cwd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+        terminals = (
+            ("xdg-terminal-exec", (f"--dir={cwd}", "--")),
+            ("x-terminal-emulator", ("-e",)),
+            ("ptyxis", ("--working-directory", str(cwd), "--")),
+            ("gnome-terminal", ("--",)),
+            ("konsole", ("-e",)),
+            ("xfce4-terminal", ("--execute",)),
+            ("xterm", ("-e",)),
         )
-        return "", 0, "Interactive program opened in a terminal window."
+        for name, options in terminals:
+            if terminal := shutil.which(name):
+                subprocess.Popen(
+                    [terminal, *options, *args],
+                    cwd=cwd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                return "", 0, "Interactive program opened in a terminal window."
+        raise RuntimeError(
+            "Interactive program needs a terminal, but no terminal emulator was found."
+        )
     result = subprocess.run(
         args,
         cwd=cwd,
