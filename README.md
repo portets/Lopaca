@@ -30,7 +30,7 @@ Choose **Add Documents** from a chat’s menu and drag files or folders into the
 
 Retrieval uses SQLite FTS5/BM25, phrase and identifier matching, and filename/section searches combined with Reciprocal Rank Fusion (RRF). With an embedding model loaded(automatic default) vectorization is additionally used with RRF. Relevant excerpts are injected into the current request as document reference data.
 
-**The two below features are now replaced by an embedding model by defautl**
+**The two below features are now replaced by an embedding model by default**
 
 **Expand Document Searches** in App Settings optionally asks the same llama-server model for related search terms. It's off by default because it adds response latency.
 

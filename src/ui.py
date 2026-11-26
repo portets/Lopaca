@@ -140,7 +140,7 @@ window.lopaca-main, .transcript-scroll, .transcript {
     /* Theme defaults; add overrides here when needed. */
 }
 .main-transcript-scroll {
-    /* Theme defaults; add overrides here when needed. */
+    margin-bottom: -5px;
 }
 .response-status {
     /* Theme defaults; add overrides here when needed. */
