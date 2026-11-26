@@ -577,7 +577,7 @@ class Settings:
     max_tokens: int | None = None
     request_timeout: int = 600
     thinking_selection_timeout: int = 15
-    max_tool_rounds: int = 12
+    max_tool_rounds: int = 16
     connection_check_interval: int = 5
 
     # Conversation defaults and global memory limits.

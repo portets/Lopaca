@@ -134,7 +134,7 @@ window.lopaca-main, .transcript-scroll, .transcript {
     /* Theme defaults; add overrides here when needed. */
 }
 .chat-title {
-    /* Theme defaults; add overrides here when needed. */
+    margin-top: -1px;
 }
 .chat-folder-path {
     /* Theme defaults; add overrides here when needed. */
